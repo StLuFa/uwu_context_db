@@ -1,0 +1,28 @@
+[package]
+name = "agent-context-db-storage"
+version = "0.1.0"
+edition = "2024"
+description = "agent-context-db L7 存储层：VectorIndex 端口 + PG 适配器（基于 uwu_database）+ 服务装配（composition root）"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+uwu_database = { path = "../../uwu_database" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+parking_lot = "0.12"
+blake3 = "1"
+zstd = "0.13"
+tracing = "0.1"
+tokio = { version = "1", features = ["sync", "time"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "chrono", "uuid"] }
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }

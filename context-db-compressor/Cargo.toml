@@ -1,0 +1,21 @@
+[package]
+name = "agent-context-db-compressor"
+version = "0.1.0"
+edition = "2024"
+description = "agent-context-db L6 压缩层：SemanticQueue 异步语义处理管线（替代 sidecar-consolidator）"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+agent-context-db-session = { path = "../context-db-session" }
+agent-context-db-parse = { path = "../context-db-parse" }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+parking_lot = "0.12"
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -1,0 +1,22 @@
+[package]
+name = "agent-context-db-retrieve"
+version = "0.1.0"
+edition = "2024"
+description = "agent-context-db M1 检索层：HierarchicalRetriever + IntentAnalyzer + Reranker 端口（仅依赖 core FsOps）"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+parking_lot = "0.12"
+chrono = { version = "0.4" }
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+default = []
+
+[dev-dependencies]
+agent-context-db-testkit = { path = "../context-db-testkit" }
+tokio = { version = "1", features = ["rt", "macros"] }
+uuid = { version = "1", features = ["v4"] }

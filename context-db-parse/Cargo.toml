@@ -1,0 +1,19 @@
+[package]
+name = "agent-context-db-parse"
+version = "0.1.0"
+edition = "2024"
+description = "agent-context-db L5 解析层：SemanticProcessor + MemoryExtractor(8类) + TrajectoryExtractor 端口"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

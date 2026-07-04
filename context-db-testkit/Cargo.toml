@@ -1,0 +1,17 @@
+[package]
+name = "agent-context-db-testkit"
+version = "0.1.0"
+edition = "2024"
+description = "agent-context-db 存储端口内存实现（仅测试/开发；生产由 PG + Qdrant 注入）"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+agent-context-db-version = { path = "../context-db-version" }
+async-trait = "0.1"
+parking_lot = "0.12"
+chrono = { version = "0.4" }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+uuid = { version = "1", features = ["v4"] }

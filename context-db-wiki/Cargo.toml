@@ -1,0 +1,19 @@
+[package]
+name = "agent-context-db-wiki"
+version = "0.1.0"
+edition = "2024"
+description = "agent-context-db L7 wiki 层：ContextDbWikiStorage —— 把 wiki-core 7 端口桥接到 context-db 的内容层 + 索引层（无 uwu 依赖）"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+agent-context-db-storage = { path = "../context-db-storage" }
+wiki-core = { path = "../../uwu_wiki/wiki-core" }
+async-trait = "0.1"
+serde_json = "1"
+parking_lot = "0.12"
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -322,13 +322,13 @@ pub struct CausalHypothesis {
 /// 不是真正的因果模型，而是在 DAG 版本历史上做 Granger 式的时间先导检验。
 pub struct CausalInference<V: VersionStore> {
     store: Arc<V>,
-    temporal: TemporalReasoner<V>,
+    _temporal: TemporalReasoner<V>,
 }
 
 impl<V: VersionStore> CausalInference<V> {
     pub fn new(store: Arc<V>) -> Self {
         let temporal = TemporalReasoner::new(store.clone());
-        Self { store, temporal }
+        Self { store, _temporal: temporal }
     }
 
     /// 检测一个 URI 的变更是否在统计上"导致"另一个 URI 的变更。

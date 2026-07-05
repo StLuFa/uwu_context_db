@@ -62,11 +62,7 @@ impl HallucinationDetector {
         let mut rejected = Vec::new();
 
         for hit in hits {
-            let content_text = match &hit.content {
-                ContentPayload::Abstract(s) => s.clone(),
-                ContentPayload::Overview(s) => s.clone(),
-                ContentPayload::Detail(b) => String::from_utf8_lossy(b).to_string(),
-            };
+            let content_text = hit.content.sparse_text().to_string();
 
             let prompt = format!(
                 r#"You are a retrieval quality auditor. Evaluate if this retrieved content is consistent with and relevant to the query.

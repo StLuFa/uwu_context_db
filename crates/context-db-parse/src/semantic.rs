@@ -88,10 +88,12 @@ Respond with ONLY the overview text.
 
         for entry in &entries {
             match self.fs.read(&entry.uri, ContentLevel::L0).await {
-                Ok(ContentPayload::Abstract(abs)) => {
-                    child_abstracts.push((entry.uri.clone(), abs));
+                Ok(payload) => {
+                    let abs = payload.sparse_text().to_string();
+                    if !abs.is_empty() {
+                        child_abstracts.push((entry.uri.clone(), abs));
+                    }
                 }
-                Ok(_) => {} // skip non-abstract payloads
                 Err(_) => {
                     // 目录：递归聚合
                     if entry.is_dir {
@@ -152,7 +154,8 @@ Format as Markdown. Respond with ONLY the overview text.
     async fn multimodal_to_text(&self, uri: &ContextUri) -> Result<(String, String)> {
         // 多模态转文本：读取 L2 Detail 原始字节，调用 LLM 描述为文本
         match self.fs.read(uri, ContentLevel::L2).await {
-            Ok(ContentPayload::Detail(bytes)) if !bytes.is_empty() => {
+            Ok(ContentPayload::Text { full, .. }) if !full.is_empty() => {
+                let bytes = full.as_bytes().to_vec();
                 // 尝试检测内容类型并转 base64 描述
                 let content_hint = detect_content_type(&bytes);
 
@@ -201,17 +204,9 @@ Return your response as a JSON object:
                     }
                 }
             }
-            Ok(ContentPayload::Detail(bytes)) if bytes.is_empty() => {
-                // Empty detail — return empty abstract
-                Ok((format!("(empty content at {uri})"), String::new()))
+            Ok(ContentPayload::Text { sparse, dense, .. }) => {
+                Ok((sparse.chars().take(200).collect(), dense))
             }
-            Ok(ContentPayload::Abstract(s)) => {
-                // Already text — return as-is
-                Ok((s.clone(), String::new()))
-            }
-            Ok(ContentPayload::Overview(s)) => {
-                // Already text — return overview as abstract
-                Ok((s.chars().take(200).collect(), s))
             }
             Ok(_) => {
                 Err(agent_context_db_core::ContextError::Unsupported(

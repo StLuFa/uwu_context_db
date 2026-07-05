@@ -1,6 +1,6 @@
 [package]
 name = "agent-context-db-parse"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 description = "agent-context-db L5 解析层：SemanticProcessor + MemoryExtractor(8类) + TrajectoryExtractor 端口"
 

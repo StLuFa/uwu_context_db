@@ -74,10 +74,8 @@ pub enum CacheTier {
 /// 分层向量索引 — 按访问频率自动升级/降级。
 pub struct TieredVectorIndex {
     index: Arc<dyn VectorIndex>,
-    /// URI → 访问计数
-    access_counts: parking_lot::Mutex<HashMap<String, u64>>,
-    /// URI → 当前层级
-    tier_map: parking_lot::Mutex<HashMap<String, CacheTier>>,
+    /// B.6: 双锁合并为单一 Mutex — (access_counts, tier_map) 原子更新。
+    state: parking_lot::Mutex<(HashMap<String, u64>, HashMap<String, CacheTier>)>,
     hot_threshold: u64,
     warm_threshold: u64,
 }
@@ -86,24 +84,23 @@ impl TieredVectorIndex {
     pub fn new(index: Arc<dyn VectorIndex>, hot: u64, warm: u64) -> Self {
         Self {
             index,
-            access_counts: parking_lot::Mutex::new(HashMap::new()),
-            tier_map: parking_lot::Mutex::new(HashMap::new()),
+            state: parking_lot::Mutex::new((HashMap::new(), HashMap::new())),
             hot_threshold: hot, warm_threshold: warm,
         }
     }
 
     pub fn record_access(&self, uri: &str) {
-        let mut counts = self.access_counts.lock();
-        let count = counts.entry(uri.to_string()).or_insert(0);
+        let mut state = self.state.lock();
+        let count = state.0.entry(uri.to_string()).or_insert(0);
         *count += 1;
         let tier = if *count >= self.hot_threshold { CacheTier::Hot }
                    else if *count >= self.warm_threshold { CacheTier::Warm }
                    else { CacheTier::Cold };
-        self.tier_map.lock().insert(uri.to_string(), tier);
+        state.1.insert(uri.to_string(), tier);
     }
 
     pub fn tier(&self, uri: &str) -> CacheTier {
-        self.tier_map.lock().get(uri).copied().unwrap_or(CacheTier::Cold)
+        self.state.lock().1.get(uri).copied().unwrap_or(CacheTier::Cold)
     }
 
     pub async fn search(
@@ -243,14 +240,18 @@ impl ParallelGenerator {
 
 /// 物化视图 — 缓存常见检索路径的结果。
 pub struct MaterializedView {
-    /// query_key → (uris, expires_at)
     cache: parking_lot::Mutex<HashMap<String, (Vec<ContextUri>, chrono::DateTime<chrono::Utc>)>>,
     ttl_secs: i64,
+    max_capacity: usize, // H.2: 容量上限，超限时 LRU 淘汰
 }
 
 impl MaterializedView {
     pub fn new(ttl_secs: i64) -> Self {
-        Self { cache: parking_lot::Mutex::new(HashMap::new()), ttl_secs }
+        Self { cache: parking_lot::Mutex::new(HashMap::new()), ttl_secs, max_capacity: 500 }
+    }
+
+    pub fn with_capacity(ttl_secs: i64, capacity: usize) -> Self {
+        Self { cache: parking_lot::Mutex::new(HashMap::new()), ttl_secs, max_capacity: capacity }
     }
 
     pub fn get(&self, query: &str) -> Option<Vec<ContextUri>> {
@@ -263,7 +264,17 @@ impl MaterializedView {
 
     pub fn set(&self, query: &str, uris: Vec<ContextUri>) {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(self.ttl_secs);
-        self.cache.lock().insert(query.to_string(), (uris, expires));
+        let mut cache = self.cache.lock();
+        // H.2: 容量超限 → 淘汰最旧的 N 条
+        if cache.len() >= self.max_capacity {
+            let mut entries: Vec<_> = cache.iter().collect();
+            entries.sort_by_key(|(_, (_, e))| *e);
+            let to_remove = entries.len() - self.max_capacity + 1;
+            for (k, _) in entries.iter().take(to_remove) {
+                cache.remove(*k);
+            }
+        }
+        cache.insert(query.to_string(), (uris, expires));
     }
 
     pub fn invalidate(&self, scope: &str) {

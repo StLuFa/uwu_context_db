@@ -69,10 +69,10 @@ impl EventEmitter {
         parent_uri: Option<ContextUri>,
     ) -> ChangeEventStream {
         let parent = parent_uri
-            .and_then(|uri| self.causal_index.lock().get(&uri.0).cloned());
+            .and_then(|uri| self.causal_index.lock().get(&uri.to_string()).cloned());
 
         let causal_link = CausalLink {
-            source_uri: entries.first().map(|e| e.uri.clone()).unwrap_or_else(|| ContextUri("".into())),
+            source_uri: entries.first().map(|e| e.uri.clone()).unwrap_or_else(|| ContextUri::parse("uwu://_/empty").unwrap()),
             source: source.clone(),
             timestamp: Utc::now(),
             parent: parent.map(Box::new),
@@ -87,7 +87,7 @@ impl EventEmitter {
 
         // 更新索引
         for entry in &event.entries {
-            self.causal_index.lock().insert(entry.uri.0.clone(), causal_link.clone());
+            self.causal_index.lock().insert(entry.uri.to_string().clone(), causal_link.clone());
         }
         self.history.lock().push(event.clone());
         event
@@ -96,7 +96,7 @@ impl EventEmitter {
     /// 追溯某个 URI 的完整因果链。
     pub fn trace_causality(&self, uri: &ContextUri) -> Vec<CausalLink> {
         let mut chain = Vec::new();
-        let mut current = self.causal_index.lock().get(&uri.0).cloned();
+        let mut current = self.causal_index.lock().get(&uri.to_string()).cloned();
         while let Some(link) = current {
             current = link.parent.as_ref().map(|p| *p.clone());
             chain.push(link);
@@ -178,7 +178,7 @@ impl InheritanceChain {
 
         // 先查自己的覆盖
         for (pattern, rule) in &node.overrides {
-            if uri.0.starts_with(pattern) {
+            if uri.to_string().starts_with(pattern) {
                 return match rule.action {
                     OverrideAction::Replace => Some((uri.clone(), false)),
                     OverrideAction::Hide => None,
@@ -191,8 +191,8 @@ impl InheritanceChain {
         if let Some(ref parent_id) = node.parent {
             let parent_node = nodes.iter().find(|n| &n.agent_id == parent_id)?;
             // 将 URI 映射到父级 scope
-            let mapped = uri.0.replace(&node.scope.0, &parent_node.scope.0);
-            Some((ContextUri(mapped), true))
+            let mapped = uri.to_string().replace(&node.scope.0, &parent_node.scope.0);
+            Some((ContextUri::parse(mapped).unwrap(), true))
         } else {
             Some((uri.clone(), false))
         }
@@ -353,7 +353,7 @@ mod tests {
         let entries = TemplateEngine::instantiate(&template, &vars, &scope);
 
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].l0_abstract.contains("helper-bot"));
-        assert!(entries[0].l0_abstract.contains("assistant"));
+        assert!(entries[0].l0_text().contains("helper-bot"));
+        assert!(entries[0].l0_text().contains("assistant"));
     }
 }

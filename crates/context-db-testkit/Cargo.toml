@@ -1,6 +1,6 @@
 [package]
 name = "agent-context-db-testkit"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 description = "agent-context-db 存储端口内存实现（仅测试/开发；生产由 PG + Qdrant 注入）"
 

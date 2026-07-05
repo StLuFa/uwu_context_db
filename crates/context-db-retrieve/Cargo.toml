@@ -1,6 +1,6 @@
 [package]
 name = "agent-context-db-retrieve"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 description = "agent-context-db M1 检索层：HierarchicalRetriever + IntentAnalyzer + Reranker 端口（仅依赖 core FsOps）"
 

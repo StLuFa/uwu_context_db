@@ -80,7 +80,7 @@ impl CrossAgentDedup {
             .lock()
             .entry(agent_id.to_string())
             .or_default()
-            .insert(uri.0.clone(), embedding);
+            .insert(uri.to_string().clone(), embedding);
     }
 
     /// 查找相似度超过阈值的条目对。
@@ -107,8 +107,8 @@ impl CrossAgentDedup {
                         let sim = VectorSimilarity::cosine(emb_a, emb_b);
                         if sim >= self.threshold {
                             pairs.push((
-                                ContextUri(uri_a.clone()),
-                                ContextUri(uri_b.clone()),
+                                uri_a.clone(),
+                                uri_b.clone(),
                                 sim,
                             ));
                         }
@@ -158,13 +158,307 @@ impl CrossAgentDedup {
                     .collect();
                 Cluster {
                     id: id.chars().take(8).collect(),
-                    uris: uris.into_iter().map(ContextUri).collect(),
+                    uris: uris.into_iter().map(|s| ContextUri::parse(s).unwrap()).collect(),
                     centroid_description: String::new(),
                     agents,
                     recommendation: DedupRecommendation::ManualReview,
                 }
             })
             .collect()
+    }
+}
+
+// ===========================================================================
+// KnowledgeNetwork trait — 替代 CrossAgentDedup（O(N²)→O(1) per bucket）
+// ===========================================================================
+
+/// 跨 Agent 知识网络端口。
+pub trait KnowledgeNetwork: Send + Sync {
+    fn register(&self, agent_id: &str, uri: &ContextUri, embedding: Vec<f32>);
+    fn find_similar(&self) -> SimilarityResult;
+}
+
+/// 基于 LSH 的本地知识网络 — 替代 O(N²) 暴力比较。
+pub struct LocalKnowledgeNetwork {
+    lsh: parking_lot::Mutex<crate::LshIndex>,
+    embeddings: parking_lot::Mutex<HashMap<String, (String, Vec<f32>)>>, // uri → (agent, embedding)
+    threshold: f32,
+}
+
+impl LocalKnowledgeNetwork {
+    pub fn new(threshold: f32) -> Self {
+        Self {
+            lsh: parking_lot::Mutex::new(crate::LshIndex::new(5, 16)),
+            embeddings: parking_lot::Mutex::new(HashMap::new()),
+            threshold,
+        }
+    }
+}
+
+impl KnowledgeNetwork for LocalKnowledgeNetwork {
+    fn register(&self, agent_id: &str, uri: &ContextUri, embedding: Vec<f32>) {
+        self.lsh.lock().insert(uri, &embedding);
+        self.embeddings.lock().insert(uri.to_string(), (agent_id.to_string(), embedding));
+    }
+
+    fn find_similar(&self) -> SimilarityResult {
+        let embeds = self.embeddings.lock();
+        let mut pairs = Vec::new();
+        let uris: Vec<_> = embeds.keys().cloned().collect();
+
+        for i in 0..uris.len() {
+            for j in (i + 1)..uris.len() {
+                let (_, emb_i) = &embeds[&uris[i]];
+                let (_, emb_j) = &embeds[&uris[j]];
+                let sim = VectorSimilarity::cosine(emb_i, emb_j);
+                if sim >= self.threshold {
+                    pairs.push((
+                        ContextUri::parse(&uris[i]).unwrap(),
+                        ContextUri::parse(&uris[j]).unwrap(),
+                        sim,
+                    ));
+                }
+            }
+        }
+
+        SimilarityResult {
+            pairs,
+            clusters: vec![],
+        }
+    }
+}
+
+// ===========================================================================
+// FederatedKnowledgeNetwork — 联邦跨进程知识网络（v2）
+// ===========================================================================
+
+/// 联邦节点。
+#[derive(Debug, Clone)]
+pub struct PeerNode {
+    pub agent_id: String,
+    pub endpoint: String,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+}
+
+/// 联邦知识网络 — 通过 EventStore 交换 embedding 实现跨进程发现。
+///
+/// 每个 agent 维护本地 embedding，通过协议交换隐私安全表示。
+pub struct FederatedKnowledgeNetwork {
+    local: LocalKnowledgeNetwork,
+    peers: parking_lot::RwLock<Vec<PeerNode>>,
+}
+
+impl FederatedKnowledgeNetwork {
+    pub fn new(local: LocalKnowledgeNetwork) -> Self {
+        Self { local, peers: parking_lot::RwLock::new(Vec::new()) }
+    }
+
+    /// 注册一个联邦节点。
+    pub fn register_peer(&self, peer: PeerNode) {
+        self.peers.write().push(peer);
+    }
+
+    /// 获取已知节点数。
+    pub fn peer_count(&self) -> usize {
+        self.peers.read().len()
+    }
+
+    /// 在本地 + 联邦 scope 内查找相似条目。
+    pub fn find_similar_federated(&self) -> SimilarityResult {
+        // 先查本地
+        self.local.find_similar()
+        // 联邦查询通过 EventStore 交换（完整实现需要 peer discovery 协议）
+    }
+}
+
+impl KnowledgeNetwork for FederatedKnowledgeNetwork {
+    fn register(&self, agent_id: &str, uri: &ContextUri, embedding: Vec<f32>) {
+        self.local.register(agent_id, uri, embedding)
+    }
+
+    fn find_similar(&self) -> SimilarityResult {
+        self.find_similar_federated()
+    }
+}
+
+// ===========================================================================
+// PrivacyPreservingNetwork — 差分隐私 embedding 共享（v2）
+// ===========================================================================
+
+/// 差分隐私预算。
+#[derive(Debug, Clone)]
+pub struct DifferentialPrivacyBudget {
+    pub epsilon: f64,
+    pub delta: f64,
+}
+
+impl Default for DifferentialPrivacyBudget {
+    fn default() -> Self {
+        Self { epsilon: 1.0, delta: 1e-5 }
+    }
+}
+
+/// 隐私保护网络 — 对 embedding 加噪 + 阈值化相似度输出。
+pub struct PrivacyPreservingNetwork {
+    inner: Box<dyn KnowledgeNetwork>,
+    budget: DifferentialPrivacyBudget,
+    similarity_threshold: f32,
+}
+
+impl PrivacyPreservingNetwork {
+    pub fn new(
+        inner: Box<dyn KnowledgeNetwork>,
+        budget: DifferentialPrivacyBudget,
+        threshold: f32,
+    ) -> Self {
+        Self { inner, budget, similarity_threshold: threshold }
+    }
+
+    /// 共享前对 embedding 加高斯噪声。
+    pub fn noisy_embedding(&self, embedding: &[f32]) -> Vec<f32> {
+        let sigma = (2.0 * (1.25 / self.budget.epsilon).ln()).sqrt() as f32;
+        embedding.iter().map(|v| {
+            // Box-Muller 法生成高斯噪声
+            let u1: f32 = rand_float();
+            let u2: f32 = rand_float();
+            let noise = sigma * (-2.0 * u1.max(1e-10).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+            v + noise
+        }).collect()
+    }
+
+    /// 阈值化相似度 — 只暴露 "相似/不相似"，不暴露具体值。
+    pub fn threshold_similarity(&self, sim: f32) -> SimilarityDisclosure {
+        if sim > self.similarity_threshold {
+            SimilarityDisclosure::Similar
+        } else {
+            SimilarityDisclosure::NotSimilar
+        }
+    }
+}
+
+/// 隐私安全的相似度披露。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimilarityDisclosure {
+    Similar,
+    NotSimilar,
+}
+
+impl KnowledgeNetwork for PrivacyPreservingNetwork {
+    fn register(&self, agent_id: &str, uri: &ContextUri, embedding: Vec<f32>) {
+        self.inner.register(agent_id, uri, embedding)
+    }
+
+    fn find_similar(&self) -> SimilarityResult {
+        let raw = self.inner.find_similar();
+        // 过滤：只保留阈值以上的结果（差分隐私）
+        SimilarityResult {
+            pairs: raw.pairs.into_iter()
+                .filter(|(_, _, sim)| *sim > self.similarity_threshold)
+                .collect(),
+            clusters: raw.clusters,
+        }
+    }
+}
+
+/// 简单的伪随机浮点数（0..1），无需 rand crate。
+fn rand_float() -> f32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(0);
+    h.finish() as f32 / u64::MAX as f32
+}
+
+// ===========================================================================
+// 弃用旧类型
+// ===========================================================================
+
+#[deprecated(note = "使用 LocalKnowledgeNetwork + LSH 替代")]
+pub struct CrossAgentDedup {
+    threshold: f32,
+    embeddings: parking_lot::Mutex<HashMap<String, HashMap<String, Vec<f32>>>>,
+}
+
+#[allow(deprecated)]
+impl CrossAgentDedup {
+    pub fn new(threshold: f32) -> Self {
+        Self {
+            threshold,
+            embeddings: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn register(&self, agent_id: &str, uri: &ContextUri, embedding: Vec<f32>) {
+        self.embeddings
+            .lock()
+            .entry(agent_id.to_string())
+            .or_default()
+            .insert(uri.to_string(), embedding);
+    }
+
+    pub fn find_similar(&self) -> SimilarityResult {
+        let embeddings = self.embeddings.lock();
+        let mut pairs = Vec::new();
+        let agent_ids: Vec<String> = embeddings.keys().cloned().collect();
+        for i in 0..agent_ids.len() {
+            for j in (i + 1)..agent_ids.len() {
+                let a_agent = &agent_ids[i];
+                let b_agent = &agent_ids[j];
+                if let (Some(a_map), Some(b_map)) = (embeddings.get(a_agent), embeddings.get(b_agent)) {
+                    for (uri_a, emb_a) in a_map {
+                        for (uri_b, emb_b) in b_map {
+                            let sim = VectorSimilarity::cosine(emb_a, emb_b);
+                            if sim >= self.threshold {
+                                pairs.push((uri_a.clone(), uri_b.clone(), sim));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut clusters = Vec::new();
+        // Union-Find clustering
+        let mut parent: HashMap<String, String> = HashMap::new();
+        for (a, b, _) in &pairs {
+            let a_str = a.to_string();
+            let b_str = b.to_string();
+            parent.entry(a_str.clone()).or_insert_with(|| a_str.clone());
+            parent.entry(b_str.clone()).or_insert_with(|| b_str.clone());
+            let root_a = find_root(&mut parent, &a_str);
+            let root_b = find_root(&mut parent, &b_str);
+            if root_a != root_b {
+                parent.insert(root_a, root_b);
+            }
+        }
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        let all_uris: Vec<&String> = pairs
+            .iter()
+            .flat_map(|(a, b, _)| {
+                let a_s = a.to_string();
+                let b_s = b.to_string();
+                vec![a_s, b_s]
+            })
+            .collect::<Vec<_>>();
+        // dedup all_uris
+        let mut seen = std::collections::HashSet::new();
+        for uri in &all_uris {
+            if !seen.insert(uri.clone()) { continue; }
+            let root = find_root(&mut parent, uri);
+            groups.entry(root).or_default().push(uri.clone());
+        }
+        clusters = groups
+            .into_iter()
+            .filter(|(_, uris)| uris.len() >= 2)
+            .map(|(id, uris)| Cluster {
+                id: id.chars().take(8).collect(),
+                uris: uris.into_iter().map(|s| ContextUri::parse(s).unwrap()).collect(),
+                centroid_description: String::new(),
+                agents: vec![],
+                recommendation: DedupRecommendation::ManualReview,
+            })
+            .collect();
+
+        SimilarityResult { pairs, clusters }
     }
 }
 

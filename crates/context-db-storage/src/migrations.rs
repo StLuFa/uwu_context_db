@@ -64,6 +64,29 @@ pub fn context_db_migrations() -> Vec<SqlMigration> {
             "#,
             None::<&str>,
         ),
+        // D.3: GIN trigram 索引 — 加速 grep/ILIKE 全表扫描。
+        SqlMigration::new(
+            3,
+            "create_grep_gin_index",
+            r#"
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+            CREATE INDEX IF NOT EXISTS idx_ctx_l0_trgm ON context_entries
+                USING gin (l0_abstract gin_trgm_ops);
+            CREATE INDEX IF NOT EXISTS idx_ctx_l1_trgm ON context_entries
+                USING gin (l1_overview gin_trgm_ops);
+            "#,
+            None::<&str>,
+        ),
+        // D.6: tags GIN 索引 — 加速按标签过滤。
+        SqlMigration::new(
+            4,
+            "create_tags_gin_index",
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_ctx_tags_gin ON context_entries
+                USING gin (tags jsonb_path_ops);
+            "#,
+            None::<&str>,
+        ),
     ]
 }
 

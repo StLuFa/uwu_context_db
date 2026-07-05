@@ -1,54 +1,59 @@
 //! # agent-context-db-retrieve (M1 检索层)
 //!
-//! 分层检索：意图分析 → 目录递归 → Rerank，全程可产生检索轨迹。
+//! 查询引擎：Query DSL → LogicalPlan → CBO 优化 → PhysicalPlan → 物理算子执行。
 //!
 //! ## 模块
-//!
-//! - [`intent`]：`RuleBasedIntentAnalyzer`（关键词匹配） + `IntentAnalyzer` trait
-//! - [`retriever`]：`HierarchicalRetrieverImpl`（完整检索管线实现）
-//! - 本模块：trait 定义 + `ScoreReranker`
+//! - [`query`]：查询 DSL AST
+//! - [`planner`]：LogicalPlan + CBO 优化器
+//! - [`operators`]：物理算子
+//! - [`intent`]：意图分析器（LLM / 规则）
+//! - [`retriever`]：ContextRetriever（计划驱动的检索器）
 //!
 //! ## 解耦约束
-//!
-//! - 仅依赖 core 的 **`FsOps` 窄端口**（只读寻址）和可选的 `VectorIndex`，不依赖具体后端。
-//! - 可用内存版 `FsOps` mock 单测，不启 PG（见 dev-tests）。
+//! - 仅依赖 core 的 `FsOps` 窄端口和可选的 `VectorIndex`，不依赖具体后端。
 
+pub mod cache;
 pub mod innovation;
 pub mod intent;
+pub mod operators;
 pub mod perf;
+pub mod planner;
 pub mod quality;
+pub mod query;
 pub mod retriever;
 
 pub use innovation::{IncrementalRetrievalLearner, PredictivePrefetcher, RelevanceFeedback};
 pub use intent::{LlmIntentAnalyzer, RuleBasedIntentAnalyzer};
+pub use operators::{ExecContext, ExecStats, RecordBatch};
 pub use perf::{
     BatchFsRequest, CacheTier, MaterializedView, ParallelGenerator, PartitionedRetriever,
     QueryCompiler, TieredVectorIndex, VectorQuantizer,
 };
+pub use planner::{CboOptimizer, LogicalPlan, PhysicalPlan, StatisticsCollector, VectorFilter};
 pub use quality::{CompressionAwareLoader, HallucinationDetector, PressureLevel, QualityReport};
-pub use retriever::HierarchicalRetrieverImpl;
+pub use query::{Condition, MergeStrategy, Predicate, Query, SortKey};
+pub use retriever::ContextRetriever;
 
-use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContextUri, LlmClient, LlmOpts, MemoryClass, Result,
-};
+use agent_context_db_core::{ContentLevel, ContentPayload, ContentType, ContextUri, LlmClient, LlmOpts, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // ===========================================================================
-// 检索器端口
+// 检索器端口（分层 + 计划驱动）
 // ===========================================================================
 
-/// 分层检索器：意图分析 → 目录递归 → Rerank。
+/// 分层检索器 trail（已废弃 — 使用 PlanRetriever）。
+#[deprecated(note = "使用 PlanRetriever + QueryPlanner 替代")]
 #[async_trait]
 pub trait HierarchicalRetriever: Send + Sync {
     async fn retrieve(&self, query: &str, ctx: &RetrieveContext) -> Result<RetrievalResult>;
-    async fn retrieve_typed(
-        &self,
-        query: &str,
-        class: MemoryClass,
-        ctx: &RetrieveContext,
-    ) -> Result<RetrievalResult>;
+}
+
+/// 计划驱动检索器 — 查询 DSL → CBO 优化 → 物理计划执行（推荐）。
+#[async_trait]
+pub trait PlanRetriever: Send + Sync {
+    async fn retrieve_plan(&self, query: &Query, ctx: &RetrieveContext) -> Result<RetrievalResult>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,7 +70,6 @@ pub struct RetrievalResult {
     pub hits: Vec<RetrievalHit>,
     pub trace: RetrievalTrace,
     pub tokens_used: usize,
-    pub intent: Vec<TypedQuery>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,12 +80,12 @@ pub struct RetrievalHit {
     pub relevance: f32,
     /// 父目录链（递归深入路径）。
     pub parent_chain: Vec<ContextUri>,
-    /// 记忆分类（从条目元数据中获取，用于 class-aware 过滤）。
-    pub memory_class: Option<MemoryClass>,
+    /// 内容类型（从 URI 或元数据中获取）。
+    pub content_type: Option<ContentType>,
 }
 
 // ===========================================================================
-// 检索轨迹可视化
+// 检索轨迹
 // ===========================================================================
 
 #[derive(Debug, Clone, Default)]
@@ -91,32 +95,34 @@ pub struct RetrievalTrace {
 
 #[derive(Debug, Clone)]
 pub enum TraceStep {
-    IntentAnalysis { raw: String, typed: Vec<TypedQuery> },
-    InitialLocate { query: TypedQuery, top_dirs: Vec<(ContextUri, f32)> },
-    IntraDirSearch { dir: ContextUri, candidates: Vec<ContextUri> },
-    RecursiveDescent { from: ContextUri, into: ContextUri, reason: String },
+    IntentAnalysis { raw: String, num_queries: usize },
+    PlanOptimized { logical: String, physical: String },
+    Execute { plan: String, hits: usize, duration_ms: u64 },
     Rerank { input: usize, kept: usize, model: String },
     Load { uri: ContextUri, level: ContentLevel, tokens: usize },
 }
 
 // ===========================================================================
-// 意图分析
+// 意图分析器（已废弃 — 使用 QueryPlanner）
 // ===========================================================================
 
-/// 意图分析器：将自然语言查询拆为 0-N 个类型化查询。
+#[deprecated(note = "使用 QueryPlanner（plan/execute 模式）替代")]
 #[async_trait]
 pub trait IntentAnalyzer: Send + Sync {
-    async fn analyze(&self, query: &str, ctx: &RetrieveContext) -> Result<Vec<TypedQuery>>;
+    async fn analyze(&self, query: &str, ctx: &RetrieveContext)
+        -> Result<Vec<TypedQuery>>;
 }
 
+#[deprecated(note = "使用 Query + LogicalPlan 替代")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypedQuery {
     pub kind: QueryKind,
     pub text: String,
     pub target_dirs: Vec<ContextUri>,
-    pub expected_class: Option<MemoryClass>,
+    pub expected_type: Option<ContentType>,
 }
 
+#[deprecated(note = "使用 Query + Predicate 替代")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryKind {
     SemanticSearch,
@@ -137,7 +143,6 @@ pub trait Reranker: Send + Sync {
     async fn rerank(&self, query: &str, hits: Vec<RetrievalHit>) -> Result<Vec<RetrievalHit>>;
 }
 
-/// 分数降序、按 budget 截断的朴素 reranker（轻量默认实现）。
 pub struct ScoreReranker {
     pub keep: usize,
 }
@@ -155,14 +160,8 @@ impl Reranker for ScoreReranker {
     }
 }
 
-/// LLM 驱动的语义重排器。
-///
-/// 对每个命中的内容调用 LLM，评估其与查询的语义相关性（0.0–1.0），
-/// 然后按语义分数降序排列。相比 `ScoreReranker` 的纯分数排序，
-/// 能捕捉到词语不匹配但语义相关的命中。
 pub struct LlmReranker {
     llm: Arc<dyn LlmClient>,
-    /// 保留的最大命中数
     pub keep: usize,
 }
 
@@ -178,8 +177,6 @@ impl Reranker for LlmReranker {
         if hits.is_empty() {
             return Ok(hits);
         }
-
-        // 为每个 hit 调用 LLM 评估语义相关性
         let mut rescored: Vec<(RetrievalHit, f32)> = Vec::new();
         for hit in hits {
             let content_text = content_preview(&hit.content, 500);
@@ -191,46 +188,51 @@ impl Reranker for LlmReranker {
                  - 0.0 = completely unrelated\n\
                  Respond with ONLY a number between 0.0 and 1.0."
             );
-
             let score = match self.llm.complete(&prompt, &LlmOpts {
                 max_tokens: Some(10),
                 temperature: Some(0.0),
                 ..Default::default()
             }).await {
                 Ok(text) => text.trim().parse::<f32>().unwrap_or(hit.relevance),
-                Err(_) => hit.relevance, // LLM 失败时保留原始分数
+                Err(_) => hit.relevance,
             };
-
             rescored.push((hit, score));
         }
-
-        // 按语义分数降序
         rescored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
         });
         rescored.truncate(self.keep);
-
         Ok(rescored.into_iter().map(|(h, s)| {
             RetrievalHit { relevance: s, ..h }
         }).collect())
     }
 }
 
-/// 提取 ContentPayload 的文本预览（最多 max_chars 字符）。
 fn content_preview(content: &ContentPayload, max_chars: usize) -> String {
-    let text = match content {
-        ContentPayload::Abstract(s) => s.clone(),
-        ContentPayload::Overview(s) => s.clone(),
-        ContentPayload::Detail(bytes) => {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
-    };
+    let text = content.sparse_text().to_string();
     if text.len() > max_chars {
         format!("{}...", &text[..max_chars])
     } else {
         text
     }
 }
+
+// ===========================================================================
+// 查询规划器 trait（QueryPlanner）
+// ===========================================================================
+
+/// 查询规划器 — 将自然语言或 Query DSL 编译为物理计划。
+#[async_trait]
+pub trait QueryPlanner: Send + Sync {
+    /// 自然语言 → LogicalPlan。
+    async fn parse(&self, query: &str, ctx: &RetrieveContext) -> Result<LogicalPlan>;
+    /// LogicalPlan → PhysicalPlan（经 CBO）。
+    async fn plan(&self, logical: &LogicalPlan) -> Result<PhysicalPlan>;
+}
+
+// ===========================================================================
+// 测试
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -241,10 +243,14 @@ mod tests {
         let mk = |score: f32| RetrievalHit {
             uri: ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap(),
             level: ContentLevel::L0,
-            content: ContentPayload::Abstract("x".into()),
+            content: ContentPayload::Text {
+                sparse: "x".into(),
+                dense: String::new(),
+                full: String::new(),
+            },
             relevance: score,
             parent_chain: vec![],
-            memory_class: None,
+            content_type: None,
         };
         let rr = ScoreReranker { keep: 2 };
         let out = rr

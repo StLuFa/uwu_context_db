@@ -1,6 +1,6 @@
 [package]
 name = "agent-context-db-compressor"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 description = "agent-context-db L6 压缩层：SemanticQueue 异步语义处理管线（替代 sidecar-consolidator）"
 

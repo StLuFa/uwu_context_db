@@ -47,7 +47,7 @@ impl MemoryContextStore {
 impl ContentRepo for MemoryContextStore {
     async fn write(&self, mut entry: ContextEntry) -> Result<MvccVersion> {
         let mut map = self.entries.lock();
-        let list = map.entry(entry.uri.0.clone()).or_default();
+        let list = map.entry(entry.uri.to_string().clone()).or_default();
         let next = MvccVersion(list.len() as u64 + 1);
         entry.mvcc_version = next;
         entry.updated_at = chrono::Utc::now();
@@ -56,7 +56,7 @@ impl ContentRepo for MemoryContextStore {
     }
 
     async fn delete(&self, uri: &ContextUri) -> Result<()> {
-        self.entries.lock().remove(&uri.0);
+        self.entries.lock().remove(&uri.to_string());
         Ok(())
     }
 
@@ -84,8 +84,8 @@ impl FsOps for MemoryContextStore {
                 out.push(DirEntry {
                     uri: ContextUri(uri.clone()),
                     is_dir,
-                    abstract_: latest.l0_abstract.clone(),
-                    memory_class: latest.metadata.memory_class,
+                    abstract_: latest.l0_text().to_string(),
+                    content_type: latest.metadata.content_type,
                 });
             }
         }
@@ -102,11 +102,11 @@ impl FsOps for MemoryContextStore {
         Ok(map
             .iter()
             .filter(|(uri, _)| uri.starts_with(&scope))
-            .filter(|(_, versions)| match pattern.class {
-                Some(c) => versions
+            .filter(|(_, versions)| match pattern.content_type {
+                Some(ct) => versions
                     .last()
-                    .and_then(|e| e.metadata.memory_class)
-                    .map(|mc| mc == c)
+                    .and_then(|e| e.metadata.content_type)
+                    .map(|c| c == ct)
                     .unwrap_or(false),
                 None => true,
             })
@@ -123,10 +123,11 @@ impl FsOps for MemoryContextStore {
                 continue;
             }
             if let Some(e) = versions.last() {
-                if e.l0_abstract.to_lowercase().contains(&needle) {
+                let l0 = e.l0_text();
+                if l0.to_lowercase().contains(&needle) {
                     hits.push(GrepHit {
                         uri: ContextUri(uri.clone()),
-                        line: e.l0_abstract.clone(),
+                        line: l0.to_string(),
                         level: ContentLevel::L0,
                     });
                 }
@@ -156,20 +157,39 @@ impl FsOps for MemoryContextStore {
 
     async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload> {
         let e = self
-            .latest(&uri.0)
-            .ok_or_else(|| ContextError::NotFound(uri.0.clone()))?;
+            .latest(&uri.to_string())
+            .ok_or_else(|| ContextError::NotFound(uri.to_string().clone()))?;
+        let l0 = e.l0_text().to_string();
+        let l1 = match &e.payload {
+            ContentPayload::Text { dense, .. } => dense.clone(),
+            _ => String::new(),
+        };
         Ok(match level {
-            ContentLevel::L0 => ContentPayload::Abstract(e.l0_abstract),
-            ContentLevel::L1 => ContentPayload::Overview(e.l1_overview.unwrap_or_default()),
+            ContentLevel::L0 => ContentPayload::Text {
+                sparse: l0.clone(),
+                dense: l1.clone(),
+                full: l0,
+            },
+            ContentLevel::L1 => ContentPayload::Text {
+                sparse: l0.clone(),
+                dense: l1.clone(),
+                full: l0,
+            },
             ContentLevel::L2 => {
-                // 优先返回显式存入的 L2 blob（模拟 AGFS）
-                if let Some(bytes) = self.l2_blobs.lock().get(&uri.0) {
+                if let Some(bytes) = self.l2_blobs.lock().get(&uri.to_string()) {
                     if !bytes.is_empty() {
-                        return Ok(ContentPayload::Detail(bytes.clone()));
+                        return Ok(ContentPayload::Text {
+                            sparse: l0,
+                            dense: l1,
+                            full: String::from_utf8(bytes.clone()).unwrap_or_default(),
+                        });
                     }
                 }
-                // 无显式 blob 时返回空 Detail，由调用方降级到 L1
-                ContentPayload::Detail(Vec::new())
+                ContentPayload::Text {
+                    sparse: l0,
+                    dense: l1,
+                    full: String::new(),
+                }
             }
         })
     }
@@ -181,7 +201,7 @@ impl VersionOps for MemoryContextStore {
         Ok(self
             .entries
             .lock()
-            .get(&uri.0)
+            .get(&uri.to_string())
             .map(|list| {
                 list.iter()
                     .map(|e| VersionEntry {
@@ -197,8 +217,8 @@ impl VersionOps for MemoryContextStore {
     async fn rollback(&self, uri: &ContextUri, to: MvccVersion) -> Result<()> {
         let mut map = self.entries.lock();
         let list = map
-            .get_mut(&uri.0)
-            .ok_or_else(|| ContextError::NotFound(uri.0.clone()))?;
+            .get_mut(&uri.to_string())
+            .ok_or_else(|| ContextError::NotFound(uri.to_string().clone()))?;
         let target = list
             .iter()
             .find(|e| e.mvcc_version == to)
@@ -213,7 +233,7 @@ impl VersionOps for MemoryContextStore {
 
     async fn diff(&self, uri: &ContextUri, a: MvccVersion, b: MvccVersion) -> Result<ContextDiff> {
         Ok(ContextDiff {
-            summary: format!("{}: v{:?} → v{:?}", uri.0, a, b),
+            summary: format!("{}: v{:?} → v{:?}", uri.to_string(), a, b),
         })
     }
 }
@@ -335,8 +355,8 @@ mod tests {
     async fn version_history_and_rollback() {
         let store = MemoryContextStore::new();
         let uri = ContextUri::parse("uwu://t/agent/a/state/mid/s1").unwrap();
-        let v1 = store.write(entry(&uri.0, "v1")).await.unwrap();
-        store.write(entry(&uri.0, "v2")).await.unwrap();
+        let v1 = store.write(entry(&uri.to_string(), "v1")).await.unwrap();
+        store.write(entry(&uri.to_string(), "v2")).await.unwrap();
         assert_eq!(store.version_history(&uri).await.unwrap().len(), 2);
 
         store.rollback(&uri, v1).await.unwrap();

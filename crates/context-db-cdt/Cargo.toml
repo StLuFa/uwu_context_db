@@ -1,0 +1,29 @@
+[package]
+name = "agent-context-db-cdt"
+version = "0.0.0"
+edition = "2024"
+description = "context-db — 认知驱动训练：认知偏好优化 + 主动课程 + 策略门控 + 指标驱动"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+agent-context-db-retrieve = { path = "../context-db-retrieve" }
+agent-context-db-version = { path = "../context-db-version" }
+agent-context-db-consolidation = { path = "../context-db-consolidation" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "1"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+rand = "0.8"
+blake3 = "1"
+tracing = "0.1"
+
+[features]
+default = []
+
+[dev-dependencies]
+agent-context-db-testkit = { path = "../context-db-testkit" }
+tokio = { version = "1", features = ["rt", "macros"] }

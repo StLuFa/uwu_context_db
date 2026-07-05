@@ -31,10 +31,10 @@ impl TrajectoryExtractor for TrajectoryExtractorImpl {
             .fs
             .read(archive, ContentLevel::L1)
             .await
-            .unwrap_or_else(|_| agent_context_db_core::ContentPayload::Abstract("empty".into()));
+            .unwrap_or_else(|_| agent_context_db_core::ContentPayload::Text { sparse: "empty".into(), dense: String::new(), full: String::new() });
 
         let text = match &content {
-            agent_context_db_core::ContentPayload::Overview(s) => s.clone(),
+            agent_context_db_core::ContentPayload::Text { dense, .. } => s.clone(),
             agent_context_db_core::ContentPayload::Abstract(s) => s.clone(),
             _ => String::new(),
         };
@@ -98,7 +98,7 @@ Return a JSON object with these fields:
         for uri in &trajectories {
             if let Ok(content) = self.fs.read(uri, ContentLevel::L1).await {
                 match content {
-                    agent_context_db_core::ContentPayload::Overview(s) => traj_texts.push(s),
+                    agent_context_db_core::ContentPayload::Text { dense, .. } => traj_texts.push(s),
                     agent_context_db_core::ContentPayload::Abstract(s) => traj_texts.push(s),
                     _ => {}
                 }

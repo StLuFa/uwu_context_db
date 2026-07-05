@@ -1,6 +1,6 @@
 [package]
 name = "agent-context-db-wiki"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 description = "agent-context-db L7 wiki 层：ContextDbWikiStorage —— 把 wiki-core 7 端口桥接到 context-db 的内容层 + 索引层（无 uwu 依赖）"
 

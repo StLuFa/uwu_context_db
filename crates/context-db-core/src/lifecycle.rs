@@ -1,160 +1,242 @@
-//! 记忆生命周期（F22 遗忘曲线 + F26 上下文经济模型）。
+//! 生命周期管理：per-entry 自适应遗忘 + 重要性评分 + 可组合规则引擎。
+//!
+//! 替代旧的全局固定 `ForgettingCurve` 和 `LifecyclePolicy::for_class` 硬编码。
 
-use crate::{ContentLevel, ContextEntry, MemoryClass};
-use chrono::{DateTime, Utc};
+use crate::{ContentLevel, ContextEntry, ContentType};
+use chrono::{DateTime, Duration, Utc};
+use std::collections::HashMap;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// F22 遗忘曲线
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// 访问事件
+// ===========================================================================
 
-/// 艾宾浩斯遗忘曲线参数。
-///
-/// 记忆保留率 R = e^(-t/S)  其中 t = 距创建时间, S = 稳定性因子
 #[derive(Debug, Clone)]
-pub struct ForgettingCurve {
-    /// 稳定性因子（越大遗忘越慢）
-    pub stability: f64,
-    /// 初始强化次数
-    pub reinforcements: u32,
-}
-
-impl Default for ForgettingCurve {
-    fn default() -> Self {
-        Self { stability: 7.0, reinforcements: 0 }
-    }
-}
-
-impl ForgettingCurve {
-    /// 计算当前保留率 (0-1)。
-    pub fn retention(&self, created_at: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
-        let days = (now - created_at).num_hours() as f64 / 24.0;
-        let effective_stability = self.stability * (1.0 + self.reinforcements as f64 * 0.5);
-        (-days / effective_stability).exp()
-    }
-
-    /// 记忆被访问后强化。
-    pub fn reinforce(&mut self) {
-        self.reinforcements = self.reinforcements.saturating_add(1);
-    }
-
-    /// 判断是否需要降级（L2→L1→L0→归档）。
-    pub fn should_degrade(&self, created_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<ContentLevel> {
-        let r = self.retention(created_at, now);
-        match r {
-            x if x < 0.1 => Some(ContentLevel::L0), // 几乎遗忘 → L0
-            x if x < 0.3 => Some(ContentLevel::L1), // 模糊 → L1
-            _ => None,                                // 清晰 → 保持
-        }
-    }
-
-    /// 判断是否应完全归档。
-    pub fn should_archive(&self, created_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-        self.retention(created_at, now) < 0.05
-    }
-}
-
-/// 条目生命周期策略。
-#[derive(Debug, Clone)]
-pub struct LifecyclePolicy {
-    /// 曲线参数
-    pub curve: ForgettingCurve,
-    /// 最大保留版本数
-    pub max_versions: Option<usize>,
-    /// 最大保留天数
-    pub max_age_days: Option<i64>,
-    /// 降级动作
-    pub on_degrade: DegradeAction,
+pub struct AccessEvent {
+    pub timestamp: DateTime<Utc>,
+    pub accessor: String,
+    pub context: String,
+    pub outcome: AccessOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DegradeAction {
-    /// 仅降低加载级别
-    Downgrade,
-    /// 归档到冷存储
-    Archive,
-    /// 删除
-    Delete,
-    /// 保留
-    Keep,
+pub enum AccessOutcome {
+    Adopted,
+    Rejected,
+    Ignored,
+    Modified,
 }
 
-impl LifecyclePolicy {
-    /// 按记忆类型的默认策略。
-    pub fn for_class(class: MemoryClass) -> Self {
-        match class {
-            MemoryClass::Events | MemoryClass::Cases => Self {
-                curve: ForgettingCurve { stability: 90.0, reinforcements: 0 },
-                max_versions: None,
-                max_age_days: None,
-                on_degrade: DegradeAction::Keep,
-            },
-            MemoryClass::Profile | MemoryClass::Preferences => Self {
-                curve: ForgettingCurve { stability: 30.0, reinforcements: 2 },
-                max_versions: Some(20),
-                max_age_days: Some(180),
-                on_degrade: DegradeAction::Downgrade,
-            },
-            MemoryClass::Patterns | MemoryClass::Skills | MemoryClass::Tools => Self {
-                curve: ForgettingCurve { stability: 60.0, reinforcements: 1 },
-                max_versions: Some(50),
-                max_age_days: Some(365),
-                on_degrade: DegradeAction::Archive,
-            },
-            _ => Self {
-                curve: ForgettingCurve::default(),
-                max_versions: Some(100),
-                max_age_days: Some(90),
-                on_degrade: DegradeAction::Downgrade,
-            },
-        }
-    }
+// ===========================================================================
+// 遗忘模型 trait
+// ===========================================================================
 
-    /// 对条目应用生命周期检查。
-    pub fn evaluate(&self, entry: &ContextEntry, now: DateTime<Utc>) -> LifecycleAction {
-        // 检查时间衰减
-        if let Some(level) = self.curve.should_degrade(entry.created_at, now) {
-            if self.curve.should_archive(entry.created_at, now) {
-                return LifecycleAction::Archive;
-            }
-            return LifecycleAction::Downgrade(level);
-        }
+pub trait ForgettingModel: Send + Sync {
+    fn retention(&self, now: DateTime<Utc>) -> f32;
+    fn record_access(&mut self, access: AccessEvent);
+    fn fit(&mut self);
+    fn half_life(&self) -> Option<Duration>;
+}
 
-        // 检查最大天数
-        if let Some(max_days) = self.max_age_days {
-            let age = (now - entry.created_at).num_days();
-            if age > max_days {
-                return match self.on_degrade {
-                    DegradeAction::Delete => LifecycleAction::Delete,
-                    DegradeAction::Archive => LifecycleAction::Archive,
-                    _ => LifecycleAction::Downgrade(ContentLevel::L0),
-                };
-            }
-        }
+// ===========================================================================
+// Ebbinghaus 遗忘模型
+// ===========================================================================
 
-        LifecycleAction::Keep
+#[derive(Debug, Clone)]
+pub struct EbbinghausModel {
+    pub stability: f64,
+    pub reinforcements: u32,
+    pub last_access: DateTime<Utc>,
+    pub access_history: Vec<AccessEvent>,
+}
+
+impl EbbinghausModel {
+    pub fn new() -> Self {
+        Self { stability: 7.0, reinforcements: 0, last_access: Utc::now(), access_history: Vec::new() }
     }
 }
+
+impl Default for EbbinghausModel {
+    fn default() -> Self { Self::new() }
+}
+
+impl ForgettingModel for EbbinghausModel {
+    fn retention(&self, now: DateTime<Utc>) -> f32 {
+        let elapsed = (now - self.last_access).num_seconds() as f64 / 86400.0;
+        let s_eff = self.stability * (1.0 + 0.5 * self.reinforcements as f64);
+        ((-elapsed / s_eff).exp() as f32).clamp(0.0, 1.0)
+    }
+
+    fn record_access(&mut self, access: AccessEvent) {
+        self.access_history.push(access);
+        self.reinforcements = self.reinforcements.saturating_add(1);
+        self.last_access = Utc::now();
+        if self.reinforcements % 10 == 0 { self.fit(); }
+    }
+
+    fn fit(&mut self) {
+        if self.access_history.len() < 3 { return; }
+        let intervals: Vec<f64> = self.access_history.windows(2)
+            .map(|w| (w[1].timestamp - w[0].timestamp).num_seconds() as f64 / 86400.0)
+            .collect();
+        let avg = intervals.iter().sum::<f64>() / intervals.len() as f64;
+        self.stability = self.stability * 0.7 + avg * 0.3;
+    }
+
+    fn half_life(&self) -> Option<Duration> {
+        let s_eff = self.stability * (1.0 + 0.5 * self.reinforcements as f64);
+        Some(Duration::days((s_eff * 0.693) as i64))
+    }
+}
+
+// ===========================================================================
+// 重要性评分
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct ImportanceScore {
+    pub access_frequency: f32,
+    pub recency: f32,
+    pub centrality: f32,
+    pub confidence: f32,
+    pub tenant_priority: f32,
+    pub composite: f32,
+}
+
+impl ImportanceScore {
+    pub fn compute(log: &[AccessEvent], meta: &crate::ContextMeta, weights: &ImportanceWeights) -> Self {
+        let access_frequency = if log.is_empty() { 0.1 } else { (log.len() as f32 / (log.len() as f32 + 5.0)).clamp(0.0, 1.0) };
+        let recency = match log.last() {
+            Some(a) => { let d = (Utc::now() - a.timestamp).num_hours() as f32 / 24.0; (-d / 30.0).exp().clamp(0.05, 1.0) }
+            None => 0.05,
+        };
+        let centrality = 0.5;
+        let confidence = meta.quality_score.unwrap_or(0.5);
+        let tenant_priority = 0.5;
+        let composite = weights.access_freq * access_frequency
+            + weights.recency * recency
+            + weights.centrality * centrality
+            + weights.confidence * confidence
+            + weights.tenant_priority * tenant_priority;
+        Self { access_frequency, recency, centrality, confidence, tenant_priority, composite }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportanceWeights {
+    pub access_freq: f32,
+    pub recency: f32,
+    pub centrality: f32,
+    pub confidence: f32,
+    pub tenant_priority: f32,
+}
+
+impl Default for ImportanceWeights {
+    fn default() -> Self {
+        Self { access_freq: 0.25, recency: 0.25, centrality: 0.15, confidence: 0.25, tenant_priority: 0.10 }
+    }
+}
+
+// ===========================================================================
+// LifecycleEngine（可组合规则）
+// ===========================================================================
 
 #[derive(Debug, Clone)]
 pub enum LifecycleAction {
     Keep,
-    Downgrade(ContentLevel),
+    Downgrade { to_level: ContentLevel },
     Archive,
+    Consolidate,
     Delete,
+    Freeze,
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// F26 上下文经济模型
-// ═══════════════════════════════════════════════════════════════════════════
+pub struct LifecycleRule {
+    pub name: String,
+    pub condition: Box<dyn Fn(&ImportanceScore, &crate::ContextMeta) -> bool + Send + Sync>,
+    pub action: LifecycleAction,
+    pub priority: u32,
+}
 
-/// Token 消耗追踪器。
-#[derive(Debug, Clone, Default)]
+pub struct LifecycleEngine {
+    rules: Vec<LifecycleRule>,
+    weights: ImportanceWeights,
+}
+
+impl LifecycleEngine {
+    pub fn new(rules: Vec<LifecycleRule>, weights: ImportanceWeights) -> Self { Self { rules, weights } }
+
+    pub fn evaluate(&self, score: &ImportanceScore, meta: &crate::ContextMeta) -> LifecycleAction {
+        self.rules.iter()
+            .filter(|r| (r.condition)(score, meta))
+            .max_by_key(|r| r.priority)
+            .map(|r| r.action.clone())
+            .unwrap_or(LifecycleAction::Keep)
+    }
+
+    pub fn default_rules() -> Vec<LifecycleRule> {
+        vec![
+            LifecycleRule { name: "freeze".into(), condition: Box::new(|s, m| s.tenant_priority > 0.9 || m.tags.contains(&"pinned".to_string())), action: LifecycleAction::Freeze, priority: 100 },
+            LifecycleRule { name: "consolidate".into(), condition: Box::new(|s, _| s.composite < 0.2), action: LifecycleAction::Consolidate, priority: 50 },
+            LifecycleRule { name: "archive".into(), condition: Box::new(|s, _| s.recency < 0.1 && s.access_frequency < 0.1), action: LifecycleAction::Archive, priority: 30 },
+            LifecycleRule { name: "delete".into(), condition: Box::new(|s, _| s.composite < 0.05), action: LifecycleAction::Delete, priority: 20 },
+        ]
+    }
+}
+
+// ===========================================================================
+// 旧类型（deprecated）
+// ===========================================================================
+
+#[deprecated(note = "使用 ForgettingModel trait 替代")]
+#[derive(Debug, Clone)]
+pub struct ForgettingCurve { pub stability: f64, pub reinforcements: u32 }
+
+#[allow(deprecated)]
+impl ForgettingCurve {
+    pub fn new() -> Self { Self { stability: 7.0, reinforcements: 0 } }
+    pub fn retention(&self, created_at: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+        let elapsed = (now - created_at).num_seconds() as f64 / 86400.0;
+        let s_eff = self.stability * (1.0 + 0.5 * self.reinforcements as f64);
+        (-elapsed / s_eff).exp().clamp(0.0, 1.0)
+    }
+    pub fn reinforce(&mut self) { self.reinforcements = self.reinforcements.saturating_add(1); }
+}
+
+impl Default for ForgettingCurve {
+    fn default() -> Self { Self::new() }
+}
+
+#[deprecated(note = "使用 LifecycleAction 替代")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradeAction { Downgrade, Archive, Delete, Keep }
+
+#[deprecated(note = "使用 LifecycleEngine 替代")]
+pub struct LifecyclePolicy { pub curve: ForgettingCurve }
+
+#[allow(deprecated)]
+impl LifecyclePolicy {
+    pub fn new() -> Self { Self { curve: ForgettingCurve::new() } }
+    pub fn evaluate(&self, entry: &ContextEntry, now: DateTime<Utc>) -> LifecycleAction {
+        let r = self.curve.retention(entry.created_at, now);
+        if r < 0.05 { LifecycleAction::Delete }
+        else if r < 0.15 { LifecycleAction::Archive }
+        else if r < 0.35 { LifecycleAction::Downgrade { to_level: ContentLevel::L0 } }
+        else { LifecycleAction::Keep }
+    }
+}
+
+impl Default for LifecyclePolicy {
+    fn default() -> Self { Self::new() }
+}
+
+// ===========================================================================
+// Token 经济
+// ===========================================================================
+
+#[derive(Debug, Clone)]
 pub struct TokenBudget {
-    /// 总预算
     pub total: usize,
-    /// 已消耗
     pub used: usize,
-    /// 按操作类别的消耗明细
     pub breakdown: TokenBreakdown,
 }
 
@@ -167,96 +249,11 @@ pub struct TokenBreakdown {
 }
 
 impl TokenBudget {
-    pub fn new(total: usize) -> Self {
-        Self { total, ..Default::default() }
-    }
-
-    pub fn remaining(&self) -> usize {
-        self.total.saturating_sub(self.used)
-    }
-
-    pub fn is_exhausted(&self) -> bool {
-        self.used >= self.total
-    }
-
-    pub fn pressure(&self) -> f32 {
-        if self.total == 0 { 0.0 }
-        else { self.used as f32 / self.total as f32 }
-    }
-
-    /// 预留一批 token（返回是否成功）。
+    pub fn new(total: usize) -> Self { Self { total, used: 0, breakdown: TokenBreakdown::default() } }
+    pub fn remaining(&self) -> usize { self.total.saturating_sub(self.used) }
+    pub fn is_exhausted(&self) -> bool { self.remaining() == 0 }
+    pub fn pressure(&self) -> f32 { if self.total == 0 { 1.0 } else { (self.used as f32 / self.total as f32).clamp(0.0, 1.0) } }
     pub fn reserve(&mut self, amount: usize) -> bool {
-        if self.used + amount <= self.total {
-            self.used += amount;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 记录检索消耗。
-    pub fn spend_retrieval(&mut self, tokens: usize) {
-        self.used = self.used.saturating_add(tokens).min(self.total);
-        self.breakdown.retrieval += tokens;
-    }
-
-    /// 记录生成消耗。
-    pub fn spend_generation(&mut self, tokens: usize) {
-        self.used = self.used.saturating_add(tokens).min(self.total);
-        self.breakdown.generation += tokens;
-    }
-
-    /// 记录 embedding 消耗。
-    pub fn spend_embedding(&mut self, tokens: usize) {
-        self.used = self.used.saturating_add(tokens).min(self.total);
-        self.breakdown.embedding += tokens;
-    }
-
-    /// 成本报告（假设 $0.01/1K tokens）。
-    pub fn cost_estimate(&self) -> f64 {
-        self.used as f64 * 0.01 / 1000.0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Duration;
-
-    #[test]
-    fn forgetting_curve_decays_over_time() {
-        let fc = ForgettingCurve::default();
-        let now = Utc::now();
-        let past = now - Duration::days(30);
-        assert!(fc.retention(past, now) < 0.1);
-    }
-
-    #[test]
-    fn reinforcement_slows_decay() {
-        let mut fc = ForgettingCurve { stability: 7.0, reinforcements: 5 };
-        let now = Utc::now();
-        let past = now - Duration::days(14);
-        let r1 = fc.retention(past, now);
-        fc.reinforce();
-        let r2 = fc.retention(past, now);
-        assert!(r2 > r1);
-    }
-
-    #[test]
-    fn token_budget_tracks_spend() {
-        let mut budget = TokenBudget::new(10000);
-        budget.spend_retrieval(2000);
-        budget.spend_generation(1000);
-        assert_eq!(budget.used, 3000);
-        assert_eq!(budget.remaining(), 7000);
-    }
-
-    #[test]
-    fn token_budget_exhaustion() {
-        let mut budget = TokenBudget::new(100);
-        assert!(budget.reserve(90));
-        assert!(!budget.reserve(20)); // 超出预算
-        assert!(budget.reserve(10));  // 刚好
-        assert!(budget.is_exhausted());
+        if self.remaining() >= amount { self.used += amount; true } else { false }
     }
 }

@@ -18,18 +18,17 @@ pub struct PackMeta {
     pub entry_count: usize,
 }
 
-/// ContextPack — 可导出的上下文子树。
+/// ContextPack — 可导出的上下文子树（K.6: entries 去冗余，用 Vec 替代 HashMap）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextPack {
     pub meta: PackMeta,
     /// 根 scope
     pub scope: ContextUri,
-    /// URI → 条目
-    pub entries: HashMap<String, ContextEntry>,
+    /// 条目列表（URI 在 entry 内部，不重复存储）
+    pub entries: Vec<ContextEntry>,
 }
 
 impl ContextPack {
-    /// 新建一个空 pack。
     pub fn new(scope: ContextUri, name: impl Into<String>) -> Self {
         Self {
             meta: PackMeta {
@@ -40,42 +39,23 @@ impl ContextPack {
                 entry_count: 0,
             },
             scope,
-            entries: HashMap::new(),
+            entries: Vec::new(),
         }
     }
 
-    pub fn with_source(mut self, agent: impl Into<String>) -> Self {
-        self.meta.source_agent = Some(agent.into());
-        self
-    }
+    pub fn with_source(mut self, agent: impl Into<String>) -> Self { self.meta.source_agent = Some(agent.into()); self }
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self { self.meta.description = Some(desc.into()); self }
 
-    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.meta.description = Some(desc.into());
-        self
-    }
-
-    /// 添加条目。
     pub fn add_entry(&mut self, entry: ContextEntry) {
-        self.entries.insert(entry.uri.to_string(), entry);
+        self.entries.push(entry);
         self.meta.entry_count = self.entries.len();
     }
 
-    /// 序列化为 JSON 字符串。
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
-    }
+    pub fn to_json(&self) -> String { serde_json::to_string_pretty(self).unwrap_or_default() }
+    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> { serde_json::from_str(json) }
 
-    /// 从 JSON 反序列化。
-    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
-    }
-
-    /// 检查 pack 中小于给定 scope 的条目，用于导入时过滤。
     pub fn filter_by_scope(&self, prefix: &ContextUri) -> Vec<&ContextEntry> {
-        self.entries
-            .values()
-            .filter(|e| e.uri.to_string().starts_with(&prefix.to_string()))
-            .collect()
+        self.entries.iter().filter(|e| e.uri.to_string().starts_with(&prefix.to_string())).collect()
     }
 }
 

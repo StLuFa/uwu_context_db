@@ -19,7 +19,7 @@ use agent_context_db_version::{
     AsOfTime, Author, Branch, BranchLifecycle, BranchName, BranchType, ChangeSet, Commit,
     CommitId, CommitMeta, CommitTrigger, ContentHash, GcPolicy, GcReport, ImpactAnalysis,
     LogOpts, MergeResult, MergeStrategy, ProvenanceGraph, Result,
-    SquashResult, Tag, TagName, TagType, TreeDiff, VersionRef, VersionStore,
+    KnowledgeMergeStrategy, SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion, TreeDiff, VersionRef, VersionStore,
     VersionError,
 };
 use async_trait::async_trait;
@@ -737,13 +737,58 @@ impl VersionStore for MemoryVersionStore {
         let branches = self.branches.lock();
         let affected: Vec<BranchName> = branches.iter()
             .filter(|(_, b)| b.head == target)
-            .map(|((_, name), _)| BranchName(name.clone()))
+            .map(|((_, name), _)| BranchName::new(name.clone()))
             .collect();
 
         Ok(ImpactAnalysis {
             commit: commit.clone(),
             downstream_uris: downstream,
             affected_branches: affected,
+        })
+    }
+
+    async fn semantic_diff(
+        &self,
+        _scope: &ContextUri,
+        a: &CommitId,
+        b: &CommitId,
+    ) -> Result<StructuredDiff> {
+        Ok(StructuredDiff {
+            entity_changes: vec![],
+            relation_changes: vec![],
+            fact_corrections: vec![],
+            confidence_delta: 0.0,
+            summary: format!("diff from {a:?} to {b:?}"),
+        })
+    }
+
+    async fn evolution(&self, uri: &ContextUri) -> Result<Vec<TemporalVersion>> {
+        let commits = self.commits.lock();
+        let mut versions: Vec<TemporalVersion> = commits
+            .iter()
+            .filter(|(_, c)| c.snapshot.contains_key(&uri.to_string()))
+            .map(|(cid, c)| TemporalVersion {
+                commit_id: cid.clone(),
+                timestamp: c.meta.timestamp,
+                content_hash: ContentHash(format!("hash-{}", cid.0)),
+                valid_from: c.meta.timestamp,
+                valid_until: None,
+            })
+            .collect();
+        versions.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        Ok(versions)
+    }
+
+    async fn knowledge_merge(
+        &self,
+        _scope: &ContextUri,
+        _from: &BranchName,
+        _into: &BranchName,
+        _strategy: KnowledgeMergeStrategy,
+    ) -> Result<MergeResult> {
+        Ok(MergeResult {
+            commit: CommitId::new(),
+            conflicts: vec![],
         })
     }
 }
@@ -843,8 +888,8 @@ mod tests {
             .unwrap();
 
         // create a feature branch from c1
-        let main = BranchName("main".into());
-        let feat = BranchName("feat".into());
+        let main = BranchName::new("main");
+        let feat = BranchName::new("feat");
 
         store
             .create_branch(&s, main.clone(), c1.clone(), BranchType::Main)
@@ -910,8 +955,8 @@ mod tests {
         });
 
         // 创建分别指向两个 commit 的分支
-        let a = BranchName("a".into());
-        let b = BranchName("b".into());
+        let a = BranchName::new("a");
+        let b = BranchName::new("b");
         store.create_branch(&s, a.clone(), c_a, BranchType::Experiment).await.unwrap();
         store.create_branch(&s, b.clone(), c_b, BranchType::Experiment).await.unwrap();
 

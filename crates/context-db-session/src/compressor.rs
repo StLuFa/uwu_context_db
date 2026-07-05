@@ -4,7 +4,7 @@
 //! - Phase2（异步）：语义处理（去重 → L0/L1 生成 → 写 .done 标记）
 
 use agent_context_db_core::{
-    ContentRepo, ContentType, ContextEntry, ContextMeta, ContextUri, MemoryClass, MvccVersion,
+    ContentPayload, ContentRepo, ContextEntry, ContextMeta, ContextUri, MediaType, MvccVersion,
     Result, TenantId,
 };
 use async_trait::async_trait;
@@ -69,22 +69,26 @@ impl SessionCompressor for SessionCompressorImpl {
         }
 
         // 写入归档条目
+        let abstract_text = format!(
+            "session {} compression #{} with {} messages",
+            session.session_id,
+            session.compression_index,
+            session.messages.len()
+        );
         let entry = ContextEntry {
             uri: archive_uri.clone(),
             tenant: TenantId(uuid::Uuid::nil()),
-            l0_abstract: format!(
-                "session {} compression #{} with {} messages",
-                session.session_id,
-                session.compression_index,
-                session.messages.len()
-            ),
-            l1_overview: Some(jsonl.clone()),
-            l2_detail_uri: None,
-            content_type: ContentType::Text,
+            payload: ContentPayload::Text {
+                sparse: abstract_text,
+                dense: jsonl.clone(),
+                full: jsonl,
+            },
+            media_type: MediaType::Text,
             metadata: ContextMeta::default(),
             mvcc_version: MvccVersion(0),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            derivation: None,
         };
 
         self.store.write(entry).await?;
@@ -134,17 +138,21 @@ impl SessionCompressor for SessionCompressorImpl {
             memory_diff_uri: Some(memory_diff_uri),
         };
 
+        let done_text = format!("done: {done_marker:?}");
         let done_entry = ContextEntry {
             uri: done_uri,
             tenant: TenantId(uuid::Uuid::nil()),
-            l0_abstract: format!("done: {done_marker:?}"),
-            l1_overview: None,
-            l2_detail_uri: None,
-            content_type: ContentType::Text,
+            payload: ContentPayload::Text {
+                sparse: done_text.clone(),
+                dense: done_text.clone(),
+                full: done_text,
+            },
+            media_type: MediaType::Text,
             metadata: ContextMeta::default(),
             mvcc_version: MvccVersion(0),
             created_at: done_marker.finished_at,
             updated_at: done_marker.finished_at,
+            derivation: None,
         };
 
         self.store.write(done_entry).await?;
@@ -246,22 +254,26 @@ pub async fn run_full_compression(
             format!("memory_diff serialize: {e}")
         ))?;
 
+    let abstract_text = format!(
+        "memory diff: {} adds, {} updates, {} deletes",
+        memory_diff.adds.len(),
+        memory_diff.updates.len(),
+        memory_diff.deletes.len()
+    );
     let diff_entry = ContextEntry {
         uri: diff_uri,
         tenant: TenantId(uuid::Uuid::nil()),
-        l0_abstract: format!(
-            "memory diff: {} adds, {} updates, {} deletes",
-            memory_diff.adds.len(),
-            memory_diff.updates.len(),
-            memory_diff.deletes.len()
-        ),
-        l1_overview: Some(diff_json),
-        l2_detail_uri: None,
-        content_type: ContentType::Text,
+        payload: ContentPayload::Text {
+            sparse: abstract_text,
+            dense: diff_json,
+            full: String::new(),
+        },
+        media_type: MediaType::Text,
         metadata: ContextMeta::default(),
         mvcc_version: MvccVersion(0),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        derivation: None,
     };
     compressor.store.write(diff_entry).await?;
 
@@ -290,10 +302,11 @@ pub enum ShimAction {
     Merge,
 }
 
-/// Phase2 记忆提取 trait shim。
+/// Phase2 记忆提取 trait shim（G.5: 已弃用，建议直接依赖 parse crate）。
 ///
 /// 避免 session crate 直接依赖 parse crate。
 /// 实际实现在 context-db-parse crate 中，由 composition root 注入。
+#[deprecated(note = "直接使用 agent-context-db-parse")]
 #[async_trait]
 pub trait MemoryExtractorShim: Send + Sync {
     /// 从归档中提取记忆候选项（返回候选内容列表）。
@@ -306,9 +319,10 @@ pub trait MemoryExtractorShim: Send + Sync {
     ) -> Result<Vec<ShimCandidateAction>>;
 }
 
-/// Phase2 语义处理 trait shim。
+/// Phase2 语义处理 trait shim（G.5: 已弃用，建议直接依赖 parse crate）。
 ///
 /// 避免 session crate 直接依赖 parse crate。
+#[deprecated(note = "直接使用 agent-context-db-parse")]
 #[async_trait]
 pub trait SemanticProcessorShim: Send + Sync {
     /// 为 URI 生成 L0 摘要。

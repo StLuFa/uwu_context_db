@@ -46,7 +46,8 @@ impl CrystalDistiller {
         let mut texts = Vec::new();
         for uri in experience_uris {
             if let Ok(content) = self.fs.read(uri, ContentLevel::L1).await {
-                if let ContentPayload::Overview(s) = content {
+                let s = content.sparse_text().to_string();
+                if !s.is_empty() {
                     texts.push(s);
                 }
             }
@@ -255,7 +256,8 @@ impl<V: VersionStore> DreamConsolidator<V> {
             let mut summaries = Vec::new();
             for uri in &uris {
                 if let Ok(content) = self.fs.read(uri, ContentLevel::L0).await {
-                    if let ContentPayload::Abstract(abs) = content {
+                    let abs = content.sparse_text();
+                    if !abs.is_empty() {
                         summaries.push(format!("- {uri}: {abs}", uri = uri, abs = abs));
                     }
                 }

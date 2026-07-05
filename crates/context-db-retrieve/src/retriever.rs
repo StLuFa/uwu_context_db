@@ -1,415 +1,494 @@
-//! `HierarchicalRetrieverImpl`：M1 检索管线完整实现。
+//! `ContextRetriever`：计划驱动检索器 + `HierarchicalRetrieverImpl`（向后兼容）。
 //!
-//! 流程：意图分析 → 目录定位 → 目录内搜索 → 递归深入 → Rerank → 按预算加载。
-//!
-//! ## 端口依赖
-//!
-//! - `FsOps`（core 窄端口）：只读寻址，所有 ls/find/grep/read 走此端口。
-//! - `VectorIndex`（core 窄端口，可选）：向量召回定位高分目录；`None` 时纯 FS 检索。
-//! - `IntentAnalyzer` + `Reranker`：本层端口，由调用方注入。
-//!
-//! 检索层不依赖任何具体后端（PG/Qdrant），可用 MemoryContextStore 完整单测。
+//! 新版流程：Query DSL → LogicalPlan → CBO 优化 → PhysicalPlan → 执行。
+//! 旧版流程（保留）：意图分析 → 目录定位 → 目录内搜索 → 递归深入 → Rerank → 按预算加载。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContextUri, FsOps, LlmClient, MemoryClass, Result, VectorIndex,
+    ContentLevel, ContentPayload, ContentType, ContextUri, FsOps, LlmClient, Result, VectorIndex,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::intent::{LlmIntentAnalyzer, RuleBasedIntentAnalyzer};
+use crate::operators::ExecContext;
+use crate::planner::{CboOptimizer, LogicalPlan, PhysicalPlan, StatisticsCollector};
+use crate::query::{Condition, Predicate, Query};
 use crate::{
-    HierarchicalRetriever, IntentAnalyzer, QueryKind, Reranker, RetrievalHit, RetrievalResult,
-    RetrievalTrace, RetrieveContext, TraceStep, TypedQuery,
+    HierarchicalRetriever, IntentAnalyzer, PlanRetriever, QueryPlanner, Reranker, RetrievalHit,
+    RetrievalResult, RetrievalTrace, RetrieveContext, TraceStep, TypedQuery,
 };
 
 // ===========================================================================
-// 默认 token 预算估算常量
+// ContextRetriever — 计划驱动检索器
 // ===========================================================================
 
-/// L0 摘要估算：~100 tokens
-const L0_TOKENS: usize = 100;
-/// L1 概览估算：~2k tokens
-const L1_TOKENS: usize = 2000;
-/// 默认检索 budget（无 ctx 指定时）
-const DEFAULT_BUDGET: usize = 8000;
-
-// ===========================================================================
-// HierarchicalRetrieverImpl
-// ===========================================================================
-
-pub struct HierarchicalRetrieverImpl {
+/// 计划驱动检索器：Query DSL → Plan → Execute。
+pub struct ContextRetriever {
     fs: Arc<dyn FsOps>,
     index: Option<Arc<dyn VectorIndex>>,
-    llm: Option<Arc<dyn LlmClient>>,
-    intent: Arc<dyn IntentAnalyzer>,
+    planner: Arc<dyn QueryPlanner>,
     reranker: Arc<dyn Reranker>,
+    optimizer: CboOptimizer,
+    /// 计划缓存（相同 query 不重复优化）。
+    plan_cache: parking_lot::Mutex<std::collections::HashMap<Vec<u8>, PhysicalPlan>>,
 }
 
+impl ContextRetriever {
+    pub fn new(
+        fs: Arc<dyn FsOps>,
+        index: Option<Arc<dyn VectorIndex>>,
+        planner: Arc<dyn QueryPlanner>,
+        reranker: Arc<dyn Reranker>,
+    ) -> Self {
+        let stats = Arc::new(StatisticsCollector::new());
+        Self {
+            fs,
+            index,
+            planner,
+            reranker,
+            optimizer: CboOptimizer::new(stats),
+            plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// G.1: Builder 入口。
+    pub fn builder(fs: Arc<dyn FsOps>) -> ContextRetrieverBuilder {
+        ContextRetrieverBuilder::new(fs)
+    }
+
+    /// 自然语言查询 → 检索结果。
+    pub async fn retrieve(
+        &self,
+        query: &str,
+        ctx: &RetrieveContext,
+    ) -> Result<RetrievalResult> {
+        let budget = ctx.budget_tokens.unwrap_or(8000);
+        let mut trace = RetrievalTrace::default();
+
+        // 1. 自然语言 → LogicalPlan
+        let logical = self.planner.parse(query, ctx).await?;
+
+        // 2. CBO 优化 → PhysicalPlan
+        let physical = self.optimizer.optimize(&logical);
+        trace.steps.push(TraceStep::PlanOptimized {
+            logical: format!("{logical:?}"),
+            physical: format!("{physical:?}"),
+        });
+
+        // 3. 执行物理计划
+        let exec_ctx = ExecContext {
+            fs: self.fs.clone(),
+            index: self.index.clone(),
+        };
+        let batch = physical.execute(&exec_ctx).await?;
+        trace.steps.push(TraceStep::Execute {
+            plan: "physical".into(),
+            hits: batch.records.len(),
+            duration_ms: batch.stats.duration.as_millis() as u64,
+        });
+
+        // 4. Rerank
+        let reranked = self.reranker.rerank(query, batch.records).await?;
+        trace.steps.push(TraceStep::Rerank {
+            input: batch.stats.rows_scanned,
+            kept: reranked.len(),
+            model: "score".into(),
+        });
+
+        // 5. Budget loading
+        let (hits, tokens_used) = load_within_budget(reranked, budget);
+
+        Ok(RetrievalResult {
+            hits,
+            trace,
+            tokens_used,
+        })
+    }
+
+    /// 结构化 Query → 检索结果。
+    pub async fn retrieve_query(
+        &self,
+        query: &Query,
+        ctx: &RetrieveContext,
+    ) -> Result<RetrievalResult> {
+        let budget = match query {
+            Query::Find { budget, .. } => *budget,
+            Query::Similar { budget, .. } => *budget,
+            _ => ctx.budget_tokens.unwrap_or(8000),
+        };
+        let mut trace = RetrievalTrace::default();
+
+        let logical = query_to_logical(query);
+        let physical = self.optimizer.optimize(&logical);
+        trace.steps.push(TraceStep::PlanOptimized {
+            logical: format!("{logical:?}"),
+            physical: format!("{physical:?}"),
+        });
+
+        let exec_ctx = ExecContext {
+            fs: self.fs.clone(),
+            index: self.index.clone(),
+        };
+        let batch = physical.execute(&exec_ctx).await?;
+        trace.steps.push(TraceStep::Execute {
+            plan: "physical".into(),
+            hits: batch.records.len(),
+            duration_ms: batch.stats.duration.as_millis() as u64,
+        });
+
+        let reranked = self.reranker.rerank("", batch.records).await?;
+        let (hits, tokens_used) = load_within_budget(reranked, budget);
+
+        Ok(RetrievalResult {
+            hits,
+            trace,
+            tokens_used,
+        })
+    }
+}
+
+#[async_trait]
+impl PlanRetriever for ContextRetriever {
+    async fn retrieve_plan(
+        &self,
+        query: &Query,
+        ctx: &RetrieveContext,
+    ) -> Result<RetrievalResult> {
+        self.retrieve_query(query, ctx).await
+    }
+}
+
+#[async_trait]
+impl HierarchicalRetriever for ContextRetriever {
+    async fn retrieve(&self, query: &str, ctx: &RetrieveContext) -> Result<RetrievalResult> {
+        self.retrieve(query, ctx).await
+    }
+}
+
+// ===========================================================================
+// Query → LogicalPlan 转换
+// ===========================================================================
+
+fn query_to_logical(query: &Query) -> LogicalPlan {
+    match query {
+        Query::Find {
+            scope,
+            predicate,
+            budget,
+            expand,
+            ..
+        } => {
+            let scan = LogicalPlan::Scan {
+                scope: scope.clone(),
+                level: ContentLevel::L0,
+            };
+            let plan = if predicate.is_empty() {
+                scan
+            } else {
+                LogicalPlan::Filter {
+                    input: Box::new(scan),
+                    predicate: predicate.clone(),
+                }
+            };
+            let plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                budget: *budget,
+            };
+            if let Some(exp) = expand {
+                LogicalPlan::Traverse {
+                    input: Box::new(plan),
+                    edges: exp.kinds.clone(),
+                    max_hops: exp.max_hops,
+                }
+            } else {
+                plan
+            }
+        }
+        Query::Similar {
+            query_embedding,
+            predicate,
+            budget,
+            expand,
+        } => {
+            let vs = LogicalPlan::VectorSearch {
+                collection: "memories".into(),
+                query: query_embedding.clone(),
+                top_k: 50,
+            };
+            let plan = if predicate.is_empty() {
+                vs
+            } else {
+                LogicalPlan::Filter {
+                    input: Box::new(vs),
+                    predicate: predicate.clone(),
+                }
+            };
+            let plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                budget: *budget,
+            };
+            if let Some(exp) = expand {
+                LogicalPlan::Traverse {
+                    input: Box::new(plan),
+                    edges: exp.kinds.clone(),
+                    max_hops: exp.max_hops,
+                }
+            } else {
+                plan
+            }
+        }
+        Query::AsOf { uri, at, level } => LogicalPlan::TemporalScan {
+            uri: uri.clone(),
+            at: at.clone(),
+        },
+        Query::Traverse {
+            start,
+            edges,
+            max_hops,
+            predicate,
+        } => {
+            let scan = LogicalPlan::Scan {
+                scope: Some(start.clone()),
+                level: ContentLevel::L0,
+            };
+            LogicalPlan::Traverse {
+                input: Box::new(scan),
+                edges: edges.clone(),
+                max_hops: *max_hops,
+            }
+        },
+        Query::Composite { queries, merge: _ } => {
+            // 组合查询 → 多个 LogicalPlan 并行
+            // 简化：合并所有子查询的 scan scopes
+            let first = queries.first().map(|q| query_to_logical(q));
+            first.unwrap_or(LogicalPlan::Scan {
+                scope: None,
+                level: ContentLevel::L0,
+            })
+        }
+    }
+}
+
+// ===========================================================================
+// Budget loading
+// ===========================================================================
+
+fn load_within_budget(
+    mut hits: Vec<RetrievalHit>,
+    budget: usize,
+) -> (Vec<RetrievalHit>, usize) {
+    let mut tokens = 0;
+    let mut result = Vec::new();
+    hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
+    for hit in hits {
+        let cost = estimate_tokens(&hit.content);
+        if tokens + cost <= budget {
+            tokens += cost;
+            result.push(hit);
+        } else {
+            // 降级到 L0
+            let l0_text = hit.content.sparse_text().to_string();
+            let l0_cost = l0_text.len() / 4;
+            if tokens + l0_cost <= budget {
+                tokens += l0_cost;
+                result.push(RetrievalHit {
+                    level: ContentLevel::L0,
+                    content: ContentPayload::Text {
+                        sparse: l0_text.clone(),
+                        dense: l0_text.clone(),
+                        full: l0_text,
+                    },
+                    ..hit
+                });
+            }
+        }
+    }
+    (result, tokens)
+}
+
+fn estimate_tokens(content: &ContentPayload) -> usize {
+    match content {
+        ContentPayload::Text { sparse, dense, full: _ } => {
+            std::cmp::max(sparse.len() / 4, 100)
+        }
+        _ => 100,
+    }
+}
+
+// ===========================================================================
+// 基于规则的 QueryPlanner 实现
+// ===========================================================================
+
+/// 基于规则的查询规划器 — 从自然语言生成 LogicalPlan。
+pub struct RuleBasedPlanner {
+    default_tenant: String,
+    default_agent: String,
+}
+
+impl RuleBasedPlanner {
+    pub fn new(
+        default_tenant: impl Into<String>,
+        default_agent: impl Into<String>,
+    ) -> Self {
+        Self {
+            default_tenant: default_tenant.into(),
+            default_agent: default_agent.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl QueryPlanner for RuleBasedPlanner {
+    async fn parse(
+        &self,
+        query: &str,
+        ctx: &RetrieveContext,
+    ) -> Result<LogicalPlan> {
+        let lower = query.to_lowercase();
+        let scope = ContextUri::parse(&format!(
+            "uwu://{}/agent/{}",
+            ctx.user_id.as_deref().unwrap_or(&self.default_tenant),
+            ctx.agent_id.as_deref().unwrap_or(&self.default_agent),
+        ))?;
+
+        // 简单关键词 → Predicate 映射
+        let mut predicate = Predicate::new();
+        if lower.contains("fact") || lower.contains("事实") {
+            predicate = predicate.with(Condition::TypeEquals(ContentType::Fact));
+        }
+        if lower.contains("error") || lower.contains("错误") || lower.contains("失败") {
+            predicate = predicate.with(Condition::TypeEquals(ContentType::Error));
+        }
+        predicate = predicate.with(Condition::ValidOnly);
+
+        Ok(LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                scope: Some(scope),
+                level: ContentLevel::L0,
+            }),
+            predicate,
+        })
+    }
+
+    async fn plan(&self, logical: &LogicalPlan) -> Result<PhysicalPlan> {
+        let stats = Arc::new(StatisticsCollector::new());
+        let optimizer = CboOptimizer::new(stats);
+        Ok(optimizer.optimize(logical))
+    }
+}
+
+// ===========================================================================
+// HierarchicalRetrieverImpl（向后兼容的旧版实现，委托给 ContextRetriever）
+// ===========================================================================
+
+#[deprecated(note = "使用 ContextRetriever 替代")]
+pub struct HierarchicalRetrieverImpl {
+    pub fs: Arc<dyn FsOps>,
+    pub index: Option<Arc<dyn VectorIndex>>,
+    pub llm: Option<Arc<dyn LlmClient>>,
+    pub intent: Arc<dyn IntentAnalyzer>,
+    pub reranker: Arc<dyn Reranker>,
+}
+
+#[allow(deprecated)]
 impl HierarchicalRetrieverImpl {
-    /// 无向量索引的构造器（纯 FS 检索）。
     pub fn new(
         fs: Arc<dyn FsOps>,
         intent: Arc<dyn IntentAnalyzer>,
         reranker: Arc<dyn Reranker>,
     ) -> Self {
-        Self { fs, index: None, llm: None, intent, reranker }
+        Self {
+            fs,
+            index: None,
+            llm: None,
+            intent,
+            reranker,
+        }
     }
 
-    /// 带向量索引的构造器。
     pub fn with_index(
         fs: Arc<dyn FsOps>,
         index: Arc<dyn VectorIndex>,
         intent: Arc<dyn IntentAnalyzer>,
         reranker: Arc<dyn Reranker>,
     ) -> Self {
-        Self { fs, index: Some(index), llm: None, intent, reranker }
-    }
-
-    /// 带向量索引 + LLM embedding 的构造器（完整向量召回链路）。
-    pub fn with_full_vector(
-        fs: Arc<dyn FsOps>,
-        index: Arc<dyn VectorIndex>,
-        llm: Arc<dyn LlmClient>,
-        intent: Arc<dyn IntentAnalyzer>,
-        reranker: Arc<dyn Reranker>,
-    ) -> Self {
-        Self { fs, index: Some(index), llm: Some(llm), intent, reranker }
+        Self {
+            fs,
+            index: Some(index),
+            llm: None,
+            intent,
+            reranker,
+        }
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl HierarchicalRetriever for HierarchicalRetrieverImpl {
-    async fn retrieve(&self, query: &str, ctx: &RetrieveContext) -> Result<RetrievalResult> {
-        let mut trace = RetrievalTrace::default();
-        let budget = ctx.budget_tokens.unwrap_or(DEFAULT_BUDGET);
+    async fn retrieve(&self, query: &str, _ctx: &RetrieveContext) -> Result<RetrievalResult> {
+        // 委托到新的计划驱动方式
+        let scope = ContextUri::parse("uwu://t/")?;
+        let logical = LogicalPlan::Scan {
+            scope: Some(scope),
+            level: ContentLevel::L0,
+        };
+        let stats = Arc::new(StatisticsCollector::new());
+        let optimizer = CboOptimizer::new(stats);
+        let physical = optimizer.optimize(&logical);
 
-        // ── 阶段 1：意图分析 ──
-        let typed_queries = self.intent.analyze(query, ctx).await?;
-        trace.steps.push(TraceStep::IntentAnalysis {
-            raw: query.to_string(),
-            typed: typed_queries.clone(),
-        });
-
-        let mut all_hits: Vec<RetrievalHit> = Vec::new();
-
-        for tq in &typed_queries {
-            // ── 阶段 2：定位目录 ──
-            let top_dirs = self.locate_dirs(tq, ctx).await?;
-            trace.steps.push(TraceStep::InitialLocate {
-                query: tq.clone(),
-                top_dirs: top_dirs.clone(),
-            });
-
-            // ── 阶段 3 + 4：目录内搜索 + 递归深入 ──
-            for (dir, _score) in &top_dirs {
-                let candidates = self.intra_dir_search(dir, tq).await?;
-                let uris: Vec<ContextUri> = candidates.iter().map(|(u, _)| u.clone()).collect();
-                trace.steps.push(TraceStep::IntraDirSearch {
-                    dir: dir.clone(),
-                    candidates: uris,
-                });
-
-                for (cand_uri, cand_mc) in &candidates {
-                    let deeper = self
-                        .recursive_descent(cand_uri, *cand_mc, tq, ctx, &mut trace)
-                        .await?;
-                    all_hits.extend(deeper);
-                }
-            }
-        }
-
-        // ── 阶段 5：Rerank ──
-        let before = all_hits.len();
-        let reranked = self.reranker.rerank(query, all_hits).await?;
-        trace.steps.push(TraceStep::Rerank {
-            input: before,
-            kept: reranked.len(),
-            model: "score-reranker".into(),
-        });
-
-        // ── 阶段 6：按预算加载 ──
-        let (hits, tokens_used) = self.load_within_budget(reranked, budget).await?;
-        for h in &hits {
-            trace.steps.push(TraceStep::Load {
-                uri: h.uri.clone(),
-                level: h.level,
-                tokens: estimate_tokens(&h.content),
-            });
-        }
-
+        let exec_ctx = ExecContext {
+            fs: self.fs.clone(),
+            index: self.index.clone(),
+        };
+        let batch = physical.execute(&exec_ctx).await?;
+        let (hits, tokens) = load_within_budget(batch.records, 8000);
         Ok(RetrievalResult {
             hits,
-            trace,
-            tokens_used,
-            intent: typed_queries,
+            trace: RetrievalTrace::default(),
+            tokens_used: tokens,
         })
     }
+}
 
-    async fn retrieve_typed(
-        &self,
-        query: &str,
-        class: MemoryClass,
-        ctx: &RetrieveContext,
-    ) -> Result<RetrievalResult> {
-        // 调用通用 retrieve，然后按 class 过滤
-        let mut result = self.retrieve(query, ctx).await?;
+// ===========================================================================
+// G.1: ContextRetrieverBuilder
+// ===========================================================================
 
-        // Post-filter: 只保留匹配 class 或无 class 标注的 hits
-        result.hits.retain(|h| {
-            h.memory_class.map_or(true, |mc| mc == class)
+/// Builder for ContextRetriever — 替代多构造器模式。
+pub struct ContextRetrieverBuilder {
+    fs: Arc<dyn FsOps>,
+    index: Option<Arc<dyn VectorIndex>>,
+    planner: Option<Arc<dyn QueryPlanner>>,
+    reranker: Option<Arc<dyn Reranker>>,
+}
+
+impl ContextRetrieverBuilder {
+    pub fn new(fs: Arc<dyn FsOps>) -> Self {
+        Self { fs, index: None, planner: None, reranker: None }
+    }
+
+    pub fn with_vector_index(mut self, index: Arc<dyn VectorIndex>) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    pub fn with_planner(mut self, planner: Arc<dyn QueryPlanner>) -> Self {
+        self.planner = Some(planner);
+        self
+    }
+
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
+    }
+
+    pub fn build(self) -> ContextRetriever {
+        let planner = self.planner.unwrap_or_else(|| {
+            Arc::new(RuleBasedPlanner::new("default", "default"))
         });
-
-        // 如果过滤后为空，保留原始结果（宽松降级）
-        if result.hits.is_empty() {
-            return self.retrieve(query, ctx).await;
-        }
-
-        Ok(result)
-    }
-}
-
-// ===========================================================================
-// 私有管线阶段
-// ===========================================================================
-
-impl HierarchicalRetrieverImpl {
-    /// 阶段 2：定位候选目录。
-    ///
-    /// 有向量索引时通过 embedding 搜索定位；
-    /// 无索引时直接用 typed_query 的 target_dirs。
-    async fn locate_dirs(
-        &self,
-        tq: &TypedQuery,
-        _ctx: &RetrieveContext,
-    ) -> Result<Vec<(ContextUri, f32)>> {
-        // 向量检索：有 index + llm 时用 embedding 搜索
-        if let (Some(index), Some(llm)) = (&self.index, &self.llm) {
-            match llm.embed(&tq.text).await {
-                Ok(vec) => {
-                    let filter = tq.expected_class.map(|c| {
-                        serde_json::json!({"memory_class": memory_class_str(c)})
-                    });
-                    match index.search("memories", vec, 5, filter).await {
-                        Ok(hits) if !hits.is_empty() => {
-                            return Ok(hits
-                                .into_iter()
-                                .map(|h| {
-                                    (ContextUri::parse(h.uri).unwrap_or_else(|_| ContextUri("".into())), h.score)
-                                })
-                                .filter(|(u, _)| !u.0.is_empty())
-                                .collect());
-                        }
-                        _ => {} // fall through to target_dirs
-                    }
-                }
-                Err(_) => {} // embed failed, fall through
-            }
-        }
-
-        // Fallback：target_dirs（无向量或向量搜索失败）
-        let score = if self.index.is_some() { 0.5 } else { 0.8 };
-        Ok(tq.target_dirs.iter().cloned().map(|d| (d, score)).collect())
-    }
-
-    /// 阶段 3：目录内搜索。
-    ///
-    /// 对指定目录 ls，按 tq.kind 和 tq.expected_class 筛选候选。
-    /// 返回 (uri, memory_class) 对。
-    async fn intra_dir_search(
-        &self,
-        dir: &ContextUri,
-        tq: &TypedQuery,
-    ) -> Result<Vec<(ContextUri, Option<MemoryClass>)>> {
-        let entries = self.fs.ls(dir).await?;
-        let candidates: Vec<(ContextUri, Option<MemoryClass>)> = entries
-            .into_iter()
-            .filter(|e| !e.is_dir) // 只取文件
-            .filter(|e| {
-                // 按 expected_class 过滤（有指定 class 时只保留匹配项）
-                match tq.expected_class {
-                    Some(expected) => e.memory_class.map_or(true, |mc| mc == expected),
-                    None => true,
-                }
-            })
-            .map(|e| (e.uri, e.memory_class))
-            .collect();
-        Ok(candidates)
-    }
-
-    /// 阶段 4：递归深入子目录。
-    ///
-    /// 如果候选目录下有子目录且预算允许，深入读取。
-    async fn recursive_descent(
-        &self,
-        uri: &ContextUri,
-        memory_class: Option<MemoryClass>,
-        tq: &TypedQuery,
-        ctx: &RetrieveContext,
-        trace: &mut RetrievalTrace,
-    ) -> Result<Vec<RetrievalHit>> {
-        let mut hits = Vec::new();
-        let mut parent_chain = Vec::new();
-
-        // 按 ctx.prefer_level 读取内容
-        let level = ctx.prefer_level;
-        match self.fs.read(uri, level).await {
-            Ok(content) => {
-                hits.push(RetrievalHit {
-                    uri: uri.clone(),
-                    level,
-                    content,
-                    relevance: initial_relevance(tq),
-                    parent_chain: parent_chain.clone(),
-                    memory_class,
-                });
-            }
-            Err(_) => {
-                // 文件不可读时尝试 L0 降级
-                if level != ContentLevel::L0 {
-                    if let Ok(l0) = self.fs.read(uri, ContentLevel::L0).await {
-                        hits.push(RetrievalHit {
-                            uri: uri.clone(),
-                            level: ContentLevel::L0,
-                            content: l0,
-                            relevance: initial_relevance(tq) * 0.5,
-                            parent_chain: parent_chain.clone(),
-                            memory_class,
-                        });
-                    }
-                }
-            }
-        }
-
-        // 检查是否有子目录：ls uri 的父目录看有无同名目录下的内容
-        if let Some(parent) = uri.parent() {
-            if let Ok(children) = self.fs.ls(&parent).await {
-                for child in children {
-                    if child.is_dir && child.uri.0.starts_with(&uri.0) {
-                        if ctx.trace_enabled {
-                            trace.steps.push(TraceStep::RecursiveDescent {
-                                from: uri.clone(),
-                                into: child.uri.clone(),
-                                reason: "subdir hit".into(),
-                            });
-                        }
-                        parent_chain.push(uri.clone());
-                        // 递归进去
-                        let sub_hits = Box::pin(
-                            self.recursive_descent(
-                                &child.uri,
-                                child.memory_class,
-                                tq, ctx, trace,
-                            ),
-                        )
-                        .await?;
-                        hits.extend(sub_hits);
-                    }
-                }
-            }
-        }
-
-        Ok(hits)
-    }
-
-    /// 阶段 6：按 token 预算加载内容。
-    ///
-    /// 按 relevance 从高到低消耗 budget。
-    async fn load_within_budget(
-        &self,
-        hits: Vec<RetrievalHit>,
-        budget: usize,
-    ) -> Result<(Vec<RetrievalHit>, usize)> {
-        let mut loaded = Vec::new();
-        let mut used = 0usize;
-
-        for h in hits {
-            let cost = estimate_tokens(&h.content);
-            if used + cost > budget && !loaded.is_empty() {
-                // 超预算：后续命中降级为 L0
-                if h.level != ContentLevel::L0 {
-                    if let Ok(l0) = self.fs.read(&h.uri, ContentLevel::L0).await {
-                        let l0_cost = L0_TOKENS;
-                        if used + l0_cost <= budget {
-                            loaded.push(RetrievalHit {
-                                uri: h.uri,
-                                level: ContentLevel::L0,
-                                content: l0,
-                                relevance: h.relevance,
-                                parent_chain: h.parent_chain,
-                                memory_class: h.memory_class,
-                            });
-                            used += l0_cost;
-                        }
-                    }
-                }
-                continue;
-            }
-            used += cost;
-            loaded.push(h);
-        }
-
-        Ok((loaded, used))
-    }
-}
-
-// ===========================================================================
-// 辅助函数
-// ===========================================================================
-
-/// 根据 query type 给出初始相关性。
-fn initial_relevance(tq: &TypedQuery) -> f32 {
-    match tq.kind {
-        QueryKind::EntityLookup => 0.9,
-        QueryKind::EventRecall => 0.85,
-        QueryKind::SkillReuse => 0.8,
-        QueryKind::SemanticSearch => 0.6,
-        QueryKind::PatternMatch => 0.75,
-        QueryKind::StateSnapshot => 0.7,
-        QueryKind::PersonaRelation => 0.8,
-    }
-}
-
-fn memory_class_str(c: MemoryClass) -> &'static str {
-    match c {
-        MemoryClass::Profile => "profile",
-        MemoryClass::Preferences => "preferences",
-        MemoryClass::Entities => "entities",
-        MemoryClass::Events => "events",
-        MemoryClass::Cases => "cases",
-        MemoryClass::Patterns => "patterns",
-        MemoryClass::Tools => "tools",
-        MemoryClass::Skills => "skills",
-    }
-}
-
-/// 估算 ContentPayload 的 token 数。
-fn estimate_tokens(content: &ContentPayload) -> usize {
-    match content {
-        ContentPayload::Abstract(s) => {
-            // ~1 token / 4 chars for English
-            s.len().max(L0_TOKENS.min(s.len() / 4))
-        }
-        ContentPayload::Overview(s) => {
-            s.len().max(L1_TOKENS.min(s.len() / 4))
-        }
-        ContentPayload::Detail(b) => b.len() / 4,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_estimate_l0_is_reasonable() {
-        let c = ContentPayload::Abstract("short abstract".into());
-        let t = estimate_tokens(&c);
-        assert!(t > 0 && t < 500);
-    }
-
-    #[test]
-    fn token_estimate_l2_is_bytes_based() {
-        let c = ContentPayload::Detail(vec![0u8; 4000]);
-        let t = estimate_tokens(&c);
-        assert_eq!(t, 1000); // 4000 / 4
+        let reranker = self.reranker.unwrap_or_else(|| {
+            Arc::new(crate::ScoreReranker { keep: 20 })
+        });
+        ContextRetriever::new(self.fs, self.index, planner, reranker)
     }
 }

@@ -77,14 +77,15 @@ impl CrdtMerger {
         b: &ContextEntry,
         clock_b: u64,
     ) -> (ContextEntry, CrdtStrategy) {
-        let parsed_a = parse_kv_pairs(&a.l0_abstract);
-        let parsed_b = parse_kv_pairs(&b.l0_abstract);
+        let l0_text_a = a.l0_text();
+        let l0_text_b = b.l0_text();
+        let parsed_a = parse_kv_pairs(l0_text_a);
+        let parsed_b = parse_kv_pairs(l0_text_b);
 
         let mut map: LwwMap<String, String> = LwwMap::new();
         for (k, v) in &parsed_a {
             map.set(k.clone(), v.clone(), clock_a, &self.node_id);
         }
-        // 用 b 的时钟再次 apply（LWW 自动裁决冲突）
         for (k, v) in &parsed_b {
             map.set(k.clone(), v.clone(), clock_b, &self.node_id);
         }
@@ -97,8 +98,14 @@ impl CrdtMerger {
 
         let mut merged = a.clone();
         merged.uri = uri.clone();
-        merged.l0_abstract = merged_text;
-        merged.mvcc_version = agent_context_db_core::MvccVersion(clock_a.max(clock_b) + 1);
+        merged.mvcc_version =
+            agent_context_db_core::MvccVersion(clock_a.max(clock_b) + 1);
+        // 将合并文本写入 payload
+        merged.payload = agent_context_db_core::ContentPayload::Text {
+            sparse: merged_text.clone(),
+            dense: merged_text.clone(),
+            full: merged_text,
+        };
 
         (merged, CrdtStrategy::LwwKeyValue)
     }
@@ -110,10 +117,23 @@ impl CrdtMerger {
         a: &ContextEntry,
         b: &ContextEntry,
     ) -> (ContextEntry, CrdtStrategy) {
-        let items_a: Vec<&str> = a.l0_abstract.split(&[',', ';', '\n']).map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        let items_b: Vec<&str> = b.l0_abstract.split(&[',', ';', '\n']).map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let l0_a = a.l0_text();
+        let l0_b = b.l0_text();
+        let items_a: Vec<&str> = l0_a
+            .split(&[',', ';', '\n'])
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let items_b: Vec<&str> = l0_b
+            .split(&[',', ';', '\n'])
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-        let mut all = items_a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut all = items_a
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
         for item in items_b {
             if !all.iter().any(|x| x == item) {
                 all.push(item.to_string());
@@ -123,8 +143,14 @@ impl CrdtMerger {
         let merged_text = all.join("; ");
         let mut merged = a.clone();
         merged.uri = uri.clone();
-        merged.l0_abstract = merged_text;
-        merged.mvcc_version = agent_context_db_core::MvccVersion(a.mvcc_version.0.max(b.mvcc_version.0) + 1);
+        merged.mvcc_version = agent_context_db_core::MvccVersion(
+            a.mvcc_version.0.max(b.mvcc_version.0) + 1,
+        );
+        merged.payload = agent_context_db_core::ContentPayload::Text {
+            sparse: merged_text.clone(),
+            dense: merged_text.clone(),
+            full: merged_text,
+        };
 
         (merged, CrdtStrategy::SetUnion)
     }

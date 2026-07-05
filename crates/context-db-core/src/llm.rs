@@ -53,13 +53,10 @@ pub trait LlmClient: Send + Sync {
     /// 生成 embedding。
     async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError>;
 
-    /// 结构化 JSON 输出（返回原始 JSON 字符串，调用方自行解析）。
+    /// 结构化 JSON 输出 — G.4: 无默认实现，强制后端提供。
     async fn complete_json(
         &self, prompt: &str, schema: &JsonSchema, opts: &LlmOpts,
-    ) -> Result<String, LlmError> {
-        let full_prompt = format!("{prompt}\n\nRespond with ONLY valid JSON matching this schema: {}", schema.schema);
-        self.complete(&full_prompt, opts).await
-    }
+    ) -> Result<String, LlmError>;
 
     /// 流式生成（默认 fallback 到 complete）。
     async fn stream_complete(
@@ -88,9 +85,10 @@ pub trait LlmClient: Send + Sync {
     }
 }
 
-/// 流式响应迭代器。
+/// 流式响应迭代器 — E.2: async trait。
+#[async_trait::async_trait]
 pub trait LlmStream: Send {
-    fn next_chunk(&mut self) -> Option<Result<String, LlmError>>;
+    async fn next_chunk(&mut self) -> Option<Result<String, LlmError>>;
 }
 
 struct BufferedStream {
@@ -98,8 +96,9 @@ struct BufferedStream {
     index: usize,
 }
 
+#[async_trait::async_trait]
 impl LlmStream for BufferedStream {
-    fn next_chunk(&mut self) -> Option<Result<String, LlmError>> {
+    async fn next_chunk(&mut self) -> Option<Result<String, LlmError>> {
         if self.index < self.chunks.len() {
             let chunk = self.chunks[self.index].clone();
             self.index += 1;

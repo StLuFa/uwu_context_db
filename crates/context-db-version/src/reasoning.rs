@@ -271,7 +271,7 @@ impl<V: VersionStore> TemporalReasoner<V> {
                 *counts.entry(add.0.clone()).or_default() += 1;
             }
             for upd in &commit.metadata.changes.updates {
-                *counts.entry(upd.uri.0.clone()).or_default() += 1;
+                *counts.entry(upd.uri.to_string().clone()).or_default() += 1;
             }
         }
 
@@ -293,11 +293,11 @@ impl<V: VersionStore> TemporalReasoner<V> {
         let after_content = self.store.asof_read(uri, after, ContentLevel::L0).await;
 
         let before_text = match before_content {
-            Ok(ContentPayload::Abstract(s)) => Some(s),
+            Ok(ref p) => Some(p.sparse_text().to_string()),
             _ => None,
         };
         let after_text = match after_content {
-            Ok(ContentPayload::Abstract(s)) => Some(s),
+            Ok(ref p) => Some(p.sparse_text().to_string()),
             _ => None,
         };
 

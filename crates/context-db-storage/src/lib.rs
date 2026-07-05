@@ -14,6 +14,7 @@
 pub mod migrations;
 pub mod perf;
 pub mod pg;
+pub mod uwu_cache_adapter;
 pub mod vector_index;
 
 // Re-export core vector types（来源统一）
@@ -104,7 +105,7 @@ pub async fn service_from_uwu_db(
     // 3. 构造向量层适配器（无配置时回退空实现）
     let index: Arc<dyn VectorIndex> = match db.vector {
         Some(vs) => Arc::new(UwuVectorIndex::new(vs)),
-        None => Arc::new(NoopVectorIndex),
+        None => Arc::new(NoopVectorIndex::new()),
     };
 
     Ok(ContextDbService::new(content, index))
@@ -112,39 +113,31 @@ pub async fn service_from_uwu_db(
 
 /// 空实现：无向量后端时的降级方案。
 ///
-/// 所有操作记录 warn 日志后静默返回，确保系统在无向量后端的
-/// 环境下不崩溃，但向量召回功能降级为空结果。
-struct NoopVectorIndex;
+/// 所有操作仅首次 warn（E.4: OnceLock 去重），静默返回空结果。
+struct NoopVectorIndex {
+    warned: std::sync::OnceLock<()>,
+}
+
+impl NoopVectorIndex {
+    fn new() -> Self { Self { warned: std::sync::OnceLock::new() } }
+    fn warn_once(&self, msg: &str) {
+        self.warned.get_or_init(|| { tracing::warn!("{msg}"); });
+    }
+}
 
 #[async_trait]
 impl VectorIndex for NoopVectorIndex {
-    async fn upsert(&self, collection: &str, point: IndexPoint) -> Result<()> {
-        tracing::warn!(
-            collection = %collection,
-            uri = %point.uri,
-            "NoopVectorIndex: upsert dropped (no vector backend configured)"
-        );
+    async fn upsert(&self, _collection: &str, _point: IndexPoint) -> Result<()> {
+        self.warn_once("NoopVectorIndex: no vector backend configured — operations are no-ops");
         Ok(())
     }
     async fn search(
-        &self,
-        collection: &str,
-        _query: Vec<f32>,
-        _top_k: usize,
-        _filter: Option<serde_json::Value>,
+        &self, _collection: &str, _query: Vec<f32>, _top_k: usize, _filter: Option<serde_json::Value>,
     ) -> Result<Vec<IndexHit>> {
-        tracing::warn!(
-            collection = %collection,
-            "NoopVectorIndex: search returned empty (no vector backend configured)"
-        );
+        self.warn_once("NoopVectorIndex: no vector backend configured — operations are no-ops");
         Ok(vec![])
     }
-    async fn delete(&self, collection: &str, uri: &str) -> Result<()> {
-        tracing::warn!(
-            collection = %collection,
-            uri = %uri,
-            "NoopVectorIndex: delete ignored (no vector backend configured)"
-        );
+    async fn delete(&self, _collection: &str, _uri: &str) -> Result<()> {
         Ok(())
     }
 }

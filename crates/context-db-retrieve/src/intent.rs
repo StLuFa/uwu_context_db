@@ -4,7 +4,7 @@
 //! - [`LlmIntentAnalyzer`]：LLM 驱动版（结构化意图分类，生产级）
 
 use agent_context_db_core::{
-    ContextUri, LlmClient, LlmOpts, MemoryClass, Result,
+    ContentType, ContextUri, LlmClient, LlmOpts, MemoryClass, Result,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -103,7 +103,7 @@ Current context: tenant="{tenant}", agent="{agent}"
                 kind: QueryKind::SemanticSearch,
                 text: query.to_string(),
                 target_dirs: default_memory_dirs(tenant, agent),
-                expected_class: None,
+                expected_type: None,
             }]);
         }
 
@@ -118,7 +118,7 @@ Current context: tenant="{tenant}", agent="{agent}"
                     .map(|d| ContextUri::parse(d).unwrap_or_else(|_| ContextUri("".into())))
                     .filter(|u| !u.0.is_empty())
                     .collect(),
-                expected_class: r.expected_class.and_then(|c| parse_class(&c)),
+                expected_type: r.expected_class.and_then(|c| parse_class(&c)),
             })
             .collect())
     }
@@ -172,7 +172,7 @@ impl RuleBasedIntentAnalyzer {
         }
         if contains_any(&lower, &["relation", "persona", "关系", "朋友", "信任", "trust"]) {
             results.push(tq(QueryKind::PersonaRelation, query, &[
-                uri(format!("uwu://{}/agent/{}/persona/relations", agent_id, agent_id)),
+                uri(format!("uwu://{}/agent/{}/persona/relations", user_id, agent_id)),
             ], None));
         }
         if results.is_empty() || contains_any(&lower, &["prefer", "like", "dislike", "喜欢", "偏好", "remember", "记得"]) {

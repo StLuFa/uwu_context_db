@@ -118,7 +118,16 @@ pub struct Branch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BranchName(pub String);
+pub struct BranchName(pub(crate) String); // F.3
+
+impl BranchName {
+    pub fn new(name: impl Into<String>) -> Self { Self(name.into()) }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for BranchName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BranchType {
@@ -152,7 +161,16 @@ pub struct Tag {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TagName(pub String);
+pub struct TagName(pub(crate) String); // F.3
+
+impl TagName {
+    pub fn new(name: impl Into<String>) -> Self { Self(name.into()) }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for TagName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TagType {
@@ -175,4 +193,194 @@ pub enum VersionRef {
     Branch(BranchName),
     Tag(TagName),
     Head,
+}
+
+// ===========================================================================
+// 语义 diff — 替代 TreeDiff（URI 列表）
+// ===========================================================================
+
+/// 结构化语义 diff — 机器可读的变更集（替代 TreeDiff）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredDiff {
+    pub entity_changes: Vec<EntityChange>,
+    pub relation_changes: Vec<RelationChange>,
+    pub fact_corrections: Vec<FactCorrection>,
+    pub confidence_delta: f32,
+    pub summary: String,
+}
+
+/// 实体属性变更。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityChange {
+    pub entity_uri: ContextUri,
+    pub field: String,
+    pub old_value: Option<serde_json::Value>,
+    pub new_value: Option<serde_json::Value>,
+    pub change_type: ChangeType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeType {
+    Set,
+    Remove,
+    ArrayAppend,
+    ArrayRemove,
+}
+
+/// 关系变更。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationChange {
+    pub relation: RelationKind,
+    pub from: ContextUri,
+    pub to: ContextUri,
+    pub change: RelationChangeType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelationChangeType {
+    Added,
+    Removed,
+    Strengthened,
+    Weakened,
+}
+
+/// 关系类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RelationKind {
+    EvolvedFrom,
+    EvolvedTo,
+    EvidenceOf,
+    EntangledWith,
+    Contradicts,
+    Corroborates,
+    DerivedFrom,
+    Supersedes,
+}
+
+/// 事实修正。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactCorrection {
+    pub fact_uri: ContextUri,
+    pub old_claim: String,
+    pub new_claim: String,
+    pub correction_type: CorrectionType,
+    pub evidence: Vec<ContextUri>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CorrectionType {
+    Refinement,
+    Contradiction,
+    Update,
+}
+
+// ===========================================================================
+// 知识图谱合并 — 替代 MergeStrategy 文件级合并
+// ===========================================================================
+
+/// 知识图谱合并策略。
+pub enum KnowledgeMergeStrategy {
+    EntityAutoMerge,
+    GraphMerge { edge_policy: EdgePolicy },
+    ContradictionDetection { threshold: f32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgePolicy {
+    AutoMerge,
+    RequireConsensus,
+    ManualOnly,
+}
+
+/// 冲突解决器 trait。
+pub trait ConflictResolver: Send + Sync {
+    fn resolve(&self, conflict: SemanticConflict) -> Resolution;
+}
+
+/// 语义冲突。
+#[derive(Debug, Clone)]
+pub enum SemanticConflict {
+    ContradictoryFact { uri: ContextUri, a: String, b: String },
+    ConflictingRelation { from: ContextUri, to: ContextUri, a: RelationKind, b: RelationKind },
+    OverlappingEntity { a: ContextUri, b: ContextUri, similarity: f32 },
+}
+
+/// 冲突解决。
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    KeepBoth { reason: String },
+    PreferA { reason: String },
+    PreferB { reason: String },
+    Fuse { merged: serde_json::Value, reason: String },
+    DeferToHuman { reason: String },
+}
+
+// ===========================================================================
+// 时态版本 — TemporalIndex
+// ===========================================================================
+
+/// 时态版本条目。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalVersion {
+    pub commit_id: CommitId,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub content_hash: ContentHash,
+    pub valid_from: chrono::DateTime<chrono::Utc>,
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// 时态索引 — URI → 有序版本时间线，O(log n) 查询。
+#[derive(Debug, Clone, Default)]
+pub struct TemporalIndex {
+    timelines: std::collections::HashMap<String, Vec<TemporalVersion>>,
+}
+
+impl TemporalIndex {
+    pub fn new() -> Self {
+        Self { timelines: std::collections::HashMap::new() }
+    }
+
+    /// 注册一个版本。
+    pub fn record(&mut self, uri: &ContextUri, version: TemporalVersion) {
+        let key = uri.to_string();
+        let timeline = self.timelines.entry(key).or_default();
+        // 有序插入（按 timestamp）
+        let pos = timeline.binary_search_by(|v| v.timestamp.cmp(&version.timestamp))
+            .unwrap_or_else(|e| e);
+        timeline.insert(pos, version);
+    }
+
+    /// AS OF 查询：某时间点的版本。二分查找 O(log n)。
+    pub fn as_of(&self, uri: &ContextUri, at: chrono::DateTime<chrono::Utc>) -> Option<&TemporalVersion> {
+        let timeline = self.timelines.get(&uri.to_string())?;
+        let pos = timeline
+            .binary_search_by(|v| v.timestamp.cmp(&at))
+            .unwrap_or_else(|e| e.saturating_sub(1));
+        timeline.get(pos)
+    }
+
+    /// BETWEEN 查询：时间范围内的版本。
+    pub fn between(
+        &self,
+        uri: &ContextUri,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<&TemporalVersion> {
+        let timeline = match self.timelines.get(&uri.to_string()) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        timeline
+            .iter()
+            .filter(|v| v.timestamp >= from && v.timestamp <= to)
+            .collect()
+    }
+
+    /// EVOLUTION OF：完整演化历史。
+    pub fn evolution(&self, uri: &ContextUri) -> Vec<&TemporalVersion> {
+        self.timelines
+            .get(&uri.to_string())
+            .map(|t| t.iter().collect())
+            .unwrap_or_default()
+    }
 }

@@ -1,12 +1,12 @@
 [package]
 name = "agent-context-db-version"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 description = "agent-context-db M2 版本层：Commit/Branch/Tag DAG 模型 + VersionStore 端口（feature 可关，M0/M1 不受影响）"
 
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
-uwu-crdt = { git = "https://github.com/StLuFa/uwu-crdt.git" }
+uwu-crdt = { git = "https://github.com/StLuFa/uwu-crdt.git", rev = "bdbf452" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

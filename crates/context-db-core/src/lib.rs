@@ -15,13 +15,21 @@
 //!
 //! 内存版实现见 `agent-context-db-testkit`；生产由 PG + Qdrant 适配器注入。
 
+pub mod config;
 pub mod error;
 pub mod event;
+pub mod event_bus;
+pub mod event_store;
 pub mod lifecycle;
 pub mod llm;
+pub mod lsh;
 pub mod model;
 pub mod observability;
 pub mod pack;
+pub mod rate_limiter;
+pub mod read_cache;
+#[cfg(feature = "redis-backend")]
+pub mod redis_backend;
 pub mod similarity;
 pub mod store;
 pub mod uri;
@@ -34,9 +42,20 @@ pub use event::{
     InheritanceChain, InheritanceNode, OverrideAction, OverrideRule, TemplateEngine,
     TemplateEntry,
 };
-pub use lifecycle::{
-    DegradeAction, ForgettingCurve, LifecycleAction, LifecyclePolicy, TokenBudget,
+pub use event_bus::{EventBus, EventStream as EventBusStream, MemoryEventBus};
+pub use event_store::{
+    CausalDag, CausalityType, DomainEvent, EventFilter as StoreEventFilter, EventId,
+    EventKind as StoreEventKind, EventMetadata, EventPayload, EventStore, MemoryEventStore,
+    SnapshotStore,
 };
+pub use lifecycle::{
+    AccessEvent, AccessOutcome, DegradeAction, EbbinghausModel, ForgettingCurve,
+    ForgettingModel, ImportanceScore, ImportanceWeights, LifecycleAction, LifecycleEngine,
+    LifecyclePolicy, LifecycleRule, TokenBudget,
+};
+pub use lsh::LshIndex;
+pub use rate_limiter::{MemoryRateLimiter, RateLimiter};
+pub use read_cache::{MemoryReadCache, ReadCache};
 pub use llm::{JsonSchema, LlmClient, LlmError, LlmOpts, LlmStream};
 pub use observability::{
     ChangeEvent, ChangeEventType, ContextPubSub, ProvenanceEdge, ProvenanceGraph,
@@ -44,12 +63,20 @@ pub use observability::{
     SubscriptionFilter,
 };
 pub use pack::{AclRule, ContextPack, PackMeta, PathAcl, Permissions, Principal};
-pub use similarity::{Cluster, CrossAgentDedup, DedupRecommendation, SimilarityResult, VectorSimilarity};
+#[allow(deprecated)]
+pub use similarity::{Cluster, CrossAgentDedup, DedupRecommendation, KnowledgeNetwork, LocalKnowledgeNetwork, SimilarityResult, VectorSimilarity};
 pub use model::{
-    ContentLevel, ContentPayload, ContentRef, ContentType, ContextDiff, ContextEntry, ContextMeta,
-    DirEntry, FindPattern, GrepHit, MemoryClass, MvccVersion, StateScope, TenantId, TreeNode,
+    BlobRef, ConsolidationMeta, ConsolidationStatus, ContentHash, ContentLevel, ContentPart,
+    ContentPayload, ContentType, ContextDiff, ContextEntry, ContextMeta, DecodedContent,
+    DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit,
+    LineageEntry, MediaType, MvccVersion, StateScope, TenantId, TreeNode, ValidityRecord,
     VersionEntry,
 };
-pub use store::{ContentRepo, ContextStore, FsOps, TenantOps, VersionOps};
+#[allow(deprecated)]
+pub use model::{ContentRef, MemoryClass};
+pub use store::{
+    BlobStore, BrowsingOps, ContentRepo, ContentStore, ContextStore, FsOps, GraphRelation,
+    GraphStore, StorageEngine, TenantOps, VersionOps,
+};
 pub use uri::{ContextUri, UriCategory, SCHEME};
 pub use vector::{IndexHit, IndexPoint, VectorIndex};

@@ -62,7 +62,7 @@ impl PredictivePrefetcher {
     /// 记录一次上下文访问。
     pub fn record_access(&self, uri: &ContextUri, _pattern: AccessPattern) {
         let mut history = self.access_history.lock();
-        let entry = history.entry(uri.0.clone()).or_insert_with(|| AccessRecord {
+        let entry = history.entry(uri.to_string().clone()).or_insert_with(|| AccessRecord {
             uri: uri.clone(),
             timestamp: Instant::now(),
             access_count: 0,
@@ -175,11 +175,11 @@ impl IncrementalRetrievalLearner {
         for fb in feedbacks {
             match fb {
                 RelevanceFeedback::Relevant { uri, score } => {
-                    let entry = scores.entry(uri.0.clone()).or_insert(0.5);
+                    let entry = scores.entry(uri.to_string().clone()).or_insert(0.5);
                     *entry = *entry + self.learning_rate * (score - *entry);
                 }
                 RelevanceFeedback::NotRelevant { uri } => {
-                    let entry = scores.entry(uri.0.clone()).or_insert(0.5);
+                    let entry = scores.entry(uri.to_string().clone()).or_insert(0.5);
                     *entry = (*entry * 0.9).max(0.05); // 衰减
                 }
                 RelevanceFeedback::Missing { description: _ } => {
@@ -199,7 +199,7 @@ impl IncrementalRetrievalLearner {
     pub fn learned_score(&self, uri: &ContextUri) -> f32 {
         self.uri_scores
             .lock()
-            .get(&uri.0)
+            .get(&uri.to_string())
             .copied()
             .unwrap_or(0.5)
     }
@@ -218,7 +218,7 @@ impl IncrementalRetrievalLearner {
                 .map(|(uri, base_score)| {
                     let adjusted = adjustments
                         .iter()
-                        .find(|(d, _)| uri.0.contains(d))
+                        .find(|(d, _)| uri.to_string().contains(d))
                         .map(|(_, w)| base_score * w)
                         .unwrap_or(base_score);
                     (uri, adjusted)

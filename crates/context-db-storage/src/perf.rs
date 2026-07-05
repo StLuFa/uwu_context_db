@@ -18,6 +18,16 @@ pub struct BatchWriteBuffer {
     batch_size: usize,
     /// 刷新间隔
     flush_interval: std::time::Duration,
+    /// B.4: 后台刷新任务句柄，Drop 时 abort。
+    _flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for BatchWriteBuffer {
+    fn drop(&mut self) {
+        if let Some(handle) = self._flush_handle.lock().take() {
+            handle.abort();
+        }
+    }
 }
 
 impl BatchWriteBuffer {
@@ -27,25 +37,33 @@ impl BatchWriteBuffer {
             pending: Mutex::new(Vec::new()),
             batch_size,
             flush_interval: std::time::Duration::from_millis(100),
+            _flush_handle: Mutex::new(None),
         });
-        // 启动后台刷新任务
-        let this_clone = this.clone();
-        tokio::spawn(async move {
+        // 启动后台刷新任务，保存 JoinHandle
+        let this_clone = Arc::downgrade(&this);
+        let handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(this_clone.flush_interval).await;
-                this_clone.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if let Some(strong) = this_clone.upgrade() {
+                    strong.flush().await;
+                } else {
+                    break; // Arc 已 drop，退出循环
+                }
             }
         });
+        *this._flush_handle.lock() = Some(handle);
         this
     }
 
     /// 提交单个写入（异步批量合并）。
     pub async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().push((entry, tx));
-        if self.pending.lock().len() >= self.batch_size {
-            self.flush().await;
-        }
+        let should_flush = {
+            let mut guard = self.pending.lock(); // E.3: 一次 lock
+            guard.push((entry, tx));
+            guard.len() >= self.batch_size
+        };
+        if should_flush { self.flush().await; }
         rx.await.map_err(|_| ContextError::Storage("batch write cancelled".into()))?
     }
 
@@ -120,13 +138,15 @@ pub fn decompress(compressed: &[u8]) -> Option<Vec<u8>> {
     zstd::decode_all(compressed).ok()
 }
 
-/// 内容去重存储 —— 相同内容只存一份。
+/// 内容去重存储 — 相同内容只存一份（B.5: 三锁合并为 Mutex<Inner>）。
 pub struct DedupStore {
-    /// hash → compressed bytes
-    blobs: Mutex<HashMap<String, Vec<u8>>>,
-    /// uri → hash
-    index: Mutex<HashMap<String, String>>,
-    stats: Mutex<DedupStats>,
+    inner: Mutex<DedupInner>,
+}
+
+struct DedupInner {
+    blobs: HashMap<String, Vec<u8>>,
+    index: HashMap<String, String>,
+    stats: DedupStats,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,41 +159,37 @@ pub struct DedupStats {
 
 impl DedupStore {
     pub fn new() -> Self {
-        Self {
-            blobs: Mutex::new(HashMap::new()),
-            index: Mutex::new(HashMap::new()),
-            stats: Mutex::new(DedupStats::default()),
-        }
+        Self { inner: Mutex::new(DedupInner { blobs: HashMap::new(), index: HashMap::new(), stats: DedupStats::default() }) }
     }
 
     /// 存储内容（自动去重+压缩）。
     pub fn store(&self, uri: &str, data: &[u8]) -> String {
         let hash = content_hash(data);
-        let mut stats = self.stats.lock();
-        stats.total_writes += 1;
+        let mut inner = self.inner.lock();
+        inner.stats.total_writes += 1;
 
-        let mut blobs = self.blobs.lock();
-        if blobs.contains_key(&hash) {
-            stats.dedup_hits += 1;
+        if inner.blobs.contains_key(&hash) {
+            inner.stats.dedup_hits += 1;
         } else {
             let compressed = compress(data, 3);
-            stats.raw_bytes += data.len() as u64;
-            stats.compressed_bytes += compressed.len() as u64;
-            blobs.insert(hash.clone(), compressed);
+            inner.stats.raw_bytes += data.len() as u64;
+            inner.stats.compressed_bytes += compressed.len() as u64;
+            inner.blobs.insert(hash.clone(), compressed);
         }
 
-        self.index.lock().insert(uri.to_string(), hash.clone());
+        inner.index.insert(uri.to_string(), hash.clone());
         hash
     }
 
     /// 读取内容（自动解压）。
     pub fn load(&self, uri: &str) -> Option<Vec<u8>> {
-        let hash = self.index.lock().get(uri)?.clone();
-        let compressed = self.blobs.lock().get(&hash)?.clone();
+        let inner = self.inner.lock();
+        let hash = inner.index.get(uri)?.clone();
+        let compressed = inner.blobs.get(&hash)?.clone();
         decompress(&compressed)
     }
 
-    pub fn stats(&self) -> DedupStats { self.stats.lock().clone() }
+    pub fn stats(&self) -> DedupStats { self.inner.lock().stats.clone() }
 }
 
 #[cfg(test)]

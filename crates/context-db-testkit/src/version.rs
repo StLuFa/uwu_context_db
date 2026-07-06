@@ -17,10 +17,10 @@ use agent_context_db_core::{
 };
 use agent_context_db_version::{
     AsOfTime, Author, Branch, BranchLifecycle, BranchName, BranchType, ChangeSet, Commit,
-    CommitId, CommitMeta, CommitTrigger, ContentHash, GcPolicy, GcReport, ImpactAnalysis,
-    LogOpts, MergeResult, MergeStrategy, ProvenanceGraph, Result,
-    KnowledgeMergeStrategy, SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion, TreeDiff, VersionRef, VersionStore,
-    VersionError,
+    CommitId, CommitMeta, CommitTrigger, ConflictStrategy, ContentHash, GcPolicy, GcReport,
+    ImpactAnalysis, LogOpts, MergeResult, MergeStrategy, ProvenanceGraph, Result,
+    KnowledgeMergeStrategy, SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion,
+    TreeDiff, VersionRef, VersionStore, VersionError,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -233,10 +233,10 @@ impl VersionStore for MemoryVersionStore {
         bt: BranchType,
     ) -> Result<Branch> {
         let scope_key = Self::scope_key(scope);
-        let key = (scope_key.clone(), name.0.clone());
-
-        if self.branches.lock().contains_key(&key) {
-            return Err(VersionError::BranchExists(name.0.clone()));
+        let key = (scope_key.clone(), name.as_str().to_string());
+        let mut branches = self.branches.lock();
+        if branches.contains_key(&key) {
+            return Err(VersionError::BranchExists(name.as_str().to_string()));
         }
 
         let branch = Branch {
@@ -265,19 +265,19 @@ impl VersionStore for MemoryVersionStore {
 
     async fn delete_branch(&self, scope: &ContextUri, name: &BranchName) -> Result<()> {
         let scope_key = Self::scope_key(scope);
-        let key = (scope_key, name.0.clone());
-        self.branches
-            .lock()
+        let key = (scope_key, name.as_str().to_string());
+        let mut branches = self.branches.lock();
+        branches
             .remove(&key)
             .map(|_| ())
-            .ok_or_else(|| VersionError::NotFound(format!("branch {}", name.0)))
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", name)))
     }
 
     // ── tag ─────────────────────────────────────────────────────────
 
     async fn create_tag(&self, scope: &ContextUri, tag: Tag) -> Result<()> {
         let scope_key = Self::scope_key(scope);
-        let key = (scope_key, tag.name.0.clone());
+        let key = (scope_key, tag.name.as_str().to_string());
         self.tags.lock().insert(key, tag);
         Ok(())
     }
@@ -300,7 +300,7 @@ impl VersionStore for MemoryVersionStore {
 
         // 确定起点：指定 branch → 分支 HEAD；否则 → scope HEAD
         let start = if let Some(ref branch_name) = opts.branch {
-            let key = (scope_key.clone(), branch_name.0.clone());
+            let key = (scope_key.clone(), branch_name.as_str().to_string());
             self.branches
                 .lock()
                 .get(&key)
@@ -379,13 +379,18 @@ impl VersionStore for MemoryVersionStore {
                 let entry: ContextEntry = serde_json::from_str(entry_json)
                     .map_err(|e| VersionError::Storage(format!("deserialize entry: {e}")))?;
                 return Ok(match level {
-                    ContentLevel::L0 => ContentPayload::Abstract(entry.l0_abstract),
-                    ContentLevel::L1 => {
-                        ContentPayload::Overview(entry.l1_overview.unwrap_or_default())
+                    ContentLevel::L0 => {
+                        let s = entry.l0_text().to_string();
+                        ContentPayload::Text { sparse: s.clone(), dense: s.clone(), full: s }
                     }
-                    ContentLevel::L2 => ContentPayload::Detail(
-                        serde_json::to_vec(&entry).unwrap_or_default(),
-                    ),
+                    ContentLevel::L1 => {
+                        let dense = match &entry.payload {
+                            ContentPayload::Text { dense, .. } => dense.clone(),
+                            _ => String::new(),
+                        };
+                        ContentPayload::Text { sparse: entry.l0_text().to_string(), dense: dense.clone(), full: dense }
+                    }
+                    ContentLevel::L2 => entry.payload.clone(),
                 });
             }
         }
@@ -443,19 +448,19 @@ impl VersionStore for MemoryVersionStore {
         strategy: MergeStrategy,
     ) -> Result<MergeResult> {
         let scope_key = Self::scope_key(scope);
-        let from_key = (scope_key.clone(), from.0.clone());
-        let into_key = (scope_key.clone(), into.0.clone());
+        let from_key = (scope_key.clone(), from.as_str().to_string());
+        let into_key = (scope_key.clone(), into.as_str().to_string());
 
         // 提取分支数据（克隆后释放锁）
         let (from_head, into_head) = {
             let branches = self.branches.lock();
             let from_branch = branches
                 .get(&from_key)
-                .ok_or_else(|| VersionError::NotFound(format!("branch {}", from.0)))?
+                .ok_or_else(|| VersionError::NotFound(format!("branch {}", from)))?
                 .clone();
             let into_branch = branches
                 .get(&into_key)
-                .ok_or_else(|| VersionError::NotFound(format!("branch {}", into.0)))?
+                .ok_or_else(|| VersionError::NotFound(format!("branch {}", into)))?
                 .clone();
             (from_branch.head, into_branch.head)
         };
@@ -503,7 +508,7 @@ impl VersionStore for MemoryVersionStore {
                         user_id: None,
                         system: true,
                     },
-                    message: format!("merge {} into {}", from.0, into.0),
+                    message: format!("merge {} into {}", from, into),
                     timestamp: now,
                     metadata: CommitMeta {
                         trigger: CommitTrigger::Merge {
@@ -571,19 +576,19 @@ impl VersionStore for MemoryVersionStore {
 
         for (uri_str, _) in &map_b {
             if !map_a.contains_key(uri_str) {
-                adds.push(ContextUri(uri_str.clone()));
+                if let Ok(u) = ContextUri::parse(uri_str.clone()) { adds.push(u); }
             }
         }
         for (uri_str, content_b) in &map_b {
             if let Some(content_a) = map_a.get(uri_str) {
                 if content_a != content_b {
-                    updates.push(ContextUri(uri_str.clone()));
+                    if let Ok(u) = ContextUri::parse(uri_str.clone()) { updates.push(u); }
                 }
             }
         }
         for uri_str in map_a.keys() {
             if !map_b.contains_key(uri_str) {
-                deletes.push(ContextUri(uri_str.clone()));
+                if let Ok(u) = ContextUri::parse(uri_str.clone()) { deletes.push(u); }
             }
         }
 
@@ -596,26 +601,78 @@ impl VersionStore for MemoryVersionStore {
 
     async fn switch_head(&self, scope: &ContextUri, branch: &BranchName) -> Result<()> {
         let scope_key = Self::scope_key(scope);
-        let key = (scope_key.clone(), branch.0.clone());
+        let key = (scope_key.clone(), branch.as_str().to_string());
         let branches = self.branches.lock();
         if let Some(b) = branches.get(&key) {
             self.set_head(&scope_key, b.head.clone());
             Ok(())
         } else {
-            Err(VersionError::NotFound(format!("branch {}", branch.0)))
+            Err(VersionError::NotFound(format!("branch {}", branch)))
         }
     }
 
-    async fn cherry_pick(&self, scope: &ContextUri, commit: &CommitId, onto: &BranchName) -> Result<CommitId> {
+    async fn cherry_pick(&self, scope: &ContextUri, commit: &CommitId, onto: &BranchName, strategy: ConflictStrategy) -> Result<CommitId> {
         let scope_key = Self::scope_key(scope);
         let source_commit = self.commits.lock().get(commit).cloned()
             .ok_or_else(|| VersionError::NotFound(format!("commit {:?}", commit)))?;
         let source_snapshot = self.entry_snapshots.lock().get(commit).cloned().unwrap_or_default();
 
+        // 三方冲突检测：base = source 的 parent[0]，target = 当前分支 head
+        let base_snapshot = source_commit
+            .parents
+            .first()
+            .and_then(|p| self.entry_snapshots.lock().get(p).cloned())
+            .unwrap_or_default();
+        let target_head = {
+            let branches = self.branches.lock();
+            branches.get(&(scope_key.clone(), onto.as_str().to_string())).map(|b| b.head.clone())
+        };
+        let mut target_snapshot = target_head
+            .as_ref()
+            .and_then(|h| self.entry_snapshots.lock().get(h).cloned())
+            .unwrap_or_default();
+
+        // 收集 source 相对 base 的变更 URIs
+        let changed_uris: Vec<String> = {
+            let mut uris: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for k in source_snapshot.keys() { uris.insert(k.clone()); }
+            for k in base_snapshot.keys() { uris.insert(k.clone()); }
+            uris.into_iter().filter(|u| source_snapshot.get(u) != base_snapshot.get(u)).collect()
+        };
+
+        let mut conflicts: Vec<String> = Vec::new();
+        let mut skip: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for uri in &changed_uris {
+            let tv = target_snapshot.get(uri);
+            let bv = base_snapshot.get(uri);
+            let sv = source_snapshot.get(uri);
+            if tv != bv && tv != sv {
+                match strategy {
+                    ConflictStrategy::Fail => conflicts.push(uri.clone()),
+                    ConflictStrategy::Ours => { skip.insert(uri.clone()); }
+                    ConflictStrategy::Theirs => { /* apply below */ }
+                }
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(VersionError::MergeConflict(format!(
+                "cherry-pick {:?} onto {}: {} URI(s) conflicted: {}",
+                commit, onto, conflicts.len(), conflicts.join(", ")
+            )));
+        }
+        // 应用（跳过 Ours 保留的 URI）
+        for uri in &changed_uris {
+            if skip.contains(uri) { continue; }
+            match source_snapshot.get(uri) {
+                Some(v) => { target_snapshot.insert(uri.clone(), v.clone()); }
+                None => { target_snapshot.remove(uri); }
+            }
+        }
+
         let new_id = CommitId::new();
         let cherry = Commit {
             id: new_id.clone(),
-            parents: vec![commit.clone()],
+            parents: target_head.map(|h| vec![h]).unwrap_or_else(|| vec![commit.clone()]),
             tree_hash: ContentHash(format!("cherry-{}", new_id.0)),
             author: source_commit.author.clone(),
             message: format!("cherry-pick: {}", source_commit.message),
@@ -624,9 +681,9 @@ impl VersionStore for MemoryVersionStore {
         };
 
         self.commits.lock().insert(new_id.clone(), cherry);
-        self.entry_snapshots.lock().insert(new_id.clone(), source_snapshot);
+        self.entry_snapshots.lock().insert(new_id.clone(), target_snapshot);
 
-        let key = (scope_key.clone(), onto.0.clone());
+        let key = (scope_key.clone(), onto.as_str().to_string());
         let mut branches = self.branches.lock();
         if let Some(b) = branches.get_mut(&key) {
             b.head = new_id.clone();
@@ -635,18 +692,18 @@ impl VersionStore for MemoryVersionStore {
         Ok(new_id)
     }
 
-    async fn rebase(&self, scope: &ContextUri, branch: &BranchName, onto: &BranchName) -> Result<Vec<CommitId>> {
+    async fn rebase(&self, scope: &ContextUri, branch: &BranchName, onto: &BranchName, strategy: ConflictStrategy) -> Result<Vec<CommitId>> {
         let scope_key = Self::scope_key(scope);
         let (branch_head, _onto_head) = {
             let branches = self.branches.lock();
-            let b = branches.get(&(scope_key.clone(), branch.0.clone()))
-                .ok_or_else(|| VersionError::NotFound(format!("branch {}", branch.0)))?;
-            let o = branches.get(&(scope_key.clone(), onto.0.clone()))
-                .ok_or_else(|| VersionError::NotFound(format!("branch {}", onto.0)))?;
+            let b = branches.get(&(scope_key.clone(), branch.as_str().to_string()))
+                .ok_or_else(|| VersionError::NotFound(format!("branch {}", branch)))?;
+            let o = branches.get(&(scope_key.clone(), onto.as_str().to_string()))
+                .ok_or_else(|| VersionError::NotFound(format!("branch {}", onto)))?;
             (b.head.clone(), o.head.clone())
         };
 
-        let new_ids = vec![self.cherry_pick(scope, &branch_head, onto).await?];
+        let new_ids = vec![self.cherry_pick(scope, &branch_head, onto, strategy).await?];
         Ok(new_ids)
     }
 
@@ -731,7 +788,9 @@ impl VersionStore for MemoryVersionStore {
         let target = commit.clone();
         for (cid, c) in commits.iter() {
             if c.parents.contains(&target) {
-                downstream.push(ContextUri(format!("commit-{}", cid.0)));
+                if let Ok(u) = ContextUri::parse(format!("commit-{}", cid.0)) {
+                    downstream.push(u);
+                }
             }
         }
         let branches = self.branches.lock();
@@ -764,14 +823,15 @@ impl VersionStore for MemoryVersionStore {
 
     async fn evolution(&self, uri: &ContextUri) -> Result<Vec<TemporalVersion>> {
         let commits = self.commits.lock();
+        let snapshots = self.entry_snapshots.lock();
         let mut versions: Vec<TemporalVersion> = commits
             .iter()
-            .filter(|(_, c)| c.snapshot.contains_key(&uri.to_string()))
+            .filter(|(cid, _)| snapshots.get(cid).map(|s| s.contains_key(&uri.to_string())).unwrap_or(false))
             .map(|(cid, c)| TemporalVersion {
                 commit_id: cid.clone(),
-                timestamp: c.meta.timestamp,
+                timestamp: c.timestamp,
                 content_hash: ContentHash(format!("hash-{}", cid.0)),
-                valid_from: c.meta.timestamp,
+                valid_from: c.timestamp,
                 valid_until: None,
             })
             .collect();
@@ -779,18 +839,169 @@ impl VersionStore for MemoryVersionStore {
         Ok(versions)
     }
 
+    /// 语义级分支合并 —— 基于 uwu-crdt `LwwMap` 的 CRDT 合并。
+    ///
+    /// 策略语义：
+    /// - `EntityAutoMerge`：纯 LWW，冲突时高时钟胜、tie-break 用分支名
+    /// - `ContradictionDetection { threshold }`：先检查两侧修改的 URI Jaccard 相似度，
+    ///   低于 threshold 的记为 conflict，但仍 LWW 合并（策略给上层决定丢弃/重做）
+    /// - `GraphMerge`：暂等价 EntityAutoMerge（关系边合并留给 GraphStore 层）
+    ///
+    /// 时钟：以 commit 的 timestamp（Unix seconds）作为 LwwMap clock，
+    /// tie-break node_id 用分支名，保证同 clock 时确定性可复现。
     async fn knowledge_merge(
         &self,
-        _scope: &ContextUri,
-        _from: &BranchName,
-        _into: &BranchName,
-        _strategy: KnowledgeMergeStrategy,
+        scope: &ContextUri,
+        from: &BranchName,
+        into: &BranchName,
+        strategy: KnowledgeMergeStrategy,
     ) -> Result<MergeResult> {
-        Ok(MergeResult {
-            commit: CommitId::new(),
-            conflicts: vec![],
-        })
+        use uwu_crdt::LwwMap;
+
+        let scope_key = Self::scope_key(scope);
+        let from_key = (scope_key.clone(), from.as_str().to_string());
+        let into_key = (scope_key.clone(), into.as_str().to_string());
+
+        let (from_head, into_head) = {
+            let branches = self.branches.lock();
+            let from_branch = branches.get(&from_key).ok_or_else(|| {
+                VersionError::NotFound(format!("branch {}", from.as_str()))
+            })?;
+            let into_branch = branches.get(&into_key).ok_or_else(|| {
+                VersionError::NotFound(format!("branch {}", into.as_str()))
+            })?;
+            (from_branch.head.clone(), into_branch.head.clone())
+        };
+
+        // 若已是 fast-forward（into 是 from 的祖先），直接推进 into 到 from
+        if self.is_ancestor(&into_head, &from_head) {
+            let mut branches = self.branches.lock();
+            if let Some(b) = branches.get_mut(&into_key) {
+                b.head = from_head.clone();
+            }
+            return Ok(MergeResult {
+                commit: from_head,
+                conflicts: vec![],
+            });
+        }
+
+        // 加载两侧快照 + 时钟（commit timestamp 秒数）
+        let (from_snap, into_snap, from_clock, into_clock) = {
+            let snapshots = self.entry_snapshots.lock();
+            let commits = self.commits.lock();
+            let from_snap = snapshots.get(&from_head).cloned().unwrap_or_default();
+            let into_snap = snapshots.get(&into_head).cloned().unwrap_or_default();
+            let from_clock = commits
+                .get(&from_head)
+                .map(|c| c.timestamp.timestamp() as u64)
+                .unwrap_or(0);
+            let into_clock = commits
+                .get(&into_head)
+                .map(|c| c.timestamp.timestamp() as u64)
+                .unwrap_or(0);
+            (from_snap, into_snap, from_clock, into_clock)
+        };
+
+        // 转成 LwwMap
+        let mut from_map: LwwMap<String, String> = LwwMap::new();
+        for (uri, json) in &from_snap {
+            from_map.set(uri.clone(), json.clone(), from_clock, from.as_str());
+        }
+        let mut into_map: LwwMap<String, String> = LwwMap::new();
+        for (uri, json) in &into_snap {
+            into_map.set(uri.clone(), json.clone(), into_clock, into.as_str());
+        }
+
+        // CRDT 合并 —— from ∨ into，交换律 & 幂等
+        let merged = uwu_crdt::merge(&from_map, &into_map);
+
+        // 冲突检测（仅 ContradictionDetection 策略）
+        let conflicts: Vec<ContextUri> = match strategy {
+            KnowledgeMergeStrategy::ContradictionDetection { threshold } => {
+                let mut cs = Vec::new();
+                for (uri_str, from_val) in &from_snap {
+                    if let Some(into_val) = into_snap.get(uri_str) {
+                        if from_val == into_val {
+                            continue;
+                        }
+                        let sim = jaccard_similarity(from_val, into_val);
+                        if sim < threshold as f64 {
+                            if let Ok(u) = ContextUri::parse(uri_str.as_str()) {
+                                cs.push(u);
+                            }
+                        }
+                    }
+                }
+                cs
+            }
+            KnowledgeMergeStrategy::EntityAutoMerge
+            | KnowledgeMergeStrategy::GraphMerge { .. } => Vec::new(),
+        };
+
+        // 从 LwwMap 提取快照（跳过墓碑）
+        let merged_snapshot: HashMap<String, String> = merged
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // 创建 merge commit（两个 parent）
+        let now = Utc::now();
+        let commit_id = CommitId::new();
+        let merge_commit = Commit {
+            id: commit_id.clone(),
+            parents: vec![into_head.clone(), from_head.clone()],
+            tree_hash: ContentHash(format!("tree-{}", commit_id.0)),
+            author: Author { agent_id: None, user_id: None, system: true },
+            message: format!(
+                "knowledge_merge {} <- {} conflicts={}",
+                into.as_str(),
+                from.as_str(),
+                conflicts.len()
+            ),
+            timestamp: now,
+            metadata: CommitMeta { trigger: CommitTrigger::default(), ..Default::default() },
+        };
+
+        {
+            let mut commits = self.commits.lock();
+            commits.insert(commit_id.clone(), merge_commit);
+        }
+        {
+            let mut snapshots = self.entry_snapshots.lock();
+            snapshots.insert(commit_id.clone(), merged_snapshot);
+        }
+        {
+            let mut branches = self.branches.lock();
+            if let Some(b) = branches.get_mut(&into_key) {
+                b.head = commit_id.clone();
+            }
+        }
+        // 推进 scope HEAD 到新 merge commit
+        {
+            let mut heads = self.heads.lock();
+            heads.insert(scope_key, commit_id.clone());
+        }
+
+        Ok(MergeResult { commit: commit_id, conflicts })
     }
+}
+
+/// Jaccard 相似度（词袋，忽略大小写和标点）—— 用于冲突检测。
+fn jaccard_similarity(a: &str, b: &str) -> f64 {
+    let tokens = |s: &str| -> std::collections::HashSet<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_lowercase())
+            .collect()
+    };
+    let sa = tokens(a);
+    let sb = tokens(b);
+    if sa.is_empty() && sb.is_empty() {
+        return 1.0;
+    }
+    let inter = sa.intersection(&sb).count() as f64;
+    let union = sa.union(&sb).count() as f64;
+    if union == 0.0 { 0.0 } else { inter / union }
 }
 
 // ===========================================================================
@@ -908,7 +1119,7 @@ mod tests {
 
         // feat head should be c2
         let branches = store.list_branches(&s).await.unwrap();
-        let feat_branch = branches.iter().find(|b| b.name.0 == "feat").unwrap();
+        let feat_branch = branches.iter().find(|b| b.name.as_str() == "feat").unwrap();
         assert_eq!(feat_branch.head, c2);
 
         // fast-forward merge feat into main
@@ -989,7 +1200,7 @@ mod tests {
             .read_at(&uri, agent_context_db_version::VersionRef::Commit(c1), ContentLevel::L0)
             .await
             .unwrap();
-        assert!(matches!(payload, ContentPayload::Abstract(s) if s.contains("memory leak")));
+        assert!(matches!(payload, ContentPayload::Text { sparse, .. } if sparse.contains("memory leak")));
     }
 
     #[tokio::test]
@@ -1019,7 +1230,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(payload, ContentPayload::Abstract(s) if s.contains("v1")));
+        assert!(matches!(payload, ContentPayload::Text { sparse, .. } if sparse.contains("v1")));
     }
 
     #[tokio::test]

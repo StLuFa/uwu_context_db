@@ -1,15 +1,28 @@
 //! K.1: UwuConfig — 集中管理配置常量。
+//! K.2: ArcSwap 热更新 —— 无锁读，写时替换整份 Arc。
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-
-// K.2: ArcSwap 热更新包装器。
 use std::sync::Arc;
 
-/// 可热更新的配置包装器 — clone 零成本（Arc）。
-pub type ConfigHandle = Arc<parking_lot::RwLock<UwuConfig>>;
+/// 可热更新的配置句柄。
+///
+/// - `load()` 无锁读，返回 `Guard<Arc<UwuConfig>>`
+/// - `store(new)` 原子替换整份配置；旧配置在最后一个 Guard 释放后回收
+/// - 读取远远多于写入的场景，性能优于 `RwLock`
+pub type ConfigHandle = Arc<ArcSwap<UwuConfig>>;
 
+/// 构造热更新句柄。
 pub fn config_handle(config: UwuConfig) -> ConfigHandle {
-    Arc::new(parking_lot::RwLock::new(config))
+    Arc::new(ArcSwap::from_pointee(config))
+}
+
+/// 便捷更新：读旧配置 → 应用变换 → 原子写入新配置。
+pub fn update_config(handle: &ConfigHandle, mutate: impl FnOnce(&mut UwuConfig)) {
+    let current = handle.load();
+    let mut next = (**current).clone();
+    mutate(&mut next);
+    handle.store(Arc::new(next));
 }
 
 /// 上下文数据库统一配置。

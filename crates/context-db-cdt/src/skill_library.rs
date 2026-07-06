@@ -29,8 +29,8 @@ impl SkillLibrary {
         // 使用向量索引搜索相似 skill
         let hits = self.index.search("skills", task_embedding.to_vec(), k, None).await.unwrap_or_default();
         hits.into_iter().map(|h| SkillEntry {
-            uri: ContextUri::parse(&h.uri).unwrap(),
-            name: h.uri,
+            uri: h.uri.clone(),
+            name: h.uri.to_string(),
             description: String::new(),
             precondition: String::new(),
             success_rate: h.score,
@@ -41,7 +41,7 @@ impl SkillLibrary {
     /// 执行成功后存入 skill library。
     pub async fn deposit(&self, skill: &SkillEntry) {
         let point = agent_context_db_core::IndexPoint {
-            uri: skill.uri.to_string(),
+            uri: skill.uri.clone(),
             vector: skill.embedding.clone(),
             payload: serde_json::json!({
                 "name": skill.name,

@@ -13,35 +13,17 @@ pub enum ContextError {
     #[error("storage: {0}")]
     Storage(String),
     #[error("LLM: {0}")]
-    Llm(String),
+    Llm(#[from] crate::LlmError),
     #[error("version conflict: {0}")]
     VersionConflict(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
     #[error("serialization: {0}")]
-    Serialization(String),
+    Serialization(#[from] serde_json::Error),
     #[error("IO: {0}")]
-    Io(String),
+    Io(#[from] std::io::Error),
     #[error("unsupported: {0}")]
     Unsupported(String),
-}
-
-impl From<serde_json::Error> for ContextError {
-    fn from(e: serde_json::Error) -> Self {
-        ContextError::Serialization(e.to_string())
-    }
-}
-
-impl From<std::io::Error> for ContextError {
-    fn from(e: std::io::Error) -> Self {
-        ContextError::Io(e.to_string())
-    }
-}
-
-impl From<crate::LlmError> for ContextError {
-    fn from(e: crate::LlmError) -> Self {
-        ContextError::Llm(e.to_string())
-    }
 }
 
 pub type Result<T> = std::result::Result<T, ContextError>;

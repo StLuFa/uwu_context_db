@@ -12,6 +12,7 @@
 //!
 //! 这样 wiki 子域完全不自持存储，真值源唯一（context-db 的 PG+Qdrant）。
 
+use agent_context_db_core::ContextUri;
 use agent_context_db_storage::{IndexPoint, VectorIndex};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -36,6 +37,13 @@ impl WikiVectorStoreAdapter {
     pub fn new(index: Arc<dyn VectorIndex>) -> Self {
         Self { index }
     }
+
+    /// wiki id → ContextUri（要求 id 是有效的 uwu:// URI；否则报错）。
+    fn parse_id(id: &str) -> Result<ContextUri> {
+        ContextUri::parse(id).map_err(|e| wiki_core::WikiError::Storage(
+            format!("wiki id is not a valid uwu URI: {id} — {e}")
+        ))
+    }
 }
 
 #[async_trait]
@@ -47,11 +55,12 @@ impl VectorStore for WikiVectorStoreAdapter {
         vector: Vec<f32>,
         metadata: serde_json::Value,
     ) -> Result<()> {
+        let uri = Self::parse_id(id)?;
         self.index
             .upsert(
                 collection,
                 IndexPoint {
-                    uri: id.to_string(),
+                    uri,
                     vector,
                     payload: metadata,
                 },
@@ -75,7 +84,7 @@ impl VectorStore for WikiVectorStoreAdapter {
         Ok(hits
             .into_iter()
             .map(|h| VectorSearchResult {
-                id: h.uri,
+                id: h.uri.to_string(),
                 score: h.score,
                 metadata: h.payload,
             })
@@ -83,8 +92,9 @@ impl VectorStore for WikiVectorStoreAdapter {
     }
 
     async fn delete(&self, collection: &str, id: &str) -> Result<()> {
+        let uri = Self::parse_id(id)?;
         self.index
-            .delete(collection, id)
+            .delete(collection, &uri)
             .await
             .map_err(|e| wiki_core::WikiError::Storage(e.to_string()))
     }
@@ -166,7 +176,7 @@ mod tests {
     // 内存 VectorIndex，验证桥接方向正确。
     #[derive(Default)]
     struct MemIndex {
-        data: Mutex<HashMap<String, (Vec<f32>, serde_json::Value)>>,
+        data: Mutex<HashMap<ContextUri, (Vec<f32>, serde_json::Value)>>,
     }
     #[async_trait]
     impl VectorIndex for MemIndex {
@@ -192,7 +202,7 @@ mod tests {
                 })
                 .collect())
         }
-        async fn delete(&self, _c: &str, uri: &str) -> CdbResult<()> {
+        async fn delete(&self, _c: &str, uri: &ContextUri) -> CdbResult<()> {
             self.data.lock().remove(uri);
             Ok(())
         }
@@ -204,7 +214,7 @@ mod tests {
         let adapter = WikiVectorStoreAdapter::new(index);
 
         adapter
-            .upsert("wiki_blocks", "b1", vec![1.0, 0.0], serde_json::json!({"doc": "d1"}))
+            .upsert("wiki_blocks", "uwu://wiki/b1", vec![1.0, 0.0], serde_json::json!({"doc": "d1"}))
             .await
             .unwrap();
         let hits = adapter
@@ -212,9 +222,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "b1");
+        assert_eq!(hits[0].id, "uwu://wiki/b1");
 
-        adapter.delete("wiki_blocks", "b1").await.unwrap();
+        adapter.delete("wiki_blocks", "uwu://wiki/b1").await.unwrap();
         assert!(adapter
             .search("wiki_blocks", vec![1.0, 0.0], 5, None)
             .await

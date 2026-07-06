@@ -267,11 +267,14 @@ impl MaterializedView {
         let mut cache = self.cache.lock();
         // H.2: 容量超限 → 淘汰最旧的 N 条
         if cache.len() >= self.max_capacity {
-            let mut entries: Vec<_> = cache.iter().collect();
-            entries.sort_by_key(|(_, (_, e))| *e);
+            let mut entries: Vec<(String, chrono::DateTime<chrono::Utc>)> = cache
+                .iter()
+                .map(|(k, (_, e))| (k.clone(), *e))
+                .collect();
+            entries.sort_by_key(|(_, e)| *e);
             let to_remove = entries.len() - self.max_capacity + 1;
             for (k, _) in entries.iter().take(to_remove) {
-                cache.remove(*k);
+                cache.remove(k);
             }
         }
         cache.insert(query.to_string(), (uris, expires));
@@ -314,7 +317,7 @@ impl PartitionedRetriever {
         let handles: Vec<_> = owned_partitions.into_iter().map(|tenant| {
             let fs = self.fs.clone();
             let mut pattern = owned_pattern.clone();
-            pattern.scope = Some(ContextUri::parse(format!("uwu://{tenant}")).unwrap_or_else(|_| ContextUri("".into())));
+            pattern.scope = ContextUri::parse(format!("uwu://{tenant}")).ok();
             tokio::spawn(async move {
                 match fs.find(&pattern).await {
                     Ok(uris) => Some((tenant, uris)),

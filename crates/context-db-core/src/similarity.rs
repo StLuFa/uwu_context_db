@@ -100,17 +100,15 @@ impl CrossAgentDedup {
 
                 for (uri_a, emb_a) in map_a {
                     for (uri_b, emb_b) in map_b {
-                        let key = if uri_a < uri_b { (uri_a, uri_b) } else { (uri_b, uri_a) };
+                        let key = if uri_a < uri_b { (uri_a.clone(), uri_b.clone()) } else { (uri_b.clone(), uri_a.clone()) };
                         if visited.contains(&key) { continue; }
                         visited.insert(key);
 
                         let sim = VectorSimilarity::cosine(emb_a, emb_b);
                         if sim >= self.threshold {
-                            pairs.push((
-                                uri_a.clone(),
-                                uri_b.clone(),
-                                sim,
-                            ));
+                            if let (Ok(ua), Ok(ub)) = (ContextUri::parse(uri_a.clone()), ContextUri::parse(uri_b.clone())) {
+                                pairs.push((ua, ub, sim));
+                            }
                         }
                     }
                 }
@@ -132,8 +130,8 @@ impl CrossAgentDedup {
         // Union-Find 聚类
         let mut parent: HashMap<String, String> = HashMap::new();
         for (a, b, _) in pairs {
-            let pa = find_root(&mut parent, &a.0);
-            let pb = find_root(&mut parent, &b.0);
+            let pa = find_root(&mut parent, &a.to_string());
+            let pb = find_root(&mut parent, &b.to_string());
             if pa != pb {
                 parent.insert(pa.clone(), pb.clone());
             }
@@ -141,12 +139,12 @@ impl CrossAgentDedup {
 
         // 收集各组
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-        let all_uris: Vec<&String> = pairs.iter()
-            .flat_map(|(a, b, _)| vec![&a.0, &b.0])
+        let all_uris: Vec<String> = pairs.iter()
+            .flat_map(|(a, b, _)| vec![a.to_string(), b.to_string()])
             .collect();
         for uri in all_uris {
-            let root = find_root(&mut parent, uri);
-            groups.entry(root).or_default().push(uri.clone());
+            let root = find_root(&mut parent, &uri);
+            groups.entry(root).or_default().push(uri);
         }
 
         groups
@@ -372,95 +370,6 @@ fn rand_float() -> f32 {
 // ===========================================================================
 // 弃用旧类型
 // ===========================================================================
-
-#[deprecated(note = "使用 LocalKnowledgeNetwork + LSH 替代")]
-pub struct CrossAgentDedup {
-    threshold: f32,
-    embeddings: parking_lot::Mutex<HashMap<String, HashMap<String, Vec<f32>>>>,
-}
-
-#[allow(deprecated)]
-impl CrossAgentDedup {
-    pub fn new(threshold: f32) -> Self {
-        Self {
-            threshold,
-            embeddings: parking_lot::Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn register(&self, agent_id: &str, uri: &ContextUri, embedding: Vec<f32>) {
-        self.embeddings
-            .lock()
-            .entry(agent_id.to_string())
-            .or_default()
-            .insert(uri.to_string(), embedding);
-    }
-
-    pub fn find_similar(&self) -> SimilarityResult {
-        let embeddings = self.embeddings.lock();
-        let mut pairs = Vec::new();
-        let agent_ids: Vec<String> = embeddings.keys().cloned().collect();
-        for i in 0..agent_ids.len() {
-            for j in (i + 1)..agent_ids.len() {
-                let a_agent = &agent_ids[i];
-                let b_agent = &agent_ids[j];
-                if let (Some(a_map), Some(b_map)) = (embeddings.get(a_agent), embeddings.get(b_agent)) {
-                    for (uri_a, emb_a) in a_map {
-                        for (uri_b, emb_b) in b_map {
-                            let sim = VectorSimilarity::cosine(emb_a, emb_b);
-                            if sim >= self.threshold {
-                                pairs.push((uri_a.clone(), uri_b.clone(), sim));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let mut clusters = Vec::new();
-        // Union-Find clustering
-        let mut parent: HashMap<String, String> = HashMap::new();
-        for (a, b, _) in &pairs {
-            let a_str = a.to_string();
-            let b_str = b.to_string();
-            parent.entry(a_str.clone()).or_insert_with(|| a_str.clone());
-            parent.entry(b_str.clone()).or_insert_with(|| b_str.clone());
-            let root_a = find_root(&mut parent, &a_str);
-            let root_b = find_root(&mut parent, &b_str);
-            if root_a != root_b {
-                parent.insert(root_a, root_b);
-            }
-        }
-        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-        let all_uris: Vec<&String> = pairs
-            .iter()
-            .flat_map(|(a, b, _)| {
-                let a_s = a.to_string();
-                let b_s = b.to_string();
-                vec![a_s, b_s]
-            })
-            .collect::<Vec<_>>();
-        // dedup all_uris
-        let mut seen = std::collections::HashSet::new();
-        for uri in &all_uris {
-            if !seen.insert(uri.clone()) { continue; }
-            let root = find_root(&mut parent, uri);
-            groups.entry(root).or_default().push(uri.clone());
-        }
-        clusters = groups
-            .into_iter()
-            .filter(|(_, uris)| uris.len() >= 2)
-            .map(|(id, uris)| Cluster {
-                id: id.chars().take(8).collect(),
-                uris: uris.into_iter().map(|s| ContextUri::parse(s).unwrap()).collect(),
-                centroid_description: String::new(),
-                agents: vec![],
-                recommendation: DedupRecommendation::ManualReview,
-            })
-            .collect();
-
-        SimilarityResult { pairs, clusters }
-    }
-}
 
 fn find_root(parent: &mut HashMap<String, String>, node: &str) -> String {
     let mut current = node.to_string();

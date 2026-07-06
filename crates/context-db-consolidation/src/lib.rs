@@ -10,7 +10,7 @@
 //! - 引擎：ConsolidationEngine / MemoryResolver / DualTimeline / BackwardEvolver
 //! - 单 Agent 创新：rif / halflife / associative / entanglement / opportunity / explainable
 
-pub mod associative;
+// associative 已移入 context-db-retrieve —— 检索层负责联想扩展
 pub mod batch;
 pub mod entanglement;
 pub mod explainable;
@@ -675,14 +675,27 @@ impl DualTimeline {
 /// 反向进化器 — 新晶体写入后，追溯更新语义重叠的历史条目。
 ///
 /// 新记忆不仅是 forward 演化，还反过来更新历史记忆的 lineage 和 context version。
+///
+/// 触发路径：
+/// 1. **文本相似**：Jaccard(new, hist) ≥ threshold → 记入受影响集合
+/// 2. **图边扩展**（可选，需注入 `GraphStore`）：命中项沿 `EvolvedFrom`/`EvolvedTo` 各扩 1 跳，
+///    传播 lineage 更新到间接相关的历史条目
 pub struct BackwardEvolver {
     /// 语义重叠阈值（Jaccard 相似度）。
     similarity_threshold: f32,
+    /// 关系图存储（可选）。注入后启用图边扩展。
+    graph: Option<Arc<dyn agent_context_db_core::GraphStore>>,
 }
 
 impl BackwardEvolver {
     pub fn new() -> Self {
-        Self { similarity_threshold: 0.3 }
+        Self { similarity_threshold: 0.3, graph: None }
+    }
+
+    /// 注入关系图存储，启用图边扩展路径。
+    pub fn with_graph(mut self, graph: Arc<dyn agent_context_db_core::GraphStore>) -> Self {
+        self.graph = Some(graph);
+        self
     }
 
     /// 检查新产物是否影响历史条目，更新受影响条目的 lineage。
@@ -690,14 +703,13 @@ impl BackwardEvolver {
     /// 对每条历史 entry：
     /// 1. 计算与新产物的文本重叠度（Jaccard 相似度）
     /// 2. 相似度超过阈值 → 追溯更新 lineage（追加 LineageEntry）
-    /// 3. 返回受影响的条目数量
-    pub fn evolve_backward(
+    /// 3. 若注入 `graph`：沿 `EvolvedFrom`/`EvolvedTo` 扩 1 跳，间接相关条目也追加 lineage
+    /// 4. 返回受影响的条目数量
+    pub async fn evolve_backward(
         &self,
         new_product: &ConsolidationProduct,
         historical: &mut [ContextEntry],
     ) -> usize {
-        let mut updated = 0;
-
         // 提取新产物的关键词集合
         let new_keywords: std::collections::HashSet<&str> =
             new_product.content.split_whitespace().collect();
@@ -706,12 +718,13 @@ impl BackwardEvolver {
             return 0;
         }
 
-        for entry in historical.iter_mut() {
+        // 阶段 1：Jaccard 命中集
+        let mut affected_uris: std::collections::HashSet<agent_context_db_core::ContextUri> =
+            std::collections::HashSet::new();
+        for entry in historical.iter() {
             let entry_text = entry.l0_text();
             let entry_keywords: std::collections::HashSet<&str> =
                 entry_text.split_whitespace().collect();
-
-            // Jaccard 相似度
             let intersection = new_keywords.intersection(&entry_keywords).count();
             let union = new_keywords.union(&entry_keywords).count();
             let similarity = if union > 0 {
@@ -719,36 +732,59 @@ impl BackwardEvolver {
             } else {
                 0.0
             };
-
             if similarity >= self.similarity_threshold {
-                // 追溯更新 lineage
-                let lineage_entry = LineageEntry {
-                    version: entry.mvcc_version,
-                    timestamp: Utc::now(),
-                    change_summary: format!(
-                        "backward-evolved from {} (similarity={:.2})",
-                        new_product.uri, similarity
-                    ),
-                };
-
-                if let Some(ref mut consolidation) = entry.metadata.consolidation {
-                    consolidation.lineage.push(lineage_entry);
-                } else {
-                    entry.metadata.consolidation = Some(ConsolidationMeta {
-                        source: "backward-evolve".to_string(),
-                        generation: 1,
-                        status: ConsolidationStatus::InProgress,
-                        patch_count: 1,
-                        lineage: vec![lineage_entry],
-                        evidence_uris: vec![],
-                        corroboration: 0,
-                        half_life_days: None,
-                        entangled_with: vec![],
-                    });
-                }
-
-                updated += 1;
+                affected_uris.insert(entry.uri.clone());
             }
+        }
+
+        // 阶段 2：图边扩展 — 沿 EvolvedFrom / EvolvedTo 扩 1 跳
+        if let Some(graph) = &self.graph {
+            let seeds: Vec<agent_context_db_core::ContextUri> = affected_uris.iter().cloned().collect();
+            if !seeds.is_empty() {
+                let kinds = [
+                    agent_context_db_core::GraphRelation::EvolvedFrom,
+                    agent_context_db_core::GraphRelation::EvolvedTo,
+                ];
+                if let Ok(edges) = graph.batch_traverse(&seeds, &kinds, 1).await {
+                    for (_from, to, _kind) in edges {
+                        affected_uris.insert(to);
+                    }
+                }
+            }
+        }
+
+        // 阶段 3：对所有受影响 URI 追加 lineage
+        let mut updated = 0;
+        for entry in historical.iter_mut() {
+            if !affected_uris.contains(&entry.uri) {
+                continue;
+            }
+            let similarity_note = if self.graph.is_some() {
+                format!("backward-evolved from {} (jaccard+graph)", new_product.uri)
+            } else {
+                format!("backward-evolved from {}", new_product.uri)
+            };
+            let lineage_entry = LineageEntry {
+                version: entry.mvcc_version,
+                timestamp: Utc::now(),
+                change_summary: similarity_note,
+            };
+            if let Some(ref mut consolidation) = entry.metadata.consolidation {
+                consolidation.lineage.push(lineage_entry);
+            } else {
+                entry.metadata.consolidation = Some(agent_context_db_core::ConsolidationMeta {
+                    source: "backward-evolve".to_string(),
+                    generation: 1,
+                    status: agent_context_db_core::ConsolidationStatus::InProgress,
+                    patch_count: 1,
+                    lineage: vec![lineage_entry],
+                    evidence_uris: vec![],
+                    corroboration: 0,
+                    half_life_days: None,
+                    entangled_with: vec![],
+                });
+            }
+            updated += 1;
         }
 
         updated
@@ -776,8 +812,14 @@ pub struct SleeptimeExecutor {
     pub tasks: Vec<SleeptimeTask>,
     pub interval: std::time::Duration,
     checker: ConsistencyChecker,
+    /// 纠缠检测器 —— EntanglementDetection 任务的实际执行者。
+    entanglement: crate::entanglement::EntanglementDetector,
     /// 可选的存储读取器（Sleeptime 加载条目用）。
     store: Option<Arc<dyn agent_context_db_core::ContentStore>>,
+    /// 可选的关系图存储（BackwardEvolve 用于图边扩展）。
+    graph: Option<Arc<dyn agent_context_db_core::GraphStore>>,
+    /// 可选的向量索引 —— `on_adopted()` 触发 RIF 抑制时使用。
+    vector_index: Option<Arc<dyn agent_context_db_core::VectorIndex>>,
 }
 
 impl SleeptimeExecutor {
@@ -794,7 +836,10 @@ impl SleeptimeExecutor {
             ],
             interval: std::time::Duration::from_secs(3600),
             checker: ConsistencyChecker::new(),
+            entanglement: crate::entanglement::EntanglementDetector::new(0.3),
             store: None,
+            graph: None,
+            vector_index: None,
         }
     }
 
@@ -802,6 +847,57 @@ impl SleeptimeExecutor {
     pub fn with_store(mut self, store: Arc<dyn agent_context_db_core::ContentStore>) -> Self {
         self.store = Some(store);
         self
+    }
+
+    /// 绑定关系图存储，启用 BackwardEvolve 的图边扩展路径。
+    pub fn with_graph(mut self, graph: Arc<dyn agent_context_db_core::GraphStore>) -> Self {
+        self.graph = Some(graph);
+        self
+    }
+
+    /// 绑定向量索引，启用 `on_adopted()` 的 RIF 邻居抑制路径。
+    pub fn with_vector_index(mut self, index: Arc<dyn agent_context_db_core::VectorIndex>) -> Self {
+        self.vector_index = Some(index);
+        self
+    }
+
+    /// 记录一次跨条目 patch 共现事件（供 EntanglementDetection 汇总）。
+    pub fn record_co_patch(
+        &self,
+        a: &ContextUri,
+        b: &ContextUri,
+    ) {
+        self.entanglement.record_co_patch(a, b);
+    }
+
+    /// 采纳事件钩子 —— 触发 RIF 抑制 + 校准器更新。
+    ///
+    /// 调用方在 `MemoryResolver::resolve` 决策为 `ADD` 且被上层实际写入后调用。
+    /// 返回被判定为"冗余邻居"的 URI 列表（上层应用可据此下调其质量分）。
+    ///
+    /// - 若未注入 `vector_index` → 返回空列表（RIF 静默禁用）
+    /// - 若命中邻居 → 同时调用 `engine.calibrator.update(epistemic, declared, adopted=false)`
+    ///   把"被抑制"当作"未被采纳"喂给校准器，收紧过度自信
+    pub async fn on_adopted(
+        &self,
+        engine: &ConsolidationEngine,
+        adopted: &ConsolidationProduct,
+        embedding: &[f32],
+    ) -> Vec<ContextUri> {
+        let index = match &self.vector_index {
+            Some(i) => i.clone(),
+            None => return vec![],
+        };
+        let rif = crate::rif::RifSuppressor::new(index, 0.15);
+        let suppressed = rif.on_adopted(&adopted.uri, embedding).await.unwrap_or_default();
+
+        // 采纳自身：喂给校准器（adopted=true）
+        engine.calibrator.update(adopted.epistemic_type, adopted.confidence, true);
+        // 被抑制邻居：视作"未采纳"，帮助收紧同类型温度
+        for _ in &suppressed {
+            engine.calibrator.update(adopted.epistemic_type, adopted.confidence, false);
+        }
+        suppressed
     }
 
     /// 执行一轮 Sleeptime 后台整理，从存储加载数据并运行全部检查。
@@ -822,7 +918,30 @@ impl SleeptimeExecutor {
         for task in &self.tasks {
             match task {
                 SleeptimeTask::QualityReassessment => {
-                    tracing::info!(scope=%scope, count=%entries.len(), "sleeptime: quality reassessment");
+                    // TODO(sleeptime-quality): 实际质量重评分
+                    //
+                    // 当前只发 tracing，未真正更新 entries 的 quality_score / confidence。
+                    //
+                    // 落地前需要用户确认以下语义：
+                    //   1) 输入信号来源
+                    //      - 访问频率 / 最近命中率（来自 RIF 反馈）
+                    //      - ForgettingModel.retention() 当前值
+                    //      - ConsistencyChecker 是否检出违规
+                    //      - 外部标注（用户 explicit reject / adopt）
+                    //   2) 评分函数
+                    //      - 贝叶斯后验更新（Beta(α, β) 增量）？
+                    //      - 简单加权 EWMA？
+                    //      - 与 lifecycle::BayesianModel 复用还是独立？
+                    //   3) 触发/收敛条件
+                    //      - 每个 entry 每次 sleeptime 都重评，还是抽样？
+                    //      - 分数变化阈值（避免抖动写入）
+                    //   4) 写回路径
+                    //      - 直接改 ContextEntry.metadata.quality_score（需要 store.put）
+                    //      - 还是走 VersionStore.commit 留下 provenance
+                    //
+                    // 与 ForgettingModel 的边界：ForgettingModel 管 retention 曲线，
+                    // QualityReassessment 管 quality_score 本身，二者正交但都影响检索排序。
+                    tracing::info!(scope=%scope, count=%entries.len(), "sleeptime: quality reassessment (not implemented — see TODO)");
                     report.tasks_executed += 1;
                 }
                 SleeptimeTask::ConsistencyCheck => {
@@ -836,7 +955,7 @@ impl SleeptimeExecutor {
                             error_pattern: None, hypothesis_outcome: None, preconditions: None,
                             expected_outcome: None, related_policy_uris: vec![],
                             metadata: ConsolidationMeta {
-                                source: String::new(), generation: 0, status: ConsolidationStatus::Pending,
+                                source_session: None, generation: 0, status: ConsolidationStatus::Pending,
                                 patch_count: 0, lineage: vec![],
                                 validity: e.metadata.validity.clone(), half_life_days: None,
                             },
@@ -847,14 +966,34 @@ impl SleeptimeExecutor {
                     report.tasks_executed += 1;
                 }
                 SleeptimeTask::EntanglementDetection => {
-                    report.tasks_executed += 1; report.entanglements_detected += 1;
+                    // 应用衰减，让长期不再共现的纠缠自然消退
+                    self.entanglement.decay(0.05);
+                    // 统计当前仍高于阈值的纠缠对数
+                    let count = entries.iter()
+                        .map(|e| self.entanglement.get_entangled(&e.uri).len())
+                        .sum::<usize>();
+                    report.entanglements_detected = count;
+                    report.tasks_executed += 1;
                 }
                 SleeptimeTask::IgnoranceMapUpdate => {
                     let spots = engine.ignorance.top_blind_spots(10);
                     report.blind_spots_updated = spots.len();
                     report.tasks_executed += 1;
                 }
-                SleeptimeTask::CalibrationUpdate => { report.tasks_executed += 1; }
+                SleeptimeTask::CalibrationUpdate => {
+                    // 用当前条目样本喂校准器 —— 声明置信度 = quality_score，
+                    // 采纳与否用 quality_score ≥ 0.7 作为启发式判据
+                    let mut samples = 0usize;
+                    for entry in &entries {
+                        let epistemic = entry.metadata.epistemic_type().unwrap_or(EpistemicType::Fact);
+                        let declared = entry.metadata.quality_score.unwrap_or(0.5);
+                        let adopted = declared >= 0.7;
+                        engine.calibrator.update(epistemic, declared, adopted);
+                        samples += 1;
+                    }
+                    report.calibration_samples = samples;
+                    report.tasks_executed += 1;
+                }
                 SleeptimeTask::ContextRotPrune => {
                     let pruned = entries.iter().filter(|e| {
                         e.metadata.quality_score.unwrap_or(0.5) < 0.1
@@ -873,16 +1012,19 @@ impl SleeptimeExecutor {
                             error_pattern: None, hypothesis_outcome: None, preconditions: None,
                             expected_outcome: None, related_policy_uris: vec![],
                             metadata: ConsolidationMeta {
-                                source: String::new(), generation: 0, status: ConsolidationStatus::Pending,
+                                source_session: None, generation: 0, status: ConsolidationStatus::Pending,
                                 patch_count: 0, lineage: vec![],
                                 validity: e.metadata.validity.clone(), half_life_days: None,
                             },
                         }
                     }).collect();
                     if let Some(last) = products.last() {
-                        let evolver = BackwardEvolver::new();
+                        let mut evolver = BackwardEvolver::new();
+                        if let Some(ref g) = self.graph {
+                            evolver = evolver.with_graph(g.clone());
+                        }
                         let mut mutable = entries.clone();
-                        let _updated = evolver.evolve_backward(last, &mut mutable);
+                        let _updated = evolver.evolve_backward(last, &mut mutable).await;
                     }
                     report.tasks_executed += 1;
                 }
@@ -900,6 +1042,7 @@ pub struct SleeptimeReport {
     pub entanglements_detected: usize,
     pub pruned: usize,
     pub blind_spots_updated: usize,
+    pub calibration_samples: usize,
 }
 
 // ===========================================================================

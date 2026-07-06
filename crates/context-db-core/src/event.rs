@@ -1,118 +1,12 @@
-//! 变更事件流 + 因果链（F5）+ 上下文继承（F11）+ 上下文模板（F12）。
+//! F11 上下文继承 + F12 上下文模板。
+//!
+//! F5 变更事件流 / EventEmitter / CausalLink 已迁移到 `event_store.rs`
+//! （基于 `uwu_event_mesh`）。
 
 use crate::{ContextEntry, ContextUri, MemoryClass};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// F5 变更事件流 + 因果链
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// 变更来源。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ChangeSource {
-    SessionCommit { session_id: String, compression_index: u64 },
-    AgentWrite { agent_id: String },
-    ForkPromotion { fork_name: String },
-    AutoConsolidation,
-    Import { pack_name: String },
-}
-
-/// 因果链节点。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CausalLink {
-    /// 触发源 URI
-    pub source_uri: ContextUri,
-    /// 来源类型
-    pub source: ChangeSource,
-    /// 时间戳
-    pub timestamp: DateTime<Utc>,
-    /// 上游因果链
-    pub parent: Option<Box<CausalLink>>,
-}
-
-/// 流式变更事件 + 完整因果链。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangeEventStream {
-    /// 事件 ID
-    pub event_id: String,
-    /// 变更的条目
-    pub entries: Vec<ContextEntry>,
-    /// 因果链
-    pub causal_chain: CausalLink,
-    /// 发生时间
-    pub occurred_at: DateTime<Utc>,
-}
-
-/// 事件流发射器。
-pub struct EventEmitter {
-    /// 事件历史
-    history: parking_lot::Mutex<Vec<ChangeEventStream>>,
-    /// 因果链索引：URI → 最近的因果链
-    causal_index: parking_lot::Mutex<HashMap<String, CausalLink>>,
-}
-
-impl EventEmitter {
-    pub fn new() -> Self {
-        Self {
-            history: parking_lot::Mutex::new(Vec::new()),
-            causal_index: parking_lot::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// 发射一个变更事件。
-    pub fn emit(
-        &self,
-        entries: Vec<ContextEntry>,
-        source: ChangeSource,
-        parent_uri: Option<ContextUri>,
-    ) -> ChangeEventStream {
-        let parent = parent_uri
-            .and_then(|uri| self.causal_index.lock().get(&uri.to_string()).cloned());
-
-        let causal_link = CausalLink {
-            source_uri: entries.first().map(|e| e.uri.clone()).unwrap_or_else(|| ContextUri::parse("uwu://_/empty").unwrap()),
-            source: source.clone(),
-            timestamp: Utc::now(),
-            parent: parent.map(Box::new),
-        };
-
-        let event = ChangeEventStream {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            entries,
-            causal_chain: causal_link.clone(),
-            occurred_at: Utc::now(),
-        };
-
-        // 更新索引
-        for entry in &event.entries {
-            self.causal_index.lock().insert(entry.uri.to_string().clone(), causal_link.clone());
-        }
-        self.history.lock().push(event.clone());
-        event
-    }
-
-    /// 追溯某个 URI 的完整因果链。
-    pub fn trace_causality(&self, uri: &ContextUri) -> Vec<CausalLink> {
-        let mut chain = Vec::new();
-        let mut current = self.causal_index.lock().get(&uri.to_string()).cloned();
-        while let Some(link) = current {
-            current = link.parent.as_ref().map(|p| *p.clone());
-            chain.push(link);
-        }
-        chain
-    }
-
-    /// 最近 N 个事件。
-    pub fn recent(&self, n: usize) -> Vec<ChangeEventStream> {
-        self.history.lock().iter().rev().take(n).cloned().collect()
-    }
-}
-
-impl Default for EventEmitter {
-    fn default() -> Self { Self::new() }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // F11 上下文继承与覆盖
@@ -155,8 +49,6 @@ pub enum OverrideAction {
 }
 
 /// 继承链管理器。
-///
-/// 运行时维护 Agent 继承 DAG；支持序列化到 context-db 和从 context-db 恢复。
 #[derive(Default)]
 pub struct InheritanceChain {
     nodes: parking_lot::Mutex<Vec<InheritanceNode>>,
@@ -190,21 +82,18 @@ impl InheritanceChain {
         // 查父级
         if let Some(ref parent_id) = node.parent {
             let parent_node = nodes.iter().find(|n| &n.agent_id == parent_id)?;
-            // 将 URI 映射到父级 scope
-            let mapped = uri.to_string().replace(&node.scope.0, &parent_node.scope.0);
+            let mapped = uri.to_string().replace(node.scope.as_str(), parent_node.scope.as_str());
             Some((ContextUri::parse(mapped).unwrap(), true))
         } else {
             Some((uri.clone(), false))
         }
     }
 
-    /// 序列化为 JSON（用于持久化到 context-db）。
     pub fn serialize_to_json(&self) -> String {
         let nodes = self.nodes.lock();
         serde_json::to_string(&*nodes).unwrap_or_else(|_| "[]".to_string())
     }
 
-    /// 从 JSON 反序列化（从 context-db 恢复）。
     pub fn deserialize_from_json(&self, json: &str) -> Result<(), String> {
         let parsed: Vec<InheritanceNode> =
             serde_json::from_str(json).map_err(|e| format!("deserialize: {e}"))?;
@@ -214,7 +103,6 @@ impl InheritanceChain {
         Ok(())
     }
 
-    /// 返回所有节点的快照（只读）。
     pub fn snapshot(&self) -> Vec<InheritanceNode> {
         self.nodes.lock().clone()
     }
@@ -229,20 +117,15 @@ impl InheritanceChain {
 pub struct ContextTemplate {
     pub name: String,
     pub description: String,
-    /// 模板条目（占位符用 {key} 标记）
     pub entries: Vec<TemplateEntry>,
-    /// 默认变量值
     pub defaults: HashMap<String, String>,
 }
 
 /// 模板中的条目定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateEntry {
-    /// URI 模板（含占位符）
     pub uri_template: String,
-    /// L0 模板
     pub abstract_template: String,
-    /// 记忆类型
     pub memory_class: Option<MemoryClass>,
 }
 
@@ -250,15 +133,12 @@ pub struct TemplateEntry {
 pub struct TemplateEngine;
 
 impl TemplateEngine {
-    /// 用变量填充模板，生成实例化条目。
     pub fn instantiate(
         template: &ContextTemplate,
         variables: &HashMap<String, String>,
         scope: &ContextUri,
     ) -> Vec<ContextEntry> {
         let mut entries = Vec::new();
-
-        // 合并默认值 + 传入变量（传入优先）
         let mut vars = template.defaults.clone();
         for (k, v) in variables {
             vars.insert(k.clone(), v.clone());
@@ -296,21 +176,6 @@ impl TemplateEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn event_emitter_traces_causality_chain() {
-        let emitter = EventEmitter::new();
-        let uri = ContextUri::parse("uwu://t1/agent/a1/memories/cases/c1").unwrap();
-        let entry = ContextEntry::new_text(uri.clone(), crate::TenantId(uuid::Uuid::nil()), "test");
-
-        let e1 = emitter.emit(vec![entry], ChangeSource::SessionCommit {
-            session_id: "s1".into(), compression_index: 0,
-        }, None);
-        assert_eq!(e1.event_id.len(), 36);
-
-        let chain = emitter.trace_causality(&uri);
-        assert!(!chain.is_empty());
-    }
 
     #[test]
     fn inheritance_resolves_to_parent() {

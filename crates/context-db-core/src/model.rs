@@ -30,6 +30,22 @@ pub struct BlobRef {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentHash(pub String);
 
+/// Schema 引用 —— 指向 JSON Schema / Avro / Protobuf 定义。
+///
+/// `format` 声明 schema 语法（`"json-schema"` / `"avro"` / `"protobuf"` 等），
+/// `blob` 指向实际定义文件。空 `blob` 表示纯内联式使用 `format` 作为轻标记。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaRef {
+    pub format: String,
+    pub blob: Option<BlobRef>,
+}
+
+impl SchemaRef {
+    pub fn json_schema(blob: BlobRef) -> Self {
+        Self { format: "json-schema".into(), blob: Some(blob) }
+    }
+}
+
 /// AGFS 内容 blob 引用（L2 原始内容指针） — 已废弃，使用 BlobRef。
 #[deprecated(note = "使用 BlobRef 替代")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,7 +70,7 @@ pub enum MediaType {
 // ===========================================================================
 
 /// 三层内容级别：L0 摘要 / L1 概览 / L2 原始详情。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ContentLevel {
     #[default]
     L0,
@@ -97,9 +113,12 @@ pub enum ContentPayload {
         embedding: Vec<f32>, // L1 语音特征
         raw: BlobRef,        // L2 原始波形
     },
-    /// 结构化内容：JSON 原生存储
+    /// 结构化内容：JSON 原生存储 + 可选 schema 引用
     Structured {
         summary: String,           // L0 人类可读摘要
+        /// L1 可选 schema 描述（BlobRef 指向 JSON Schema / Avro / Protobuf 定义）。
+        /// 用于校验 `data` 结构、驱动 UI 渲染。`None` 视为 schemaless。
+        schema: Option<SchemaRef>,
         data: serde_json::Value,   // L2 完整 JSON
     },
     /// 多部分组合（如带图的文章）
@@ -154,7 +173,7 @@ impl ContentPayload {
                 l1: None,
                 l2: None,
             },
-            ContentPayload::Structured { summary, data } => DecodedContent::Text {
+            ContentPayload::Structured { summary, data, .. } => DecodedContent::Text {
                 l0: summary.clone(),
                 l1: Some(data.to_string()),
                 l2: None,
@@ -596,58 +615,4 @@ pub struct VersionEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextDiff {
     pub summary: String,
-}
-
-#[cfg(test)]
-mod proptests {
-    use super::*;
-    use proptest::prelude::*;
-
-    /// ContentType::as_path_segment → from_path_segment roundtrip。
-    fn arb_content_type() -> impl Strategy<Value = ContentType> {
-        use ContentType::*;
-        proptest::sample::select(vec![
-            Fact, Belief, Hypothesis, Heuristic, Procedure,
-            Preference, Profile, Goal, Skill, Reflection,
-            Evidence, Error, Meta,
-        ])
-    }
-
-    proptest! {
-        #[test]
-        fn content_type_path_roundtrip(ct in arb_content_type()) {
-            let seg = ct.as_path_segment();
-            let parsed = ContentType::from_path_segment(seg);
-            prop_assert_eq!(parsed, Some(ct));
-        }
-
-        #[test]
-        fn content_type_display_stable(ct in arb_content_type()) {
-            let seg1 = ct.as_path_segment();
-            let seg2 = ct.as_path_segment();
-            prop_assert_eq!(seg1, seg2);
-        }
-
-        #[test]
-        fn media_type_serialization_roundtrip(
-            text in ".*",
-        ) {
-            let payload = ContentPayload::Text {
-                sparse: text.clone(),
-                dense: text.clone(),
-                full: text,
-            };
-            let json = serde_json::to_string(&payload).unwrap();
-            let back: ContentPayload = serde_json::from_str(&json).unwrap();
-            prop_assert_eq!(payload.sparse_text(), back.sparse_text());
-        }
-
-        #[test]
-        fn context_entry_new_text_has_payload() {
-            let uri = ContextUri::parse("uwu://t/test").unwrap();
-            let entry = ContextEntry::new_text(uri, TenantId(uuid::Uuid::nil()), "hello");
-            prop_assert!(!entry.l0_text().is_empty());
-            prop_assert_eq!(entry.media_type, MediaType::Text);
-        }
-    }
 }

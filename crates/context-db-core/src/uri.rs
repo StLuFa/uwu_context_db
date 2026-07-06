@@ -189,6 +189,7 @@ impl ContextUri {
         let inner = UriInner {
             tenant: path[0].clone(),
             path: parent_path.to_vec(),
+            query: None,
             canonical,
         };
         Some(ContextUri(Arc::new(inner)))
@@ -202,6 +203,7 @@ impl ContextUri {
         let inner = UriInner {
             tenant: self.0.tenant.clone(),
             path,
+            query: None,
             canonical,
         };
         ContextUri(Arc::new(inner))
@@ -298,6 +300,7 @@ fn query_to_string(q: &QueryParams) -> String {
         parts.push(format!("limit={}", limit));
     }
     parts.join("&")
+}
 
 impl std::fmt::Display for ContextUri {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

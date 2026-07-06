@@ -4,10 +4,12 @@
 //! 旧版流程（保留）：意图分析 → 目录定位 → 目录内搜索 → 递归深入 → Rerank → 按预算加载。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentType, ContextUri, FsOps, LlmClient, Result, VectorIndex,
+    ContentLevel, ContentPayload, ContentType, ContextUri, FsOps, GraphStore, LlmClient, Result,
+    VectorIndex,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::intent::{LlmIntentAnalyzer, RuleBasedIntentAnalyzer};
 use crate::operators::ExecContext;
@@ -26,6 +28,10 @@ use crate::{
 pub struct ContextRetriever {
     fs: Arc<dyn FsOps>,
     index: Option<Arc<dyn VectorIndex>>,
+    /// 关系图存储 — 若注入，`LogicalPlan::Traverse` 会走 `GraphTraverse` 算子；否则退化。
+    graph: Option<Arc<dyn GraphStore>>,
+    /// 联想扩展开关 —— 若为 true 且 `graph` 存在，主计划输出后自动沿联想图扩展。
+    associative_enabled: bool,
     planner: Arc<dyn QueryPlanner>,
     reranker: Arc<dyn Reranker>,
     optimizer: CboOptimizer,
@@ -44,10 +50,35 @@ impl ContextRetriever {
         Self {
             fs,
             index,
+            graph: None,
+            associative_enabled: false,
             planner,
             reranker,
             optimizer: CboOptimizer::new(stats),
             plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 若配置了图与联想扩展开关，则对已有命中做联想扩展并合并到结果尾部。
+    async fn maybe_expand_associative(
+        &self,
+        hits: Vec<RetrievalHit>,
+    ) -> Vec<RetrievalHit> {
+        if !self.associative_enabled {
+            return hits;
+        }
+        let graph = match &self.graph {
+            Some(g) => g.clone(),
+            None => return hits,
+        };
+        let expander = crate::AssociativeExpander::new(self.fs.clone(), graph);
+        match expander.expand(&hits).await {
+            Ok(extra) => {
+                let mut merged = hits;
+                merged.extend(extra);
+                merged
+            }
+            Err(_) => hits,
         }
     }
 
@@ -57,6 +88,18 @@ impl ContextRetriever {
     }
 
     /// 自然语言查询 → 检索结果。
+    ///
+    /// 检索管线 6 阶段（每阶段都有独立 tracing span）：
+    /// 1. `plan.parse` — NL → LogicalPlan
+    /// 2. `plan.optimize` — CBO → PhysicalPlan
+    /// 3. `plan.execute` — 物理算子执行
+    /// 4. `rerank` — 结果重排
+    /// 5. `expand.associative` — 图边联想扩展（可选）
+    /// 6. `budget.load` — Token 预算加载
+    #[tracing::instrument(
+        skip(self, ctx),
+        fields(query_len = query.len(), budget = ctx.budget_tokens.unwrap_or(8000)),
+    )]
     pub async fn retrieve(
         &self,
         query: &str,
@@ -66,10 +109,15 @@ impl ContextRetriever {
         let mut trace = RetrievalTrace::default();
 
         // 1. 自然语言 → LogicalPlan
-        let logical = self.planner.parse(query, ctx).await?;
+        let logical = self
+            .planner
+            .parse(query, ctx)
+            .instrument(tracing::info_span!("plan.parse"))
+            .await?;
 
         // 2. CBO 优化 → PhysicalPlan
-        let physical = self.optimizer.optimize(&logical);
+        let physical = tracing::info_span!("plan.optimize")
+            .in_scope(|| self.optimizer.optimize(&logical));
         trace.steps.push(TraceStep::PlanOptimized {
             logical: format!("{logical:?}"),
             physical: format!("{physical:?}"),
@@ -79,8 +127,12 @@ impl ContextRetriever {
         let exec_ctx = ExecContext {
             fs: self.fs.clone(),
             index: self.index.clone(),
+            graph: self.graph.clone(),
         };
-        let batch = physical.execute(&exec_ctx).await?;
+        let batch = physical
+            .execute(&exec_ctx)
+            .instrument(tracing::info_span!("plan.execute"))
+            .await?;
         trace.steps.push(TraceStep::Execute {
             plan: "physical".into(),
             hits: batch.records.len(),
@@ -88,16 +140,30 @@ impl ContextRetriever {
         });
 
         // 4. Rerank
-        let reranked = self.reranker.rerank(query, batch.records).await?;
+        let rerank_input = batch.records.len();
+        let reranked = self
+            .reranker
+            .rerank(query, batch.records)
+            .instrument(tracing::info_span!("rerank", input = rerank_input))
+            .await?;
         trace.steps.push(TraceStep::Rerank {
             input: batch.stats.rows_scanned,
             kept: reranked.len(),
             model: "score".into(),
         });
 
-        // 5. Budget loading
-        let (hits, tokens_used) = load_within_budget(reranked, budget);
+        // 4b. 联想扩展（可选）
+        let expand_input = reranked.len();
+        let expanded = self
+            .maybe_expand_associative(reranked)
+            .instrument(tracing::info_span!("expand.associative", input = expand_input))
+            .await;
 
+        // 5. Budget loading
+        let (hits, tokens_used) = tracing::info_span!("budget.load", budget)
+            .in_scope(|| load_within_budget(expanded, budget));
+
+        tracing::info!(hits = hits.len(), tokens_used, "retrieve complete");
         Ok(RetrievalResult {
             hits,
             trace,
@@ -106,6 +172,7 @@ impl ContextRetriever {
     }
 
     /// 结构化 Query → 检索结果。
+    #[tracing::instrument(skip(self, ctx))]
     pub async fn retrieve_query(
         &self,
         query: &Query,
@@ -118,8 +185,9 @@ impl ContextRetriever {
         };
         let mut trace = RetrievalTrace::default();
 
-        let logical = query_to_logical(query);
-        let physical = self.optimizer.optimize(&logical);
+        let logical = tracing::info_span!("plan.parse").in_scope(|| query_to_logical(query));
+        let physical = tracing::info_span!("plan.optimize")
+            .in_scope(|| self.optimizer.optimize(&logical));
         trace.steps.push(TraceStep::PlanOptimized {
             logical: format!("{logical:?}"),
             physical: format!("{physical:?}"),
@@ -128,17 +196,33 @@ impl ContextRetriever {
         let exec_ctx = ExecContext {
             fs: self.fs.clone(),
             index: self.index.clone(),
+            graph: self.graph.clone(),
         };
-        let batch = physical.execute(&exec_ctx).await?;
+        let batch = physical
+            .execute(&exec_ctx)
+            .instrument(tracing::info_span!("plan.execute"))
+            .await?;
         trace.steps.push(TraceStep::Execute {
             plan: "physical".into(),
             hits: batch.records.len(),
             duration_ms: batch.stats.duration.as_millis() as u64,
         });
 
-        let reranked = self.reranker.rerank("", batch.records).await?;
-        let (hits, tokens_used) = load_within_budget(reranked, budget);
+        let rerank_input = batch.records.len();
+        let reranked = self
+            .reranker
+            .rerank("", batch.records)
+            .instrument(tracing::info_span!("rerank", input = rerank_input))
+            .await?;
+        let expand_input = reranked.len();
+        let expanded = self
+            .maybe_expand_associative(reranked)
+            .instrument(tracing::info_span!("expand.associative", input = expand_input))
+            .await;
+        let (hits, tokens_used) = tracing::info_span!("budget.load", budget)
+            .in_scope(|| load_within_budget(expanded, budget));
 
+        tracing::info!(hits = hits.len(), tokens_used, "retrieve_query complete");
         Ok(RetrievalResult {
             hits,
             trace,
@@ -439,6 +523,7 @@ impl HierarchicalRetriever for HierarchicalRetrieverImpl {
         let exec_ctx = ExecContext {
             fs: self.fs.clone(),
             index: self.index.clone(),
+            graph: None,
         };
         let batch = physical.execute(&exec_ctx).await?;
         let (hits, tokens) = load_within_budget(batch.records, 8000);
@@ -458,17 +543,31 @@ impl HierarchicalRetriever for HierarchicalRetrieverImpl {
 pub struct ContextRetrieverBuilder {
     fs: Arc<dyn FsOps>,
     index: Option<Arc<dyn VectorIndex>>,
+    graph: Option<Arc<dyn GraphStore>>,
+    associative_enabled: bool,
     planner: Option<Arc<dyn QueryPlanner>>,
     reranker: Option<Arc<dyn Reranker>>,
 }
 
 impl ContextRetrieverBuilder {
     pub fn new(fs: Arc<dyn FsOps>) -> Self {
-        Self { fs, index: None, planner: None, reranker: None }
+        Self { fs, index: None, graph: None, associative_enabled: false, planner: None, reranker: None }
     }
 
     pub fn with_vector_index(mut self, index: Arc<dyn VectorIndex>) -> Self {
         self.index = Some(index);
+        self
+    }
+
+    /// 注入关系图存储 — 启用 `LogicalPlan::Traverse` 的图遍历执行。
+    pub fn with_graph(mut self, graph: Arc<dyn GraphStore>) -> Self {
+        self.graph = Some(graph);
+        self
+    }
+
+    /// 启用主计划输出后的联想扩展（需先注入 graph，否则无效）。
+    pub fn enable_associative(mut self) -> Self {
+        self.associative_enabled = true;
         self
     }
 
@@ -489,6 +588,9 @@ impl ContextRetrieverBuilder {
         let reranker = self.reranker.unwrap_or_else(|| {
             Arc::new(crate::ScoreReranker { keep: 20 })
         });
-        ContextRetriever::new(self.fs, self.index, planner, reranker)
+        let mut r = ContextRetriever::new(self.fs, self.index, planner, reranker);
+        r.graph = self.graph;
+        r.associative_enabled = self.associative_enabled;
+        r
     }
 }

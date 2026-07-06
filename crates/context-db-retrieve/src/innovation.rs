@@ -73,11 +73,12 @@ impl PredictivePrefetcher {
     /// 记录检索轨迹中的关联（URI A → URI B）。
     pub fn learn_association(&self, from: &ContextUri, to: &ContextUri) {
         let mut assoc = self.associations.lock();
-        let list = assoc.entry(from.0.clone()).or_default();
-        if let Some(entry) = list.iter_mut().find(|(u, _)| u == &to.0) {
+        let list = assoc.entry(from.to_string()).or_default();
+        let to_str = to.to_string();
+        if let Some(entry) = list.iter_mut().find(|(u, _)| u == &to_str) {
             entry.1 += 0.1; // 强化
         } else {
-            list.push((to.0.clone(), 0.3));
+            list.push((to_str, 0.3));
         }
         // 衰减旧关联
         for (_, score) in list.iter_mut() {
@@ -90,14 +91,16 @@ impl PredictivePrefetcher {
         let mut predictions = Vec::new();
 
         // 策略1：关联图预测
-        if let Some(associations) = self.associations.lock().get(&current.0) {
+        if let Some(associations) = self.associations.lock().get(&current.to_string()) {
             for (uri, prob) in associations.iter().take(self.prefetch_size) {
-                predictions.push(PrefetchPrediction {
-                    uri: ContextUri(uri.clone()),
-                    probability: *prob,
-                    pattern: AccessPattern::Sequential,
-                    prefetch_level: if *prob > 0.7 { ContentLevel::L1 } else { ContentLevel::L0 },
-                });
+                if let Ok(parsed) = ContextUri::parse(uri.clone()) {
+                    predictions.push(PrefetchPrediction {
+                        uri: parsed,
+                        probability: *prob,
+                        pattern: AccessPattern::Sequential,
+                        prefetch_level: if *prob > 0.7 { ContentLevel::L1 } else { ContentLevel::L0 },
+                    });
+                }
             }
         }
 

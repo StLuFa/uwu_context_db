@@ -1,16 +1,27 @@
 //! 检索缓存层 — 接入 ReadCache trait，含穿透/雪崩防护。
+//!
+//! 穿透/雪崩防护主体已下沉到 `ReadCache` 实现（`MemoryReadCache` / `UwuCacheAdapter` /
+//! `RedisReadCache`）。本 wrapper 只提供便捷 API 与默认 TTL 语义。
 
 use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, ReadCache};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 带防护的检索缓存包装器。
 pub struct RetrievalCache {
     inner: Arc<dyn ReadCache>,
-    /// 默认 TTL。
     default_ttl: Duration,
-    /// 空结果 TTL（防穿透）。
-    empty_ttl: Duration,
+}
+
+/// 缓存查询结果，区分未命中、命中有值、命中空值。
+#[derive(Debug, Clone)]
+pub enum CacheLookup {
+    /// 未命中，需要回源。
+    Miss,
+    /// 命中并返回内容。
+    Hit(ContentPayload),
+    /// 命中负缓存 —— 已知不存在，直接放弃回源。
+    KnownMissing,
 }
 
 impl RetrievalCache {
@@ -18,58 +29,30 @@ impl RetrievalCache {
         Self {
             inner,
             default_ttl: Duration::from_secs(300),
-            empty_ttl: Duration::from_secs(30),
         }
     }
 
-    /// 读取缓存（带 TTL 检查）。
-    pub async fn get(
-        &self,
-        uri: &ContextUri,
-        level: ContentLevel,
-    ) -> Option<ContentPayload> {
-        self.inner.get(uri, level).await
+    /// 读取缓存 —— 语义化返回。
+    pub async fn get(&self, uri: &ContextUri, level: ContentLevel) -> CacheLookup {
+        match self.inner.get(uri, level).await {
+            None => CacheLookup::Miss,
+            Some(None) => CacheLookup::KnownMissing,
+            Some(Some(payload)) => CacheLookup::Hit(payload),
+        }
     }
 
-    /// 写入缓存（带随机抖动防止雪崩）。
-    pub async fn put(
-        &self,
-        uri: &ContextUri,
-        level: ContentLevel,
-        payload: ContentPayload,
-    ) {
-        let ttl = self.jittered_ttl(self.default_ttl);
-        self.inner.put(uri, level, payload, ttl).await;
+    /// 写入正缓存 —— TTL 抖动由底层 ReadCache 处理。
+    pub async fn put(&self, uri: &ContextUri, level: ContentLevel, payload: ContentPayload) {
+        self.inner.put(uri, level, payload, self.default_ttl).await;
     }
 
-    /// 写入空结果（短 TTL 防穿透）。
-    pub async fn put_empty(
-        &self,
-        uri: &ContextUri,
-        level: ContentLevel,
-    ) {
-        let ttl = self.jittered_ttl(self.empty_ttl);
-        let empty = ContentPayload::Text {
-            sparse: String::new(),
-            dense: String::new(),
-            full: String::new(),
-        };
-        self.inner.put(uri, level, empty, ttl).await;
+    /// 写入负缓存 —— 回源发现 URI 不存在时调用（穿透防护）。
+    pub async fn put_missing(&self, uri: &ContextUri, level: ContentLevel) {
+        self.inner.put_negative(uri, level).await;
     }
 
     /// 缓存失效。
     pub async fn invalidate(&self, uri: &ContextUri) {
         self.inner.invalidate(uri).await;
-    }
-
-    /// TTL 加随机抖动（±10%），防止缓存雪崩。
-    fn jittered_ttl(&self, base: Duration) -> Duration {
-        // 基于当前时间的简单抖动（不需要 rand crate）
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64;
-        let jitter = (base.as_millis() as u64 * (nanos % 20)) / 100;
-        base + Duration::from_millis(jitter)
     }
 }

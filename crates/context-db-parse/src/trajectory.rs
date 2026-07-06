@@ -34,8 +34,7 @@ impl TrajectoryExtractor for TrajectoryExtractorImpl {
             .unwrap_or_else(|_| agent_context_db_core::ContentPayload::Text { sparse: "empty".into(), dense: String::new(), full: String::new() });
 
         let text = match &content {
-            agent_context_db_core::ContentPayload::Text { dense, .. } => s.clone(),
-            agent_context_db_core::ContentPayload::Abstract(s) => s.clone(),
+            agent_context_db_core::ContentPayload::Text { dense, .. } => dense.clone(),
             _ => String::new(),
         };
 
@@ -98,8 +97,7 @@ Return a JSON object with these fields:
         for uri in &trajectories {
             if let Ok(content) = self.fs.read(uri, ContentLevel::L1).await {
                 match content {
-                    agent_context_db_core::ContentPayload::Text { dense, .. } => traj_texts.push(s),
-                    agent_context_db_core::ContentPayload::Abstract(s) => traj_texts.push(s),
+                    agent_context_db_core::ContentPayload::Text { dense, .. } => traj_texts.push(dense),
                     _ => {}
                 }
             }
@@ -110,7 +108,7 @@ Return a JSON object with these fields:
                 uri: trajectories
                     .first()
                     .cloned()
-                    .unwrap_or_else(|| ContextUri("uwu://default/experiences/empty".into())),
+                    .unwrap_or_else(|| ContextUri::parse("uwu://default/experiences/empty").expect("static uri")),
                 situation: "no data".into(),
                 approach: "none".into(),
                 reflect: "nothing to reflect on".into(),
@@ -163,7 +161,7 @@ Return a JSON object with:
         let exp_uri = trajectories
             .first()
             .and_then(|u| u.parent())
-            .unwrap_or_else(|| ContextUri("uwu://default/experiences".into()))
+            .unwrap_or_else(|| ContextUri::parse("uwu://default/experiences").expect("static uri"))
             .join("experience.json");
 
         Ok(Experience {
@@ -198,7 +196,7 @@ mod tests {
             Ok(agent_context_db_core::TreeNode { uri: r.clone(), is_dir: true, children: vec![] })
         }
         async fn read(&self, _: &ContextUri, _: ContentLevel) -> Result<ContentPayload> {
-            Ok(ContentPayload::Overview(self.0.clone()))
+            Ok(ContentPayload::Text { sparse: self.0.clone(), dense: self.0.clone(), full: self.0.clone() })
         }
     }
 

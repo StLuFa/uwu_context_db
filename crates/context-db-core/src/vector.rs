@@ -4,14 +4,15 @@
 //! 后端适配器（Qdrant/Pgvector/Memory）由 storage 层实现。
 
 use crate::error::Result;
+use crate::uri::ContextUri;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// 索引写入点：URI + 向量 + 可选 payload。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexPoint {
-    /// 指向内容层的 uwu:// URI 字符串。
-    pub uri: String,
+    /// 指向内容层的 uwu:// URI。
+    pub uri: ContextUri,
     pub vector: Vec<f32>,
     #[serde(default)]
     pub payload: serde_json::Value,
@@ -20,7 +21,7 @@ pub struct IndexPoint {
 /// 索引命中结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexHit {
-    pub uri: String,
+    pub uri: ContextUri,
     pub score: f32,
     pub payload: serde_json::Value,
 }
@@ -41,5 +42,5 @@ pub trait VectorIndex: Send + Sync {
     ) -> Result<Vec<IndexHit>>;
 
     /// 按 URI 删除索引点。
-    async fn delete(&self, collection: &str, uri: &str) -> Result<()>;
+    async fn delete(&self, collection: &str, uri: &ContextUri) -> Result<()>;
 }

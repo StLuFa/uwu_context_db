@@ -1,6 +1,6 @@
 //! # Knowledge Marketplace — Agent-to-Agent 知识市场
 //!
-//! 核心机制：C2D硬边界 / 联邦注册表 / KPI声誉 / 六阶段工作流 / EventBus消息总线 / 三注册分离。
+//! 核心机制：C2D硬边界 / 联邦注册表 / KPI声誉 / 六阶段工作流 / EventMesh消息总线 / 三注册分离。
 
 pub mod types;
 pub mod registry;

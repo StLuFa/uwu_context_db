@@ -207,7 +207,6 @@ Return your response as a JSON object:
             Ok(ContentPayload::Text { sparse, dense, .. }) => {
                 Ok((sparse.chars().take(200).collect(), dense))
             }
-            }
             Ok(_) => {
                 Err(agent_context_db_core::ContextError::Unsupported(
                     format!("multimodal_to_text requires L2 Detail content for {uri}")

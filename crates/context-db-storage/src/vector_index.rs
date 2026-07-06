@@ -2,7 +2,7 @@
 //!
 //! 薄适配层，只做类型映射，不引入业务逻辑。
 
-use agent_context_db_core::{ContextError, IndexHit, IndexPoint, Result, VectorIndex};
+use agent_context_db_core::{ContextError, ContextUri, IndexHit, IndexPoint, Result, VectorIndex};
 use async_trait::async_trait;
 
 /// 将 uwu_database::VectorStore 适配为 context-db 的 VectorIndex。
@@ -24,7 +24,7 @@ impl UwuVectorIndex {
 impl VectorIndex for UwuVectorIndex {
     async fn upsert(&self, collection: &str, point: IndexPoint) -> Result<()> {
         let record = uwu_database::Record {
-            id: point.uri,
+            id: point.uri.to_string(),
             vector: point.vector,
             metadata: serde_json::from_value(point.payload)
                 .unwrap_or_default(),
@@ -58,15 +58,19 @@ impl VectorIndex for UwuVectorIndex {
 
         Ok(matches
             .into_iter()
-            .map(|m| IndexHit {
-                uri: m.id,
-                score: m.score,
-                payload: serde_json::to_value(m.metadata).unwrap_or_default(),
+            .filter_map(|m| {
+                // 底层存的是有效的 uwu:// URI；解析失败则跳过（记 debug）
+                let uri = ContextUri::parse(&m.id).ok()?;
+                Some(IndexHit {
+                    uri,
+                    score: m.score,
+                    payload: serde_json::to_value(m.metadata).unwrap_or_default(),
+                })
             })
             .collect())
     }
 
-    async fn delete(&self, collection: &str, uri: &str) -> Result<()> {
+    async fn delete(&self, collection: &str, uri: &ContextUri) -> Result<()> {
         self.inner
             .delete(collection, &[uri.to_string()])
             .await
@@ -81,13 +85,14 @@ mod tests {
     /// 验证 IndexPoint ↔ Record 的映射方向一致性。
     #[test]
     fn point_to_record_field_mapping() {
+        let uri = ContextUri::parse("uwu://t/x").unwrap();
         let point = IndexPoint {
-            uri: "uwu://t/x".into(),
+            uri: uri.clone(),
             vector: vec![1.0, 0.0],
             payload: serde_json::json!({"k": "v"}),
         };
         let record = uwu_database::Record {
-            id: point.uri.clone(),
+            id: point.uri.to_string(),
             vector: point.vector.clone(),
             metadata: serde_json::from_value(point.payload.clone()).unwrap(),
         };

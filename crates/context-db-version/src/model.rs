@@ -37,6 +37,105 @@ pub struct Commit {
     pub metadata: CommitMeta,
 }
 
+// ===========================================================================
+// 因果 DAG 索引 —— 双向缓存 Commit 因果关系，支持 root_causes / effects 查询。
+// ===========================================================================
+
+/// 因果 DAG —— 在 Commit.parents 之上建立**双向索引**，实现快速溯源与影响面查询。
+///
+/// - `parents_of(c)`：直接因（Commit.parents 的镜像）
+/// - `children_of(c)`：直接果（Commit.parents 的反向）
+/// - `root_causes(c)`：递归上溯到所有无 parent 的祖先（根因集合）
+/// - `effects(c)`：递归下溯到所有后代（影响面集合）
+///
+/// 循环检测：`root_causes`/`effects` 内部维护 visited 集合，避免异常 DAG 死循环。
+#[derive(Debug, Clone, Default)]
+pub struct CausalDag {
+    parents: std::collections::HashMap<CommitId, Vec<CommitId>>,
+    children: std::collections::HashMap<CommitId, Vec<CommitId>>,
+}
+
+impl CausalDag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 从 commit 序列构建索引（幂等）。
+    pub fn from_commits<I: IntoIterator<Item = Commit>>(commits: I) -> Self {
+        let mut dag = Self::new();
+        for c in commits {
+            dag.add(&c);
+        }
+        dag
+    }
+
+    /// 加入一个 commit —— 建立正向 parents 与反向 children 边。
+    pub fn add(&mut self, commit: &Commit) {
+        let id = commit.id.clone();
+        self.parents.entry(id.clone()).or_default().extend(commit.parents.iter().cloned());
+        for p in &commit.parents {
+            let entry = self.children.entry(p.clone()).or_default();
+            if !entry.contains(&id) {
+                entry.push(id.clone());
+            }
+        }
+        // 确保孤立节点也在索引中（便于 root/leaf 查询）
+        self.children.entry(id).or_default();
+    }
+
+    /// 直接父 commit。
+    pub fn parents_of(&self, commit: &CommitId) -> &[CommitId] {
+        self.parents.get(commit).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// 直接子 commit。
+    pub fn children_of(&self, commit: &CommitId) -> &[CommitId] {
+        self.children.get(commit).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// 所有根因（自身或祖先中无 parent 的 commit）。
+    pub fn root_causes(&self, commit: &CommitId) -> Vec<CommitId> {
+        let mut roots = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![commit.clone()];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            let parents = self.parents_of(&node);
+            if parents.is_empty() {
+                roots.push(node);
+            } else {
+                stack.extend(parents.iter().cloned());
+            }
+        }
+        roots
+    }
+
+    /// 所有后代（直接或间接子 commit）。
+    pub fn effects(&self, commit: &CommitId) -> Vec<CommitId> {
+        let mut effects = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut stack: Vec<CommitId> = self.children_of(commit).to_vec();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            effects.push(node.clone());
+            stack.extend(self.children_of(&node).iter().cloned());
+        }
+        effects
+    }
+
+    /// 是否是 `ancestor` 的后代。
+    pub fn is_descendant_of(&self, ancestor: &CommitId, node: &CommitId) -> bool {
+        if ancestor == node {
+            return false;
+        }
+        self.effects(ancestor).iter().any(|e| e == node)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Author {
     pub agent_id: Option<String>,
@@ -117,16 +216,55 @@ pub struct Branch {
     pub lifecycle: BranchLifecycle,
 }
 
+/// 分支名 —— 保证非空、仅含 `[A-Za-z0-9._/-]`，长度 ≤ 255。
+///
+/// 使用 [`BranchName::parse`] 或 [`BranchName::new`] 构造；字段私有以强制走验证。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BranchName(pub(crate) String); // F.3
+#[serde(try_from = "String", into = "String")]
+pub struct BranchName(String);
 
 impl BranchName {
-    pub fn new(name: impl Into<String>) -> Self { Self(name.into()) }
+    /// 严格解析：非法时返回 `VersionError::Storage`。
+    pub fn parse(name: impl Into<String>) -> crate::Result<Self> {
+        let s = name.into();
+        Self::validate(&s)?;
+        Ok(Self(s))
+    }
+
+    /// 宽松构造（推荐调用点已知名称合法时使用）；非法字符会 panic。
+    pub fn new(name: impl Into<String>) -> Self {
+        Self::parse(name).expect("BranchName::new called with invalid name — use parse() for fallible")
+    }
+
     pub fn as_str(&self) -> &str { &self.0 }
+
+    fn validate(s: &str) -> crate::Result<()> {
+        if s.is_empty() {
+            return Err(crate::VersionError::Storage("BranchName must not be empty".into()));
+        }
+        if s.len() > 255 {
+            return Err(crate::VersionError::Storage(format!("BranchName too long ({} > 255)", s.len())));
+        }
+        if !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')) {
+            return Err(crate::VersionError::Storage(format!(
+                "BranchName contains illegal chars (allowed: [A-Za-z0-9._/-]): {s}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for BranchName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+}
+
+impl TryFrom<String> for BranchName {
+    type Error = crate::VersionError;
+    fn try_from(s: String) -> crate::Result<Self> { Self::parse(s) }
+}
+
+impl From<BranchName> for String {
+    fn from(b: BranchName) -> String { b.0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,16 +298,51 @@ pub struct Tag {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// 标签名 —— 与 [`BranchName`] 同规则：非空、`[A-Za-z0-9._/-]`、≤ 255。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TagName(pub(crate) String); // F.3
+#[serde(try_from = "String", into = "String")]
+pub struct TagName(String);
 
 impl TagName {
-    pub fn new(name: impl Into<String>) -> Self { Self(name.into()) }
+    pub fn parse(name: impl Into<String>) -> crate::Result<Self> {
+        let s = name.into();
+        Self::validate(&s)?;
+        Ok(Self(s))
+    }
+
+    pub fn new(name: impl Into<String>) -> Self {
+        Self::parse(name).expect("TagName::new called with invalid name — use parse() for fallible")
+    }
+
     pub fn as_str(&self) -> &str { &self.0 }
+
+    fn validate(s: &str) -> crate::Result<()> {
+        if s.is_empty() {
+            return Err(crate::VersionError::Storage("TagName must not be empty".into()));
+        }
+        if s.len() > 255 {
+            return Err(crate::VersionError::Storage(format!("TagName too long ({} > 255)", s.len())));
+        }
+        if !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')) {
+            return Err(crate::VersionError::Storage(format!(
+                "TagName contains illegal chars (allowed: [A-Za-z0-9._/-]): {s}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for TagName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+}
+
+impl TryFrom<String> for TagName {
+    type Error = crate::VersionError;
+    fn try_from(s: String) -> crate::Result<Self> { Self::parse(s) }
+}
+
+impl From<TagName> for String {
+    fn from(t: TagName) -> String { t.0 }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,10 +353,24 @@ pub enum TagType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// 语义标签条件 —— CEL (Common Expression Language) 表达式。
+///
+/// 表达式在 `evaluate_semantic_tags()` 中对每个 commit 求值：
+/// - `commit.id: string`
+/// - `commit.message: string`
+/// - `commit.timestamp: int` (Unix 秒)
+/// - `commit.parents: list<string>`
+/// - `commit.metadata: dyn` (`CommitMeta` 的 JSON 展开，含 provenance/changes/trigger 等)
+///
+/// 求值为 `true` 时该 commit 被打上此语义标签。
+///
+/// 示例：
+/// ```text
+/// commit.message.startsWith("feat") && size(commit.parents) == 1
+/// commit.metadata.trigger == "manual"
+/// ```
 pub struct SemanticCondition {
-    pub metric: String,
-    pub threshold: f32,
-    pub window_size: usize,
+    pub expr: String,
 }
 
 /// 版本引用：可指向 commit/branch/tag。

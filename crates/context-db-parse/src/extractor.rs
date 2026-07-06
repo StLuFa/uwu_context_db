@@ -141,7 +141,7 @@ Return a JSON array of objects with: "candidate_index", "action", "reason", "mer
                 Some(DedupDecision {
                     candidate,
                     action,
-                    merge_target: r.merge_target.map(ContextUri),
+                    merge_target: r.merge_target.and_then(|s| ContextUri::parse(s).ok()),
                     reason: r.reason.unwrap_or_default(),
                 })
             })

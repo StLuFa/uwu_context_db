@@ -80,10 +80,10 @@ impl CognitiveSelfVerifier {
     }
 
     /// 批量验证（用于多个 Skill 的并行验证）。
-    pub async fn verify_batch(
+    pub async fn verify_batch<'a>(
         &self,
-        verifications: &[(&ContextUri, &Execution)],
-    ) -> Vec<(&ContextUri, VerificationResult)> {
+        verifications: &[(&'a ContextUri, &Execution)],
+    ) -> Vec<(&'a ContextUri, VerificationResult)> {
         let mut results = Vec::new();
         for (uri, exec) in verifications {
             results.push((*uri, self.verify(uri, exec).await));

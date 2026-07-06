@@ -14,6 +14,7 @@
 pub mod migrations;
 pub mod perf;
 pub mod pg;
+pub mod pg_version;
 pub mod uwu_cache_adapter;
 pub mod vector_index;
 
@@ -23,6 +24,7 @@ pub use agent_context_db_core::{IndexHit, IndexPoint, VectorIndex};
 pub use migrations::context_db_migrations;
 pub use perf::{BatchWriteBuffer, DedupStore, WalEntry, WriteAheadLogger, compress, content_hash, decompress};
 pub use pg::PgContextStore;
+pub use pg_version::PgVersionStore;
 pub use vector_index::UwuVectorIndex;
 
 use agent_context_db_core::Result;
@@ -137,7 +139,7 @@ impl VectorIndex for NoopVectorIndex {
         self.warn_once("NoopVectorIndex: no vector backend configured — operations are no-ops");
         Ok(vec![])
     }
-    async fn delete(&self, _collection: &str, _uri: &str) -> Result<()> {
+    async fn delete(&self, _collection: &str, _uri: &agent_context_db_core::ContextUri) -> Result<()> {
         Ok(())
     }
 }

@@ -87,7 +87,7 @@ impl ConsensusTracker {
     }
 
     /// Schelling 点：返回所有 ≥N 个独立源的"已确立"条目。
-    pub fn find_established(&self, entries: &[MarketEntry], min_sources: usize) -> Vec<&MarketEntry> {
+    pub fn find_established<'a>(&self, entries: &'a [MarketEntry], min_sources: usize) -> Vec<&'a MarketEntry> {
         let mut established = Vec::new();
         for entry in entries {
             if entry.corroboration.independent_sources >= min_sources {

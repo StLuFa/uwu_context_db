@@ -12,9 +12,10 @@ use crate::{
     CognitiveGradient, CognitiveMetric, CognitivePreferencePair, EpochResult, GateDecision,
     PolicyGate, TrainingConfig, TrainingGoal, TrainingReport, TrajectorySummary,
 };
+use agent_context_db_consolidation::{ConsolidationEngine, ConsolidationProduct};
 use agent_context_db_core::{
-    ConsolidationEngine, ConsolidationProduct, ContentType, ContextEntry, ContextUri,
-    EpistemicType, LifecycleEngine, LlmClient, LlmOpts, Result, VectorIndex,
+    ContentType, ContextEntry, ContextUri, EpistemicType, LifecycleEngine, LlmClient, LlmOpts,
+    Result, VectorIndex,
 };
 use std::sync::Arc;
 
@@ -212,7 +213,7 @@ impl CognitiveTrainingPipeline {
 
             // ── 阶段 4: 主动课程生成（Voyager） ──
             let mut epoch_skills: Vec<SkillEntry> = Vec::new();
-            if let Ok(_goal) = curriculum.next_goal().await {
+            if let Ok(_goal) = curriculum.next_goal(&[]).await {
                 // 用课程目标生成真实 embedding
                 let task_embedding = self.llm.embed(&_goal.expected_new_knowledge)
                     .await

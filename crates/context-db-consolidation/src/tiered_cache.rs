@@ -74,7 +74,14 @@ impl TieredCache {
     pub fn rebalance(&self) {
         // 简化：清空过期条目
         let now = Instant::now();
-        self.hot.lock().retain(|_, e| now - e.inserted < e.ttl);
+        {
+            let mut hot = self.hot.lock();
+            let expired: Vec<String> = hot.iter()
+                .filter(|(_, e)| now - e.inserted >= e.ttl)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in expired { hot.pop(&k); }
+        }
         self.warm.lock().retain(|_, e| now - e.inserted < e.ttl);
     }
 }

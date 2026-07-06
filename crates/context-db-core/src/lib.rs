@@ -18,7 +18,6 @@
 pub mod config;
 pub mod error;
 pub mod event;
-pub mod event_bus;
 pub mod event_store;
 pub mod lifecycle;
 pub mod llm;
@@ -38,16 +37,17 @@ pub mod zerocopy;
 
 pub use error::{ContextError, Result};
 pub use event::{
-    CausalLink, ChangeEventStream, ChangeSource, ContextTemplate, EventEmitter,
-    InheritanceChain, InheritanceNode, OverrideAction, OverrideRule, TemplateEngine,
-    TemplateEntry,
+    ContextTemplate, InheritanceChain, InheritanceNode, OverrideAction, OverrideRule,
+    TemplateEngine, TemplateEntry,
 };
-pub use event_bus::{EventBus, EventStream as EventBusStream, MemoryEventBus};
 pub use event_store::{
-    CausalDag, CausalityType, DomainEvent, EventFilter as StoreEventFilter, EventId,
-    EventKind as StoreEventKind, EventMetadata, EventPayload, EventStore, MemoryEventStore,
-    SnapshotStore,
+    Bridge, CorrelationId, Envelope, EventKind, EventMesh, EventMeshBuilder, EventSet,
+    EventStore, EventTypeId, FlowChannel, FlowHandle, FlowReceiver, JsonlStore,
+    JsonlStoreOptions, MemoryStore, ReplayFilter, ReplayId, SegmentedStore,
+    SegmentedStoreOptions, SerializedEnvelope, Subscription, Topic, TopicPattern,
+    TypeRegistry, TypedSubscription,
 };
+pub use event_store::EventMetadata;
 pub use lifecycle::{
     AccessEvent, AccessOutcome, DegradeAction, EbbinghausModel, ForgettingCurve,
     ForgettingModel, ImportanceScore, ImportanceWeights, LifecycleAction, LifecycleEngine,
@@ -58,9 +58,8 @@ pub use rate_limiter::{MemoryRateLimiter, RateLimiter};
 pub use read_cache::{MemoryReadCache, ReadCache};
 pub use llm::{JsonSchema, LlmClient, LlmError, LlmOpts, LlmStream};
 pub use observability::{
-    ChangeEvent, ChangeEventType, ContextPubSub, ProvenanceEdge, ProvenanceGraph,
-    ProvenanceNode, ProvenanceRelationType, QualityDimension, QualityScore, QualityScorer,
-    SubscriptionFilter,
+    ProvenanceEdge, ProvenanceGraph, ProvenanceNode, ProvenanceRelationType,
+    QualityDimension, QualityScore, QualityScorer,
 };
 pub use pack::{AclRule, ContextPack, PackMeta, PathAcl, Permissions, Principal};
 #[allow(deprecated)]

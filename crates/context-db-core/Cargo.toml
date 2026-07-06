@@ -15,8 +15,10 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["sync"] }
 lru = "0.12"
 metrics = "0.23"
+arc-swap = { workspace = true }
 redis = { version = "0.25", features = ["aio", "tokio-comp", "streams"], optional = true }
 rmp-serde = { version = "1", optional = true }
+uwu_event_mesh = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

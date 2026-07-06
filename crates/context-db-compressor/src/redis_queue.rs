@@ -81,8 +81,7 @@ impl SemanticQueue for RedisSemanticQueue {
     async fn enqueue(&self, task: SemanticTask) -> Result<TaskId> {
         self.ensure_group().await?;
         let id = TaskId::new();
-        let payload = serde_json::to_vec(&task)
-            .map_err(|e| agent_context_db_core::ContextError::Serialization(e.to_string()))?;
+        let payload = serde_json::to_vec(&task)?;
 
         let mut conn = self.conn().await?;
         redis::cmd("XADD")

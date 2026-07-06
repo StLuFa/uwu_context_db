@@ -36,9 +36,9 @@ pub mod trajectory_encoder;
 pub mod tree_search;
 pub mod voting;
 
+use agent_context_db_consolidation::ConsolidationProduct;
 use agent_context_db_core::{
-    ConsolidationProduct, ConsolidationStatus, ContentType, ContextEntry, ContextUri,
-    EpistemicType, Result,
+    ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType, Result,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -267,7 +267,7 @@ pub fn extract_gradients_from_products(
 
     for product in products {
         let weight = CognitiveGradient::compute_weight(
-            map_content_to_epistemic(product.content_type),
+            product.content_type,
             product.quality_score,
         );
 
@@ -400,7 +400,7 @@ pub struct Skill {
 }
 
 /// Skill 验证状态机。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SkillValidationStatus {
     /// 假设态：从轨迹提取但未验证。
     Hypothesized,
@@ -462,7 +462,7 @@ impl Skill {
         self.last_validated = Utc::now();
 
         if let SkillValidationStatus::Validating {
-            ref mut trials_done, ..
+            trials_done, ..
         } = &mut self.validation_status
         {
             *trials_done = trials_done.saturating_add(1);

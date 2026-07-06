@@ -236,7 +236,7 @@ impl<V: VersionStore> DreamConsolidator<V> {
         let mut clusters: HashMap<String, Vec<ContextUri>> = HashMap::new();
         for uri in &changed_uris {
             let segs = uri.segments();
-            let key: String = segs.iter().take(3).map(|s| *s).collect::<Vec<_>>().join("/");
+            let key: String = segs.iter().take(3).cloned().collect::<Vec<_>>().join("/");
             clusters.entry(key).or_default().push(uri.clone());
         }
 
@@ -354,7 +354,7 @@ impl<V: VersionStore> CausalInference<V> {
 
                     for early_change in &earlier.metadata.changes.adds {
                         for late_change in &later.metadata.changes.adds {
-                            let key = (early_change.0.clone(), late_change.0.clone());
+                            let key = (early_change.to_string(), late_change.to_string());
                             let entry = pair_counts.entry(key).or_insert((0, 0));
                             entry.0 += 1; // cause then effect
                             entry.1 += 1; // total cause occurrences
@@ -371,9 +371,13 @@ impl<V: VersionStore> CausalInference<V> {
             }
             let temporal_precedence = co_occurrence as f32 / total as f32;
             if temporal_precedence > 0.5 {
+                let (cause_uri, effect_uri) = match (ContextUri::parse(cause), ContextUri::parse(effect)) {
+                    (Ok(c), Ok(e)) => (c, e),
+                    _ => continue,
+                };
                 hypotheses.push(CausalHypothesis {
-                    cause_uri: ContextUri(cause),
-                    effect_uri: ContextUri(effect),
+                    cause_uri,
+                    effect_uri,
                     temporal_precedence,
                     co_occurrence: co_occurrence as f32 / log.len().max(1) as f32,
                     confidence: temporal_precedence * 0.7 + (co_occurrence as f32 / log.len().max(1) as f32) * 0.3,

@@ -92,7 +92,7 @@ pub enum PublishError {
 }
 
 impl std::fmt::Display for PublishError {
-    fn fmt(&self, f: &std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PublishError::QualityTooLow(q) => write!(f, "quality {:.2} below threshold", q),
             PublishError::InsufficientCorroboration(l) => write!(f, "corroboration level {:?} insufficient", l),

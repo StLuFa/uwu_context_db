@@ -2,9 +2,10 @@
 
 use crate::{ConsolidationEngine, ConsolidationProduct};
 use agent_context_db_core::{ContextEntry, Result};
+use std::sync::Arc;
 
 pub struct MapReduceConsolidator {
-    engine: ConsolidationEngine,
+    engine: Arc<ConsolidationEngine>,
     chunk_size: usize,
     max_concurrency: usize,
 }
@@ -13,7 +14,7 @@ pub struct MapReduceConsolidator {
 pub struct BatchReport { pub total: usize, pub products: usize, pub chunks: usize, pub failures: usize }
 
 impl MapReduceConsolidator {
-    pub fn new(engine: ConsolidationEngine) -> Self { Self { engine, chunk_size: 100, max_concurrency: 4 } }
+    pub fn new(engine: ConsolidationEngine) -> Self { Self { engine: Arc::new(engine), chunk_size: 100, max_concurrency: 4 } }
     pub async fn batch_consolidate(&self, entries: &[ContextEntry]) -> Result<(Vec<ConsolidationProduct>, BatchReport)> {
         let mut report = BatchReport { total: entries.len(), ..Default::default() };
         let chunks: Vec<&[ContextEntry]> = entries.chunks(self.chunk_size).collect();

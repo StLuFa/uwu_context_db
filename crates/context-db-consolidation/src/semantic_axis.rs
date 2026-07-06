@@ -38,7 +38,7 @@ impl SemanticAxis {
     /// 为新条目分配语义路径（基于向量最近类簇）。
     pub fn assign_path(&self, uri: &ContextUri, embedding: &[f32]) -> String {
         let segs = uri.segments();
-        let content_type = ContentType::from_path_segment(segs.get(2).unwrap_or(&"fact"));
+        let content_type = ContentType::from_path_segment(segs.get(2).map(|s| s.as_str()).unwrap_or("fact"));
 
         if let Some(ct) = content_type {
             let clusters = self.clusters.read();

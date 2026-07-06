@@ -213,7 +213,7 @@ impl StatisticsCollector {
 
     /// 向量索引选择性。
     pub fn vector_selectivity(&self) -> f64 {
-        *self.vector_selectivity.read().unwrap_or(&0.1_f64.into())
+        *self.vector_selectivity.read().unwrap()
     }
 }
 

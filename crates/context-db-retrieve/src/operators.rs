@@ -48,7 +48,12 @@ pub struct ExecStats {
 
 impl PhysicalPlan {
     /// 执行物理计划 — 分发到对应算子。
-    pub async fn execute(&self, ctx: &ExecContext) -> Result<RecordBatch> {
+    /// 执行物理计划 — 分发到对应算子。
+    pub fn execute<'a>(&'a self, ctx: &'a ExecContext) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecordBatch>> + Send + 'a>> {
+        Box::pin(async move { self.execute_inner(ctx).await })
+    }
+
+    async fn execute_inner(&self, ctx: &ExecContext) -> Result<RecordBatch> {
         match self {
             PhysicalPlan::TypeScan {
                 content_type,
@@ -211,21 +216,24 @@ impl VectorSearchOp {
             None
         };
 
-        let index_hits = index.search(embedding, limit).await?;
+        let collection = filter.uri_prefix.as_deref().unwrap_or("default");
+        let index_hits = index.search(collection, embedding.to_vec(), limit, filter_json).await?;
 
         let hits: Vec<RetrievalHit> = index_hits
             .into_iter()
-            .map(|h| RetrievalHit {
-                uri: h.uri,
-                level: ContentLevel::L0,
-                content: ContentPayload::Text {
-                    sparse: String::new(),
-                    dense: String::new(),
-                    full: String::new(),
-                },
-                relevance: h.score,
-                parent_chain: vec![],
-                content_type: None,
+            .map(|h| {
+                RetrievalHit {
+                    uri: h.uri,
+                    level: ContentLevel::L0,
+                    content: ContentPayload::Text {
+                        sparse: String::new(),
+                        dense: String::new(),
+                        full: String::new(),
+                    },
+                    relevance: h.score,
+                    parent_chain: vec![],
+                    content_type: None,
+                }
             })
             .collect();
 
@@ -330,6 +338,7 @@ impl GraphTraverseOp {
             crate::query::RelationKind::Corroborates => agent_context_db_core::GraphRelation::Corroborates,
             crate::query::RelationKind::DerivedFrom => agent_context_db_core::GraphRelation::DerivedFrom,
             crate::query::RelationKind::Supersedes => agent_context_db_core::GraphRelation::Supersedes,
+            crate::query::RelationKind::DrivesPolicy => agent_context_db_core::GraphRelation::DrivesPolicy,
         }).collect();
 
         match graph.batch_traverse(seeds, &kinds, max_hops).await {

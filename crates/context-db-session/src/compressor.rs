@@ -3,10 +3,7 @@
 //! - Phase1（同步）：归档消息 → 写入 FS → 返回 task_id
 //! - Phase2（异步）：语义处理（去重 → L0/L1 生成 → 写 .done 标记）
 
-use agent_context_db_core::{
-    ContentPayload, ContentRepo, ContextEntry, ContextMeta, ContextUri, MediaType, MvccVersion,
-    Result, TenantId,
-};
+use agent_context_db_core::{ContentPayload, ContentRepo, ContextEntry, ContextMeta, ContextUri, MediaType, MemoryClass, MvccVersion, Result, TenantId};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -249,10 +246,7 @@ pub async fn run_full_compression(
         .archive_dir
         .join(&pending.handle.compression_index.to_string())
         .join("memory_diff.json");
-    let diff_json = serde_json::to_string(&memory_diff)
-        .map_err(|e| agent_context_db_core::ContextError::Serialization(
-            format!("memory_diff serialize: {e}")
-        ))?;
+    let diff_json = serde_json::to_string(&memory_diff)?;
 
     let abstract_text = format!(
         "memory diff: {} adds, {} updates, {} deletes",

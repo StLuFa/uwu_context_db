@@ -44,7 +44,7 @@ impl ReputationEngine {
             last_active: chrono::Utc::now(),
             ..Default::default()
         });
-        self.bonds.write().entry(agent).or_insert_with(|| ReputationBond::new(agent.clone()));
+        self.bonds.write().entry(agent.clone()).or_insert_with(|| ReputationBond::new(agent));
     }
 
     /// 处理一条反馈。

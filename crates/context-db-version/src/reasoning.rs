@@ -165,8 +165,8 @@ Return a JSON object with:
                 reindex_required: raw.impact.reindex,
                 notify_required: raw.impact.notify,
             },
-            details: raw.changes.into_iter().map(|c| SemanticChange {
-                uri: ContextUri(c.uri),
+            details: raw.changes.into_iter().filter_map(|c| Some(SemanticChange {
+                uri: ContextUri::parse(c.uri).ok()?,
                 description: c.description,
                 category: match c.category.as_str() {
                     "relation" => ChangeCategory::RelationChange,
@@ -176,7 +176,7 @@ Return a JSON object with:
                     _ => ChangeCategory::FactUpdate,
                 },
                 magnitude: c.magnitude,
-            }).collect(),
+            })).collect(),
         })
     }
 }
@@ -268,17 +268,17 @@ impl<V: VersionStore> TemporalReasoner<V> {
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for commit in log {
             for add in &commit.metadata.changes.adds {
-                *counts.entry(add.0.clone()).or_default() += 1;
+                *counts.entry(add.to_string()).or_default() += 1;
             }
             for upd in &commit.metadata.changes.updates {
-                *counts.entry(upd.uri.to_string().clone()).or_default() += 1;
+                *counts.entry(upd.uri.to_string()).or_default() += 1;
             }
         }
 
         Ok(counts
             .into_iter()
             .filter(|(_, count)| *count >= min_occurrences)
-            .map(|(uri, count)| (ContextUri(uri), count))
+            .filter_map(|(uri, count)| ContextUri::parse(uri).ok().map(|u| (u, count)))
             .collect())
     }
 

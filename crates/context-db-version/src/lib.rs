@@ -15,8 +15,8 @@ pub mod model;
 pub mod reasoning;
 
 pub use model::{
-    Author, Branch, BranchLifecycle, BranchName, BranchType, ChangeSet, ChangeType, Commit,
-    CommitId, CommitMeta, CommitTrigger, ConflictResolver, ContentHash, CorrectionType,
+    Author, Branch, BranchLifecycle, BranchName, BranchType, CausalDag, ChangeSet, ChangeType,
+    Commit, CommitId, CommitMeta, CommitTrigger, ConflictResolver, ContentHash, CorrectionType,
     EntityChange, FactCorrection, KnowledgeMergeStrategy, ProvenanceLink, ProvenanceRelation,
     RelationChange, RelationChangeType, RelationKind, RenameOp, Resolution, SemanticCondition,
     SemanticConflict, StructuredDiff, Tag, TagName, TagType, TemporalIndex, TemporalVersion,
@@ -80,6 +80,21 @@ pub enum MergeStrategy {
     /// 冲突时优先目标分支。
     Ours,
     /// 冲突时优先来源分支。
+    Theirs,
+}
+
+/// cherry_pick / rebase 遇冲突时的解决策略。
+///
+/// - `Fail`：报 `MergeConflict` 错误并停止（默认，与 Git 语义一致）。
+/// - `Ours`：保留 target 分支的当前值（放弃 cherry commit 对冲突 URI 的修改）。
+/// - `Theirs`：采用 cherry commit 的新值（覆盖 target 独立修改）。
+///
+/// 无冲突的 URI 在任何策略下都按 delta 正常应用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictStrategy {
+    #[default]
+    Fail,
+    Ours,
     Theirs,
 }
 
@@ -184,11 +199,13 @@ pub trait VersionStore: Send + Sync {
     ) -> Result<()>;
     async fn cherry_pick(
         &self, scope: &ContextUri, commit: &CommitId, onto: &BranchName,
+        strategy: ConflictStrategy,
     ) -> Result<CommitId>;
 
     // === 历史改写 ===
     async fn rebase(
         &self, scope: &ContextUri, branch: &BranchName, onto: &BranchName,
+        strategy: ConflictStrategy,
     ) -> Result<Vec<CommitId>>;
     async fn squash(
         &self, scope: &ContextUri, commits: Vec<CommitId>, message: &str,
@@ -203,6 +220,17 @@ pub trait VersionStore: Send + Sync {
     ) -> Result<Vec<(crate::model::TagName, CommitId)>>;
 
     // === 因果分析 ===
+    /// 返回 URI 的**显式证据溯源**（CommitMeta.provenance 中写入方主动声明的链接）。
+    ///
+    /// 语义边界（重要）：
+    /// - 本方法**只读**每个修改此 URI 的 commit 的 `CommitMeta.provenance` 字段；
+    ///   不沿 commit parent DAG 回溯祖先。
+    /// - 显式证据 = 写入方在 commit 时声明的"这条知识来自 session/URI/外部证据 X"。
+    /// - 若需要"版本祖先链"（这个 commit 的父提交是谁）请用
+    ///   [`CausalDag`](crate::model::CausalDag) / [`impact_analysis`] / [`evolution`]。
+    ///
+    /// 两者故意保持正交：显式证据是**认知层**溯源，parent DAG 是**版本层**溯源，
+    /// 合并会丢失"哪些是显式声明的、哪些是推导出来的"这一区分。
     async fn provenance(&self, uri: &ContextUri) -> Result<ProvenanceGraph>;
     async fn impact_analysis(&self, commit: &CommitId) -> Result<ImpactAnalysis>;
 
@@ -255,8 +283,8 @@ pub trait TagOps: Send + Sync {
 pub trait MergeOps: Send + Sync {
     async fn merge(&self, scope: &ContextUri, from: &BranchName, into: &BranchName, strategy: MergeStrategy) -> Result<MergeResult>;
     async fn diff_commits(&self, scope: &ContextUri, a: &CommitId, b: &CommitId) -> Result<TreeDiff>;
-    async fn cherry_pick(&self, scope: &ContextUri, commit: &CommitId, onto: &BranchName) -> Result<CommitId>;
-    async fn rebase(&self, scope: &ContextUri, branch: &BranchName, onto: &BranchName) -> Result<Vec<CommitId>>;
+    async fn cherry_pick(&self, scope: &ContextUri, commit: &CommitId, onto: &BranchName, strategy: ConflictStrategy) -> Result<CommitId>;
+    async fn rebase(&self, scope: &ContextUri, branch: &BranchName, onto: &BranchName, strategy: ConflictStrategy) -> Result<Vec<CommitId>>;
     async fn squash(&self, scope: &ContextUri, commits: Vec<CommitId>, message: &str) -> Result<SquashResult>;
     async fn knowledge_merge(&self, scope: &ContextUri, from: &BranchName, into: &BranchName, strategy: crate::model::KnowledgeMergeStrategy) -> Result<MergeResult>;
 }
@@ -295,8 +323,8 @@ impl<T: VersionStore + Send + Sync> TagOps for T {
 impl<T: VersionStore + Send + Sync> MergeOps for T {
     async fn merge(&self, s: &ContextUri, f: &BranchName, i: &BranchName, st: MergeStrategy) -> Result<MergeResult> { VersionStore::merge(self, s, f, i, st).await }
     async fn diff_commits(&self, s: &ContextUri, a: &CommitId, b: &CommitId) -> Result<TreeDiff> { VersionStore::diff_commits(self, s, a, b).await }
-    async fn cherry_pick(&self, s: &ContextUri, c: &CommitId, o: &BranchName) -> Result<CommitId> { VersionStore::cherry_pick(self, s, c, o).await }
-    async fn rebase(&self, s: &ContextUri, b: &BranchName, o: &BranchName) -> Result<Vec<CommitId>> { VersionStore::rebase(self, s, b, o).await }
+    async fn cherry_pick(&self, s: &ContextUri, c: &CommitId, o: &BranchName, st: ConflictStrategy) -> Result<CommitId> { VersionStore::cherry_pick(self, s, c, o, st).await }
+    async fn rebase(&self, s: &ContextUri, b: &BranchName, o: &BranchName, st: ConflictStrategy) -> Result<Vec<CommitId>> { VersionStore::rebase(self, s, b, o, st).await }
     async fn squash(&self, s: &ContextUri, cs: Vec<CommitId>, m: &str) -> Result<SquashResult> { VersionStore::squash(self, s, cs, m).await }
     async fn knowledge_merge(&self, s: &ContextUri, f: &BranchName, i: &BranchName, st: crate::model::KnowledgeMergeStrategy) -> Result<MergeResult> { VersionStore::knowledge_merge(self, s, f, i, st).await }
 }

@@ -44,7 +44,7 @@ impl RifSuppressor {
 
         for neighbor in &neighbors {
             // 跳过自身
-            if neighbor.uri == adopted_uri.to_string() {
+            if &neighbor.uri == adopted_uri {
                 continue;
             }
 
@@ -53,9 +53,7 @@ impl RifSuppressor {
                 continue;
             }
 
-            suppressed.push(ContextUri::parse(&neighbor.uri).unwrap_or_else(|_| {
-                ContextUri::parse("uwu://t/a/x/unknown/fallback").unwrap()
-            }));
+            suppressed.push(neighbor.uri.clone());
         }
 
         Ok(suppressed)

@@ -44,14 +44,14 @@ async fn m2_acceptance_fork_rewrite_rollback() {
     store.put_entry_version(&baseline, &state_uri, &entry(&state_uri, "{\"mood\": \"neutral\"}"));
 
     // 创建 main 分支
-    let main = BranchName("main".into());
+    let main = BranchName::new("main");
     store
         .create_branch(&s, main.clone(), baseline.clone(), BranchType::Main)
         .await
         .unwrap();
 
     // 2. fork 实验分支
-    let fork = BranchName("fork-explore".into());
+    let fork = BranchName::new("fork-explore");
     store
         .create_branch(&s, fork.clone(), baseline.clone(), BranchType::StateFork)
         .await
@@ -152,8 +152,8 @@ async fn three_way_merge_on_divergent_branches() {
     let c_a = store.commit_on_parent(&root, CommitMeta::default());
     let c_b = store.commit_on_parent(&root, CommitMeta::default());
 
-    let a = BranchName("a".into());
-    let b = BranchName("b".into());
+    let a = BranchName::new("a");
+    let b = BranchName::new("b");
     store.create_branch(&s, a.clone(), c_a, BranchType::Experiment).await.unwrap();
     store.create_branch(&s, b.clone(), c_b, BranchType::Experiment).await.unwrap();
 
@@ -180,7 +180,7 @@ async fn create_and_list_tags() {
     let c1 = store.commit(&s, ChangeSet::default(), CommitMeta::default()).await.unwrap();
 
     store.create_tag(&s, agent_context_db_version::Tag {
-        name: agent_context_db_version::TagName("stable".into()),
+        name: agent_context_db_version::TagName::new("stable"),
         target: c1.clone(),
         tag_type: agent_context_db_version::TagType::Mutable,
         message: "first stable".into(),

@@ -12,6 +12,7 @@
 //! ## 解耦约束
 //! - 仅依赖 core 的 `FsOps` 窄端口和可选的 `VectorIndex`，不依赖具体后端。
 
+pub mod associative;
 pub mod cache;
 pub mod innovation;
 pub mod intent;
@@ -22,6 +23,7 @@ pub mod quality;
 pub mod query;
 pub mod retriever;
 
+pub use associative::AssociativeExpander;
 pub use innovation::{IncrementalRetrievalLearner, PredictivePrefetcher, RelevanceFeedback};
 pub use intent::{LlmIntentAnalyzer, RuleBasedIntentAnalyzer};
 pub use operators::{ExecContext, ExecStats, RecordBatch};

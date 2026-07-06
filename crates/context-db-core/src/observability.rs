@@ -1,67 +1,11 @@
-//! 可观测性模块（F9 上下文订阅 + F13 质量评分 + F15 血缘图）。
+//! 可观测性模块（F13 质量评分 + F15 血缘图 + Metrics）。
 //!
-//! F9 ContextPubSub — 已废弃，使用 `EventStore` 替代（见 `event_store.rs`）。
+//! F9 ContextPubSub 已删除，使用 `crate::event_store`（基于 `uwu_event_mesh`）替代。
 
 use crate::{ContentLevel, ContentPayload, ContextEntry, ContextUri};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::mpsc;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// F9 上下文订阅与增量推送（DEPRECATED — 使用 EventStore）
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[deprecated(note = "使用 EventStore trait 替代")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubscriptionFilter {
-    pub scope: ContextUri,
-    pub min_level: ContentLevel,
-    pub memory_class: Option<crate::MemoryClass>,
-}
-
-#[deprecated(note = "使用 DomainEvent 替代")]
-#[derive(Debug, Clone)]
-pub struct ChangeEvent {
-    pub uri: ContextUri,
-    pub event_type: ChangeEventType,
-    pub abstract_: String,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[deprecated(note = "使用 EventKind 替代")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeEventType {
-    Created,
-    Updated,
-    Deleted,
-    RolledBack,
-}
-
-/// 上下文发布订阅 — 已废弃，使用 EventStore。
-#[deprecated(note = "使用 `crate::EventStore` 替代")]
-pub struct ContextPubSub {
-    subscribers: parking_lot::Mutex<
-        Vec<(
-            String,
-            SubscriptionFilter,
-            std::sync::mpsc::Sender<ChangeEvent>,
-        )>,
-    >,
-    recent_events: parking_lot::Mutex<Vec<ChangeEvent>>,
-    window_size: usize,
-}
-
-#[allow(deprecated)]
-impl ContextPubSub {
-    pub fn new(window_size: usize) -> Self {
-        Self {
-            subscribers: parking_lot::Mutex::new(Vec::new()),
-            recent_events: parking_lot::Mutex::new(Vec::new()),
-            window_size,
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // F13 质量评分

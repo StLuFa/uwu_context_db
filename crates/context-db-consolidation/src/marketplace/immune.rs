@@ -1,7 +1,7 @@
 //! Immune Memory Protocol — 只共享攻击签名，不共享原始数据。
 
 use crate::marketplace::types::*;
-use agent_context_db_core::{ContextUri, EventBus, LlmClient, LlmOpts, Result};
+use agent_context_db_core::{ContextUri, EventMesh, LlmClient, LlmOpts, Result, Topic};
 use std::sync::Arc;
 
 /// 抗体 — 攻击模式的特征签名（不是原始 prompt）。
@@ -16,7 +16,7 @@ pub struct Antibody {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ThreatType {
     PromptInjection,
     DataExfiltration,
@@ -37,7 +37,7 @@ pub enum ThreatCheck {
 /// 免疫协议 — 一个 Agent 踩坑，全员免疫。
 pub struct ImmuneProtocol {
     antibodies: parking_lot::RwLock<Vec<Antibody>>,
-    event_bus: Option<Arc<dyn EventBus>>,
+    event_mesh: Option<EventMesh>,
     similarity_threshold: f32,
 }
 
@@ -45,13 +45,13 @@ impl ImmuneProtocol {
     pub fn new() -> Self {
         Self {
             antibodies: parking_lot::RwLock::new(Vec::new()),
-            event_bus: None,
+            event_mesh: None,
             similarity_threshold: 0.85,
         }
     }
 
-    pub fn with_event_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
-        self.event_bus = Some(bus);
+    pub fn with_event_mesh(mut self, mesh: EventMesh) -> Self {
+        self.event_mesh = Some(mesh);
         self
     }
 
@@ -75,21 +75,22 @@ impl ImmuneProtocol {
 
         self.antibodies.write().push(antibody.clone());
 
-        // 广播到 EventBus → 所有订阅 Agent 自动加载
-        if let Some(ref bus) = self.event_bus {
-            if let Ok(payload) = serde_json::to_vec(&antibody) {
-                let bus = bus.clone();
-                let payload = payload;
-                tokio::spawn(async move {
-                    let _ = bus.publish("immune.broadcast", &payload).await;
-                });
+        // 广播到 EventMesh → 所有订阅 Agent 自动加载
+        if let Some(ref mesh) = self.event_mesh {
+            if let Ok(payload) = serde_json::to_value(&antibody) {
+                let mesh = mesh.clone();
+                if let Ok(topic) = Topic::new("immune.broadcast") {
+                    tokio::spawn(async move {
+                        let _ = mesh.emit(&topic, payload).await;
+                    });
+                }
             }
         }
 
         antibody
     }
 
-    /// 加载外部抗体（从 EventBus 收到广播时调用）。
+    /// 加载外部抗体（从 EventMesh 收到广播时调用）。
     pub fn load_antibody(&self, antibody: Antibody) {
         // 去重
         if !self.antibodies.read().iter().any(|a| a.id == antibody.id) {

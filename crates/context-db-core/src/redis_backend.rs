@@ -1,19 +1,17 @@
 //! Redis 后端实现 — 可选（feature gate `redis-backend`）。
 //!
-//! 提供 EventBus、ReadCache、RateLimiter 的 Redis 实现，
-//! 启用多进程共享事件、缓存、限流能力。
+//! 提供 ReadCache、RateLimiter 的 Redis 实现（跨进程共享缓存/限流）。
+//! 事件总线已迁移到 `uwu_event_mesh` + `uwu_nats_bridge`。
 //!
 //! 编译条件：
 //! ```bash
 //! cargo build --features redis-backend
 //! ```
 
-use crate::event_bus::{EventBus, EventStream};
 use crate::read_cache::ReadCache;
 use crate::rate_limiter::RateLimiter;
 use crate::{ContentLevel, ContentPayload, ContextUri, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
 use std::time::Duration;
 
 // ===========================================================================
@@ -46,110 +44,21 @@ fn prefixed(prefix: &str, key: &str) -> String {
 }
 
 // ===========================================================================
-// RedisEventBus — Redis Pub/Sub 事件广播
-// ===========================================================================
-
-/// Redis 事件总线（Pub/Sub + Stream 双写）。
-///
-/// - Pub/Sub 做实时推送（fire-and-forget）
-/// - Stream 做持久化（新订阅者/崩溃恢复可回放）
-pub struct RedisEventBus {
-    client: redis::Client,
-    prefix: String,
-}
-
-impl RedisEventBus {
-    pub fn connect(config: &RedisConfig) -> Result<Self> {
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|e| crate::ContextError::Storage(format!("redis connect: {e}")))?;
-        Ok(Self { client, prefix: config.key_prefix.clone() })
-    }
-
-    fn channel(&self, topic: &str) -> String {
-        prefixed(&self.prefix, &format!("events:{}", topic))
-    }
-
-    fn stream_key(&self, topic: &str) -> String {
-        format!("{}:stream", self.channel(topic))
-    }
-
-    async fn conn(&self) -> Result<redis::aio::MultiplexedConnection> {
-        self.client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| crate::ContextError::Storage(format!("redis conn: {e}")))
-    }
-}
-
-#[async_trait]
-impl EventBus for RedisEventBus {
-    async fn publish(&self, topic: &str, payload: &[u8]) -> Result<()> {
-        let mut conn = self.conn().await?;
-        let chan = self.channel(topic);
-
-        // Pub/Sub 实时广播
-        redis::cmd("PUBLISH")
-            .arg(&chan)
-            .arg(payload)
-            .exec_async(&mut conn)
-            .await
-            .map_err(|e| crate::ContextError::Storage(format!("redis publish: {e}")))?;
-
-        // Stream 持久化（新订阅者可回放）
-        redis::cmd("XADD")
-            .arg(self.stream_key(topic))
-            .arg("*")  // auto-generate ID
-            .arg("data")
-            .arg(payload)
-            .exec_async(&mut conn)
-            .await
-            .map_err(|e| crate::ContextError::Storage(format!("redis xadd: {e}")))?;
-
-        Ok(())
-    }
-
-    async fn subscribe(&self, topic: &str) -> Result<Box<dyn EventStream>> {
-        let client = self.client.clone();
-        let channel = self.channel(topic);
-        let mut pubsub = client
-            .get_async_connection()
-            .await
-            .map_err(|e| crate::ContextError::Storage(format!("redis pubsub conn: {e}")))?
-            .into_pubsub();
-
-        pubsub
-            .subscribe(&channel)
-            .await
-            .map_err(|e| crate::ContextError::Storage(format!("redis subscribe: {e}")))?;
-
-        Ok(Box::new(RedisEventStream { pubsub, channel }))
-    }
-}
-
-/// Redis 事件流（通过 Pub/Sub 接收）。
-struct RedisEventStream {
-    pubsub: redis::aio::PubSub,
-    channel: String,
-}
-
-#[async_trait]
-impl EventStream for RedisEventStream {
-    async fn next(&mut self) -> Option<Vec<u8>> {
-        let msg = self.pubsub.on_message().next().await?;
-        msg.get_payload_bytes().map(|b| b.to_vec())
-    }
-}
-
-// ===========================================================================
 // RedisReadCache — Redis 读取缓存
 // ===========================================================================
 
 /// Redis 读取缓存 — 跨进程共享 L0/L1 结果。
+///
+/// 穿透防护：`put_negative` 存入哨兵值 `\0NEG\0`；`get` 命中该值时返回 `Some(None)`。
 pub struct RedisReadCache {
     client: redis::Client,
     prefix: String,
     default_ttl: Duration,
+    negative_ttl: Duration,
 }
+
+/// 负缓存哨兵值。
+const NEG_MARKER: &[u8] = b"\0NEG\0";
 
 impl RedisReadCache {
     pub fn connect(config: &RedisConfig) -> Result<Self> {
@@ -159,7 +68,13 @@ impl RedisReadCache {
             client,
             prefix: config.key_prefix.clone(),
             default_ttl: Duration::from_secs(config.default_ttl_secs),
+            negative_ttl: Duration::from_secs(30),
         })
+    }
+
+    pub fn with_negative_ttl(mut self, ttl: Duration) -> Self {
+        self.negative_ttl = ttl;
+        self
     }
 
     fn cache_key(&self, uri: &ContextUri, level: ContentLevel) -> String {
@@ -176,7 +91,7 @@ impl RedisReadCache {
 
 #[async_trait]
 impl ReadCache for RedisReadCache {
-    async fn get(&self, uri: &ContextUri, level: ContentLevel) -> Option<ContentPayload> {
+    async fn get(&self, uri: &ContextUri, level: ContentLevel) -> Option<Option<ContentPayload>> {
         let key = self.cache_key(uri, level);
         let mut conn = self.conn().await.ok()?;
         let data: Option<Vec<u8>> = redis::cmd("GET")
@@ -184,7 +99,11 @@ impl ReadCache for RedisReadCache {
             .query_async(&mut conn)
             .await
             .ok()?;
-        data.and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        let bytes = data?;
+        if bytes.as_slice() == NEG_MARKER {
+            return Some(None);
+        }
+        Some(serde_json::from_slice(&bytes).ok())
     }
 
     async fn put(
@@ -194,10 +113,11 @@ impl ReadCache for RedisReadCache {
         payload: ContentPayload,
         ttl: Duration,
     ) {
+        let effective = if ttl.is_zero() { self.default_ttl } else { ttl };
         let key = self.cache_key(uri, level);
         if let Ok(data) = serde_json::to_vec(&payload) {
             if let Ok(mut conn) = self.conn().await {
-                let ttl_secs = ttl.as_secs().max(1);
+                let ttl_secs = effective.as_secs().max(1);
                 let _: () = redis::cmd("SETEX")
                     .arg(&key)
                     .arg(ttl_secs)
@@ -206,6 +126,20 @@ impl ReadCache for RedisReadCache {
                     .await
                     .unwrap_or(());
             }
+        }
+    }
+
+    async fn put_negative(&self, uri: &ContextUri, level: ContentLevel) {
+        let key = self.cache_key(uri, level);
+        if let Ok(mut conn) = self.conn().await {
+            let ttl_secs = self.negative_ttl.as_secs().max(1);
+            let _: () = redis::cmd("SETEX")
+                .arg(&key)
+                .arg(ttl_secs)
+                .arg(NEG_MARKER)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(());
         }
     }
 
@@ -311,89 +245,5 @@ impl RateLimiter for RedisRateLimiter {
             .await
             .unwrap_or(1); // Fail open
         result == 1
-    }
-}
-
-// ===========================================================================
-// 组合注入辅助
-// ===========================================================================
-
-/// Redis 后端聚合 — 一次性创建所有 Redis 实现。
-pub struct RedisBackend {
-    pub event_bus: Arc<dyn EventBus>,
-    pub read_cache: Arc<dyn ReadCache>,
-    pub rate_limiter: Arc<dyn RateLimiter>,
-}
-
-impl RedisBackend {
-    /// 从配置创建全套 Redis 后端。
-    pub fn new(config: &RedisConfig) -> Result<Self> {
-        let event_bus = Arc::new(RedisEventBus::connect(config)?) as Arc<dyn EventBus>;
-        let read_cache = Arc::new(RedisReadCache::connect(config)?) as Arc<dyn ReadCache>;
-        let rate_limiter = Arc::new(RedisRateLimiter::new(config, 60, 60)?) as Arc<dyn RateLimiter>;
-        Ok(Self { event_bus, read_cache, rate_limiter })
-    }
-}
-
-// ===========================================================================
-// Memory fallback 组合（无 Redis 时）
-// ===========================================================================
-
-/// 内存后端聚合 — 所有默认实现。
-pub struct MemoryBackend {
-    pub event_bus: Arc<dyn EventBus>,
-    pub read_cache: Arc<dyn ReadCache>,
-    pub rate_limiter: Arc<dyn RateLimiter>,
-}
-
-impl MemoryBackend {
-    pub fn new(cache_capacity: usize, max_concurrency: usize) -> Self {
-        use crate::event_bus::MemoryEventBus;
-        use crate::read_cache::MemoryReadCache;
-        use crate::rate_limiter::MemoryRateLimiter;
-
-        Self {
-            event_bus: Arc::new(MemoryEventBus::new()) as Arc<dyn EventBus>,
-            read_cache: Arc::new(MemoryReadCache::new(cache_capacity, Duration::from_secs(300)))
-                as Arc<dyn ReadCache>,
-            rate_limiter: Arc::new(MemoryRateLimiter::new(max_concurrency)) as Arc<dyn RateLimiter>,
-        }
-    }
-}
-
-// ===========================================================================
-// 配置驱动的后端创建
-// ===========================================================================
-
-/// 后端类型。
-pub enum CacheBackend {
-    Memory(MemoryBackend),
-    #[cfg(feature = "redis-backend")]
-    Redis(RedisBackend),
-}
-
-impl CacheBackend {
-    pub fn event_bus(&self) -> Arc<dyn EventBus> {
-        match self {
-            CacheBackend::Memory(m) => m.event_bus.clone(),
-            #[cfg(feature = "redis-backend")]
-            CacheBackend::Redis(r) => r.event_bus.clone(),
-        }
-    }
-
-    pub fn read_cache(&self) -> Arc<dyn ReadCache> {
-        match self {
-            CacheBackend::Memory(m) => m.read_cache.clone(),
-            #[cfg(feature = "redis-backend")]
-            CacheBackend::Redis(r) => r.read_cache.clone(),
-        }
-    }
-
-    pub fn rate_limiter(&self) -> Arc<dyn RateLimiter> {
-        match self {
-            CacheBackend::Memory(m) => m.rate_limiter.clone(),
-            #[cfg(feature = "redis-backend")]
-            CacheBackend::Redis(r) => r.rate_limiter.clone(),
-        }
     }
 }

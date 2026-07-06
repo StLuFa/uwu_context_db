@@ -9,6 +9,9 @@ members = [
     "crates/context-db-storage",
     "crates/context-db-wiki",
     "crates/context-db-testkit",
+    "crates/context-db-cdt",
+    "crates/context-db-consolidation",
+    "crates/context-db-nats",
 ]
 resolver = "3"
 
@@ -26,3 +29,12 @@ async-trait = "0.1"
 thiserror = "1"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "macros"] }
+# uwu 生态依赖：本地 rev 与 uwu_nats_bridge 内部依赖的 uwu_event_mesh 会被 cargo
+# 视为不同 source（重复实例 → 类型不兼容 E0308）。上游未 pin 之前，我们只固定
+# uwu_visual_script（无传递依赖冲突），其余依赖 Cargo.lock 保证可重现构建。
+uwu_event_mesh = { git = "https://github.com/StLuFa/uwu_event_mesh.git" }
+uwu_nats_bridge = { git = "https://github.com/StLuFa/uwu_nats_bridge.git" }
+uwu_visual_script = { git = "https://github.com/StLuFa/uwu_visual_script.git", rev = "25e021618297f8a5453c7a649ed4d5b226cac35e" }
+uwu-crdt = { git = "https://github.com/StLuFa/uwu-crdt.git" }
+cel-interpreter = "0.9"
+arc-swap = "1"

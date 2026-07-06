@@ -4,7 +4,7 @@
 //! - [`LlmIntentAnalyzer`]：LLM 驱动版（结构化意图分类，生产级）
 
 use agent_context_db_core::{
-    ContentType, ContextUri, LlmClient, LlmOpts, MemoryClass, Result,
+    ContentType, ContextUri, LlmClient, LlmOpts, Result,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -115,10 +115,9 @@ Current context: tenant="{tenant}", agent="{agent}"
                 target_dirs: r
                     .target_dirs
                     .into_iter()
-                    .map(|d| ContextUri::parse(d).unwrap_or_else(|_| ContextUri("".into())))
-                    .filter(|u| !u.0.is_empty())
+                    .filter_map(|d| ContextUri::parse(d).ok())
                     .collect(),
-                expected_type: r.expected_class.and_then(|c| parse_class(&c)),
+                expected_type: r.expected_class.as_deref().and_then(parse_class),
             })
             .collect())
     }
@@ -149,20 +148,20 @@ impl RuleBasedIntentAnalyzer {
         let mut results = Vec::new();
 
         if contains_any(&lower, &["when", "happened", "event", "那天", "之前", "上次"]) {
-            results.push(tq(QueryKind::EventRecall, query, &mem_dirs(user_id, agent_id, &["events", "cases"]), Some(MemoryClass::Events)));
+            results.push(tq(QueryKind::EventRecall, query, &mem_dirs(user_id, agent_id, &["events", "cases"]), Some(ContentType::Fact)));
         }
         if contains_any(&lower, &["who", "what is", "entity", "project", "是谁", "什么是", "哪个"]) {
-            results.push(tq(QueryKind::EntityLookup, query, &mem_dirs(user_id, agent_id, &["entities", "profile"]), Some(MemoryClass::Entities)));
+            results.push(tq(QueryKind::EntityLookup, query, &mem_dirs(user_id, agent_id, &["entities", "profile"]), Some(ContentType::Fact)));
         }
         if contains_any(&lower, &["how to", "how do", "步骤", "方法", "怎么", "如何", "教程"]) {
             results.push(tq(QueryKind::SkillReuse, query, &[
                 memories_dir(user_id, agent_id, "skills"),
                 memories_dir(user_id, agent_id, "tools"),
-                uri("uwu://{user_id}/agent/{agent_id}/experiences"),
-            ], Some(MemoryClass::Skills)));
+                uri(format!("uwu://{}/agent/{}/experiences", user_id, agent_id)),
+            ], Some(ContentType::Skill)));
         }
         if contains_any(&lower, &["pattern", "template", "模式", "模板", "惯例", "typically"]) {
-            results.push(tq(QueryKind::PatternMatch, query, &mem_dirs(user_id, agent_id, &["patterns", "cases"]), Some(MemoryClass::Patterns)));
+            results.push(tq(QueryKind::PatternMatch, query, &mem_dirs(user_id, agent_id, &["patterns", "cases"]), Some(ContentType::Heuristic)));
         }
         if contains_any(&lower, &["state", "snapshot", "状态", "当前", "now", "recently", "最近"]) {
             results.push(tq(QueryKind::StateSnapshot, query, &[
@@ -215,17 +214,17 @@ fn parse_kind(s: &str) -> QueryKind {
     }
 }
 
-fn parse_class(s: &str) -> Option<MemoryClass> {
+fn parse_class(s: &str) -> Option<ContentType> {
     match s {
-        "profile" => Some(MemoryClass::Profile),
-        "preferences" => Some(MemoryClass::Preferences),
-        "entities" => Some(MemoryClass::Entities),
-        "events" => Some(MemoryClass::Events),
-        "cases" => Some(MemoryClass::Cases),
-        "patterns" => Some(MemoryClass::Patterns),
-        "tools" => Some(MemoryClass::Tools),
-        "skills" => Some(MemoryClass::Skills),
-        _ => None,
+        "profile" => Some(ContentType::Profile),
+        "preferences" => Some(ContentType::Preference),
+        "entities" => Some(ContentType::Fact),
+        "events" => Some(ContentType::Fact),
+        "cases" => Some(ContentType::Error),
+        "patterns" => Some(ContentType::Heuristic),
+        "tools" => Some(ContentType::Skill),
+        "skills" => Some(ContentType::Skill),
+        _ => ContentType::from_path_segment(s),
     }
 }
 
@@ -234,7 +233,7 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 fn uri(s: impl Into<String>) -> ContextUri {
-    ContextUri(s.into())
+    ContextUri::parse(s.into()).expect("invalid URI in intent.rs helper")
 }
 
 fn memories_dir(tenant: &str, agent_id: &str, sub: &str) -> ContextUri {
@@ -249,12 +248,12 @@ fn default_memory_dirs(tenant: &str, agent: &str) -> Vec<ContextUri> {
     mem_dirs(tenant, agent, &["preferences", "profile", "cases", "events", "skills", "tools", "patterns", "entities"])
 }
 
-fn tq(kind: QueryKind, text: &str, dirs: &[ContextUri], class: Option<MemoryClass>) -> TypedQuery {
+fn tq(kind: QueryKind, text: &str, dirs: &[ContextUri], class: Option<ContentType>) -> TypedQuery {
     TypedQuery {
         kind,
         text: text.to_string(),
         target_dirs: dirs.to_vec(),
-        expected_class: class,
+        expected_type: class,
     }
 }
 
@@ -321,6 +320,6 @@ mod tests {
         assert_eq!(tqs.len(), 1);
         assert_eq!(tqs[0].kind, QueryKind::SemanticSearch);
         assert!(!tqs[0].target_dirs.is_empty());
-        assert_eq!(tqs[0].expected_class, Some(MemoryClass::Preferences));
+        assert_eq!(tqs[0].expected_type, Some(ContentType::Preference));
     }
 }

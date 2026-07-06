@@ -139,8 +139,16 @@ pub fn decompress(compressed: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// 内容去重存储 — 相同内容只存一份（B.5: 三锁合并为 Mutex<Inner>）。
+///
+/// 支持可选持久化后端（H.5）：注入 `uwu_database::Cache` 后：
+/// - `store`：内存写入 + 后端 write-through（best-effort）
+/// - `load`：内存 miss 时回落到后端加载并回填内存
+///
+/// 用途：跨进程共享去重块（例如 Redis 共享 blob 池），进程重启后不丢历史 dedup 命中。
 pub struct DedupStore {
     inner: Mutex<DedupInner>,
+    /// 可选持久化后端（如 Redis / disk KV）。key 布局：`dedup:blob:{hash}`、`dedup:idx:{uri}`。
+    persistence: Option<std::sync::Arc<dyn uwu_database::Cache>>,
 }
 
 struct DedupInner {
@@ -159,34 +167,92 @@ pub struct DedupStats {
 
 impl DedupStore {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(DedupInner { blobs: HashMap::new(), index: HashMap::new(), stats: DedupStats::default() }) }
+        Self {
+            inner: Mutex::new(DedupInner { blobs: HashMap::new(), index: HashMap::new(), stats: DedupStats::default() }),
+            persistence: None,
+        }
     }
 
-    /// 存储内容（自动去重+压缩）。
+    /// 挂载可选持久化后端（H.5）。传入 `uwu_database::Cache` 即可获得跨进程/重启后的
+    /// dedup 命中保留能力。
+    pub fn with_persistence(mut self, cache: std::sync::Arc<dyn uwu_database::Cache>) -> Self {
+        self.persistence = Some(cache);
+        self
+    }
+
+    fn blob_key(hash: &str) -> String { format!("dedup:blob:{hash}") }
+    fn idx_key(uri: &str) -> String { format!("dedup:idx:{uri}") }
+
+    /// 存储内容（自动去重+压缩）。若挂载了持久化后端，则 write-through 到后端（best-effort）。
     pub fn store(&self, uri: &str, data: &[u8]) -> String {
         let hash = content_hash(data);
-        let mut inner = self.inner.lock();
-        inner.stats.total_writes += 1;
+        let compressed = {
+            let mut inner = self.inner.lock();
+            inner.stats.total_writes += 1;
 
-        if inner.blobs.contains_key(&hash) {
-            inner.stats.dedup_hits += 1;
-        } else {
-            let compressed = compress(data, 3);
-            inner.stats.raw_bytes += data.len() as u64;
-            inner.stats.compressed_bytes += compressed.len() as u64;
-            inner.blobs.insert(hash.clone(), compressed);
+            if inner.blobs.contains_key(&hash) {
+                inner.stats.dedup_hits += 1;
+                None
+            } else {
+                let compressed = compress(data, 3);
+                inner.stats.raw_bytes += data.len() as u64;
+                inner.stats.compressed_bytes += compressed.len() as u64;
+                inner.blobs.insert(hash.clone(), compressed.clone());
+                Some(compressed)
+            }
+        };
+        {
+            let mut inner = self.inner.lock();
+            inner.index.insert(uri.to_string(), hash.clone());
         }
 
-        inner.index.insert(uri.to_string(), hash.clone());
+        // 持久化 write-through（锁外，避免阻塞其他写入）。
+        if let Some(cache) = self.persistence.as_ref() {
+            let cache = cache.clone();
+            let hash_c = hash.clone();
+            let uri_c = uri.to_string();
+            // 在 tokio 运行时下 fire-and-forget；同步上下文则跳过（不阻塞调用方）。
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    if let Some(bytes) = compressed {
+                        let _ = cache.set(&Self::blob_key(&hash_c), &bytes, None).await;
+                    }
+                    let _ = cache.set(&Self::idx_key(&uri_c), hash_c.as_bytes(), None).await;
+                });
+            }
+        }
         hash
     }
 
-    /// 读取内容（自动解压）。
+    /// 读取内容（自动解压）；内存 miss 时回落到持久化后端。
     pub fn load(&self, uri: &str) -> Option<Vec<u8>> {
-        let inner = self.inner.lock();
-        let hash = inner.index.get(uri)?.clone();
-        let compressed = inner.blobs.get(&hash)?.clone();
-        decompress(&compressed)
+        // 快路径：内存
+        {
+            let inner = self.inner.lock();
+            if let Some(hash) = inner.index.get(uri) {
+                if let Some(compressed) = inner.blobs.get(hash) {
+                    return decompress(compressed);
+                }
+            }
+        }
+        // 慢路径：持久化后端
+        let cache = self.persistence.as_ref()?.clone();
+        let uri_owned = uri.to_string();
+        // 若无 tokio 运行时则放弃（保持同步 API）
+        let rt = tokio::runtime::Handle::try_current().ok()?;
+        let (hash, compressed) = rt
+            .block_on(async move {
+                let hash_bytes = cache.get(&Self::idx_key(&uri_owned)).await.ok()??;
+                let hash = String::from_utf8(hash_bytes).ok()?;
+                let compressed = cache.get(&Self::blob_key(&hash)).await.ok()??;
+                Some((hash, compressed))
+            })?;
+        let data = decompress(&compressed)?;
+        // 回填内存
+        let mut inner = self.inner.lock();
+        inner.blobs.insert(hash.clone(), compressed);
+        inner.index.insert(uri.to_string(), hash);
+        Some(data)
     }
 
     pub fn stats(&self) -> DedupStats { self.inner.lock().stats.clone() }

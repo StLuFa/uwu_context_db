@@ -63,9 +63,9 @@ impl ContentRepo for MemoryContextStore {
     async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
         let mut map = self.entries.lock();
         let val = map
-            .remove(&from.0)
-            .ok_or_else(|| ContextError::NotFound(from.0.clone()))?;
-        map.insert(to.0.clone(), val);
+            .remove(&from.to_string())
+            .ok_or_else(|| ContextError::NotFound(from.to_string()))?;
+        map.insert(to.to_string(), val);
         Ok(())
     }
 }
@@ -73,16 +73,16 @@ impl ContentRepo for MemoryContextStore {
 #[async_trait]
 impl FsOps for MemoryContextStore {
     async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
-        let prefix = format!("{}/", dir.0.trim_end_matches('/'));
+        let prefix = format!("{}/", dir.to_string().trim_end_matches('/'));
         let map = self.entries.lock();
         let mut out = Vec::new();
         for (uri, versions) in map.iter() {
             if let Some(rest) = uri.strip_prefix(&prefix) {
-                // 直接子项（rest 不含 `/`）视为文件，否则为目录
                 let is_dir = rest.contains('/');
                 let latest = versions.last().unwrap();
+                let Ok(u) = ContextUri::parse(uri.clone()) else { continue };
                 out.push(DirEntry {
-                    uri: ContextUri(uri.clone()),
+                    uri: u,
                     is_dir,
                     abstract_: latest.l0_text().to_string(),
                     content_type: latest.metadata.content_type,
@@ -97,7 +97,7 @@ impl FsOps for MemoryContextStore {
         let scope = pattern
             .scope
             .as_ref()
-            .map(|u| u.0.clone())
+            .map(|u| u.to_string())
             .unwrap_or_default();
         Ok(map
             .iter()
@@ -110,7 +110,7 @@ impl FsOps for MemoryContextStore {
                     .unwrap_or(false),
                 None => true,
             })
-            .map(|(uri, _)| ContextUri(uri.clone()))
+            .filter_map(|(uri, _)| ContextUri::parse(uri.clone()).ok())
             .collect())
     }
 
@@ -118,15 +118,17 @@ impl FsOps for MemoryContextStore {
         let needle = regex.to_lowercase();
         let map = self.entries.lock();
         let mut hits = Vec::new();
+        let scope_str = scope.to_string();
         for (uri, versions) in map.iter() {
-            if !uri.starts_with(&scope.0) {
+            if !uri.starts_with(&scope_str) {
                 continue;
             }
             if let Some(e) = versions.last() {
                 let l0 = e.l0_text();
                 if l0.to_lowercase().contains(&needle) {
+                    let Ok(u) = ContextUri::parse(uri.clone()) else { continue };
                     hits.push(GrepHit {
-                        uri: ContextUri(uri.clone()),
+                        uri: u,
                         line: l0.to_string(),
                         level: ContentLevel::L0,
                     });
@@ -137,7 +139,7 @@ impl FsOps for MemoryContextStore {
     }
 
     async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
-        let prefix = format!("{}/", root.0.trim_end_matches('/'));
+        let prefix = format!("{}/", root.to_string().trim_end_matches('/'));
         let map = self.entries.lock();
 
         // 收集所有 root 下的 URI
@@ -206,7 +208,7 @@ impl VersionOps for MemoryContextStore {
                 list.iter()
                     .map(|e| VersionEntry {
                         version: e.mvcc_version,
-                        message: e.l0_abstract.clone(),
+                        message: e.l0_text().to_string(),
                         ts: e.updated_at,
                     })
                     .collect()
@@ -286,7 +288,7 @@ fn build_memory_tree(
 
     let mut children = Vec::new();
     for (name, is_dir) in seen {
-        let child_uri = ContextUri(format!("{}{}", prefix, name));
+        let Ok(child_uri) = ContextUri::parse(format!("{}{}", prefix, name)) else { continue };
         if is_dir {
             let child_prefix = format!("{}{}/", prefix, name);
             let sub_children =
@@ -337,7 +339,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(p, ContentPayload::Abstract(s) if s == "solved bug X"));
+        assert!(matches!(p, ContentPayload::Text { sparse, .. } if sparse == "solved bug X"));
 
         // ls parent dir
         let dir = ContextUri::parse("uwu://t/agent/a/memories/cases").unwrap();

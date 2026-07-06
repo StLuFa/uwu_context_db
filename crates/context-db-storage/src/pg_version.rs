@@ -1,0 +1,1641 @@
+//! `PgVersionStore` —— Postgres 后端的版本 DAG 存储。
+//!
+//! # 设计要点
+//!
+//! - **Git 风格差量存储**：每个 commit 只存储相对 `parent[0]` 的变更（`version_entry_deltas`）。
+//!   完整快照按需从最近祖先重建（沿 parent[0] 链遍历应用 delta）。
+//! - **合并 commit** 存两个 parent（顺序：`into`, `from`）。差量仍相对 `parent[0]`。
+//! - **CRDT 知识合并** 使用 `uwu_crdt::LwwMap<String, String>`（与 MemoryVersionStore 一致语义）。
+//! - **命名引用** 独立于 commit：`version_branches`、`version_tags`。
+//!
+//! # 表结构（详见 `migrations.rs` v5）
+//!
+//! - `version_commits(id, scope, tree_hash, author_json, message, timestamp, metadata_json)`
+//! - `version_commit_parents(commit_id, parent_id, ordinal)`
+//! - `version_branches(scope, name, head, branch_type, lifecycle_json, created_from, created_at)`
+//! - `version_tags(scope, name, target, tag_type, message, timestamp)`
+//! - `version_entry_deltas(commit_id, uri, op, entry_json, rename_from)`
+//! - `version_heads(scope, commit_id)`
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri};
+use agent_context_db_version::{
+    AsOfTime, Author, Branch, BranchLifecycle, BranchName, BranchType, ChangeSet, Commit, CommitId,
+    CommitMeta, ConflictStrategy, ContentHash, GcPolicy, GcReport, ImpactAnalysis,
+    KnowledgeMergeStrategy, LogOpts, MergeResult, MergeStrategy, ProvenanceGraph, Result,
+    SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion, TreeDiff, VersionError,
+    VersionRef, VersionStore,
+};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::Row;
+use uuid::Uuid;
+use uwu_database::{Cache, DbPool};
+
+// ===========================================================================
+// PgVersionStore
+// ===========================================================================
+
+/// PG 后端 VersionStore，基于 `uwu_database::DbPool` + `sqlx` 直接访问。
+///
+/// # 快照缓存（三级）
+///
+/// `reconstruct_snapshot` 查找顺序：
+/// 1. **L1**：内存缓存 `uwu_database::Cache`（通过 `with_cache()` 注入，key `snap:{commit_id}`）
+/// 2. **L2**：`version_commit_checkpoints` 表 —— 深链兜底，commit 不可变故无失效问题
+/// 3. **回退**：沿 `first_parent` 链遍历应用 delta；链长超过 `checkpoint_threshold` 时
+///    自动写入 L2 checkpoint（默认阈值 32）
+///
+/// L2 checkpoint 通过 `ON DELETE CASCADE` 与 `version_commits` 联动，`gc()` 删 commit 时
+/// 自动清理。L1 需手动 `cache_del_snapshot`。
+#[derive(Clone)]
+pub struct PgVersionStore {
+    pool: Arc<DbPool>,
+    cache: Option<Arc<dyn Cache>>,
+    cache_ttl: Option<Duration>,
+    /// 链长超过此值时写入 L2 checkpoint。0 表示禁用 L2 写入。
+    checkpoint_threshold: usize,
+}
+
+impl PgVersionStore {
+    /// 构造 —— 构造时验证后端是 postgres。
+    pub fn new(pool: Arc<DbPool>) -> Self {
+        let _ = pool.as_postgres().expect("PgVersionStore requires postgres backend");
+        Self {
+            pool,
+            cache: None,
+            cache_ttl: Some(Duration::from_secs(3600)),
+            checkpoint_threshold: 32,
+        }
+    }
+
+    /// 注入快照缓存 —— 大幅降低深链下 `read_at` / `merge` 的 I/O 次数。
+    pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// 覆盖缓存 TTL（默认 1 小时）。传 `None` 表示永久缓存。
+    pub fn with_cache_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.cache_ttl = ttl;
+        self
+    }
+
+    /// 配置 L2 checkpoint 写入阈值（默认 32）。传 `0` 禁用 L2 写入（仅读取现有 checkpoint）。
+    pub fn with_checkpoint_threshold(mut self, threshold: usize) -> Self {
+        self.checkpoint_threshold = threshold;
+        self
+    }
+
+    fn pg(&self) -> &sqlx::PgPool {
+        self.pool.as_postgres().expect("PgVersionStore: backend validated at construction")
+    }
+
+    fn scope_key(scope: &ContextUri) -> String {
+        scope.to_string()
+    }
+
+    fn storage_err<E: std::fmt::Display>(e: E) -> VersionError {
+        VersionError::Storage(e.to_string())
+    }
+
+    // ---- Commit 读取 ---------------------------------------------------------
+
+    async fn load_commit(&self, id: &CommitId) -> Result<Option<Commit>> {
+        let row = sqlx::query(
+            r#"SELECT id, scope, tree_hash, author_json, message, timestamp, metadata_json
+               FROM version_commits WHERE id = $1"#,
+        )
+        .bind(id.0)
+        .fetch_optional(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        let row = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let parents = self.load_parents(id).await?;
+        let author_val: serde_json::Value = row.try_get("author_json").map_err(Self::storage_err)?;
+        let author: Author = serde_json::from_value(author_val).unwrap_or(Author {
+            agent_id: None,
+            user_id: None,
+            system: true,
+        });
+        let meta_val: serde_json::Value =
+            row.try_get("metadata_json").map_err(Self::storage_err)?;
+        let metadata: CommitMeta = serde_json::from_value(meta_val).unwrap_or_default();
+        let tree_hash_str: String = row.try_get("tree_hash").map_err(Self::storage_err)?;
+        let timestamp: DateTime<Utc> = row.try_get("timestamp").map_err(Self::storage_err)?;
+        let message: String = row.try_get("message").map_err(Self::storage_err)?;
+        Ok(Some(Commit {
+            id: id.clone(),
+            parents,
+            tree_hash: ContentHash(tree_hash_str),
+            author,
+            message,
+            timestamp,
+            metadata,
+        }))
+    }
+
+    async fn load_parents(&self, id: &CommitId) -> Result<Vec<CommitId>> {
+        let rows = sqlx::query(
+            r#"SELECT parent_id FROM version_commit_parents
+               WHERE commit_id = $1 ORDER BY ordinal ASC"#,
+        )
+        .bind(id.0)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(rows.into_iter()
+            .filter_map(|r| r.try_get::<Uuid, _>("parent_id").ok())
+            .map(CommitId)
+            .collect())
+    }
+
+    async fn first_parent(&self, id: &CommitId) -> Result<Option<CommitId>> {
+        let row = sqlx::query(
+            r#"SELECT parent_id FROM version_commit_parents
+               WHERE commit_id = $1 ORDER BY ordinal ASC LIMIT 1"#,
+        )
+        .bind(id.0)
+        .fetch_optional(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(row
+            .and_then(|r| r.try_get::<Uuid, _>("parent_id").ok())
+            .map(CommitId))
+    }
+
+    async fn commit_timestamp(&self, id: &CommitId) -> Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query("SELECT timestamp FROM version_commits WHERE id = $1")
+            .bind(id.0)
+            .fetch_optional(self.pg())
+            .await
+            .map_err(Self::storage_err)?;
+        Ok(row.and_then(|r| r.try_get("timestamp").ok()))
+    }
+
+    // ---- 差量 ---------------------------------------------------------------
+
+    /// 拉取单个 commit 的 delta 列表。
+    async fn load_deltas(&self, id: &CommitId) -> Result<Vec<DeltaRow>> {
+        let rows = sqlx::query(
+            r#"SELECT uri, op, entry_json, rename_from
+               FROM version_entry_deltas WHERE commit_id = $1"#,
+        )
+        .bind(id.0)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DeltaRow {
+                uri: r.try_get::<String, _>("uri").unwrap_or_default(),
+                op: r.try_get::<String, _>("op").unwrap_or_else(|_| "update".into()),
+                entry_json: r
+                    .try_get::<Option<serde_json::Value>, _>("entry_json")
+                    .ok()
+                    .flatten(),
+                rename_from: r.try_get::<Option<String>, _>("rename_from").ok().flatten(),
+            })
+            .collect())
+    }
+
+    /// 快照缓存 key —— commit_id 全局唯一，无需 scope 前缀。
+    fn snapshot_cache_key(id: &CommitId) -> String {
+        format!("snap:{}", id.0)
+    }
+
+    /// 尝试从缓存加载快照。
+    async fn cache_get_snapshot(&self, id: &CommitId) -> Option<HashMap<String, String>> {
+        let cache = self.cache.as_ref()?;
+        let key = Self::snapshot_cache_key(id);
+        let bytes = cache.get(&key).await.ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// 回填缓存（best-effort，失败静默）。
+    async fn cache_put_snapshot(&self, id: &CommitId, snap: &HashMap<String, String>) {
+        let Some(cache) = self.cache.as_ref() else { return; };
+        let Ok(bytes) = serde_json::to_vec(snap) else { return; };
+        let key = Self::snapshot_cache_key(id);
+        let _ = cache.set(&key, &bytes, self.cache_ttl).await;
+    }
+
+    /// gc 时清理已删 commit 的缓存条目。
+    async fn cache_del_snapshot(&self, id: &CommitId) {
+        let Some(cache) = self.cache.as_ref() else { return; };
+        let key = Self::snapshot_cache_key(id);
+        let _ = cache.del(&key).await;
+    }
+
+    // ---- L2 checkpoint --------------------------------------------------------
+
+    /// 尝试从 `version_commit_checkpoints` 读取 L2 快照。
+    async fn checkpoint_get(&self, id: &CommitId) -> Option<HashMap<String, String>> {
+        let row = sqlx::query(
+            r#"SELECT snapshot_json FROM version_commit_checkpoints WHERE commit_id = $1"#,
+        )
+        .bind(id.0)
+        .fetch_optional(self.pg())
+        .await
+        .ok()
+        .flatten()?;
+        let val: serde_json::Value = row.try_get("snapshot_json").ok()?;
+        serde_json::from_value(val).ok()
+    }
+
+    /// 写入 L2 checkpoint（best-effort，冲突时更新）。
+    async fn checkpoint_put(&self, id: &CommitId, snap: &HashMap<String, String>) {
+        let Ok(val) = serde_json::to_value(snap) else { return; };
+        let _ = sqlx::query(
+            r#"INSERT INTO version_commit_checkpoints (commit_id, snapshot_json)
+               VALUES ($1, $2)
+               ON CONFLICT (commit_id) DO UPDATE SET snapshot_json = EXCLUDED.snapshot_json"#,
+        )
+        .bind(id.0)
+        .bind(val)
+        .execute(self.pg())
+        .await;
+    }
+
+    /// 沿 parent[0] 链重建 commit 的完整快照（URI → 序列化 entry JSON）。
+    ///
+    /// 三级查找：
+    /// 1. L1 内存缓存 —— 命中自身或祖先
+    /// 2. L2 checkpoint 表 —— 命中自身或祖先
+    /// 3. 沿链遍历应用 delta；链长 ≥ `checkpoint_threshold` 时回写 L2 checkpoint
+    async fn reconstruct_snapshot(&self, id: &CommitId) -> Result<HashMap<String, String>> {
+        // 快路径 1：L1 自身
+        if let Some(snap) = self.cache_get_snapshot(id).await {
+            return Ok(snap);
+        }
+        // 快路径 2：L2 自身
+        if let Some(snap) = self.checkpoint_get(id).await {
+            self.cache_put_snapshot(id, &snap).await; // 回填 L1
+            return Ok(snap);
+        }
+
+        // 沿 first_parent 链收集，遇到 L1 或 L2 命中就停
+        let mut chain = vec![id.clone()];
+        let mut cur = id.clone();
+        let mut seeded: Option<HashMap<String, String>> = None;
+        loop {
+            match self.first_parent(&cur).await? {
+                Some(p) => {
+                    if chain.contains(&p) {
+                        break; // 防环
+                    }
+                    // L1 命中？
+                    if let Some(snap) = self.cache_get_snapshot(&p).await {
+                        seeded = Some(snap);
+                        break;
+                    }
+                    // L2 命中？
+                    if let Some(snap) = self.checkpoint_get(&p).await {
+                        // 顺手回填 L1
+                        self.cache_put_snapshot(&p, &snap).await;
+                        seeded = Some(snap);
+                        break;
+                    }
+                    chain.push(p.clone());
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        let chain_len = chain.len();
+        // 从种子（或空）开始，沿链正向应用 delta
+        let mut snapshot = seeded.unwrap_or_default();
+        for cid in chain.iter().rev() {
+            let deltas = self.load_deltas(cid).await?;
+            apply_deltas(&mut snapshot, &deltas);
+        }
+        // 回填 L1
+        self.cache_put_snapshot(id, &snapshot).await;
+        // 深链 → 写 L2 checkpoint（避免下次冷启动再走同样长的链）
+        if self.checkpoint_threshold > 0 && chain_len >= self.checkpoint_threshold {
+            self.checkpoint_put(id, &snapshot).await;
+        }
+        Ok(snapshot)
+    }
+
+    /// 从两个快照计算 delta：dst 相对 src 的变更。
+    fn diff_snapshots(
+        src: &HashMap<String, String>,
+        dst: &HashMap<String, String>,
+    ) -> Vec<DeltaRow> {
+        let mut out = Vec::new();
+        for (uri, dv) in dst {
+            match src.get(uri) {
+                None => out.push(DeltaRow {
+                    uri: uri.clone(),
+                    op: "add".into(),
+                    entry_json: serde_json::from_str(dv).ok(),
+                    rename_from: None,
+                }),
+                Some(sv) if sv != dv => out.push(DeltaRow {
+                    uri: uri.clone(),
+                    op: "update".into(),
+                    entry_json: serde_json::from_str(dv).ok(),
+                    rename_from: None,
+                }),
+                _ => {}
+            }
+        }
+        for uri in src.keys() {
+            if !dst.contains_key(uri) {
+                out.push(DeltaRow {
+                    uri: uri.clone(),
+                    op: "delete".into(),
+                    entry_json: None,
+                    rename_from: None,
+                });
+            }
+        }
+        out
+    }
+
+    // ---- 祖先关系 ------------------------------------------------------------
+
+    async fn is_ancestor(&self, ancestor: &CommitId, candidate: &CommitId) -> Result<bool> {
+        if ancestor == candidate {
+            return Ok(true);
+        }
+        let mut visited: HashSet<CommitId> = HashSet::new();
+        let mut stack = vec![candidate.clone()];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            let parents = self.load_parents(&node).await?;
+            for p in parents {
+                if &p == ancestor {
+                    return Ok(true);
+                }
+                stack.push(p);
+            }
+        }
+        Ok(false)
+    }
+
+    // ---- 写入 commit ---------------------------------------------------------
+
+    async fn insert_commit_row(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        commit: &Commit,
+        scope: &str,
+    ) -> Result<()> {
+        let author_json = serde_json::to_value(&commit.author).unwrap_or(serde_json::json!({}));
+        let meta_json = serde_json::to_value(&commit.metadata).unwrap_or(serde_json::json!({}));
+        sqlx::query(
+            r#"INSERT INTO version_commits
+               (id, scope, tree_hash, author_json, message, timestamp, metadata_json)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(commit.id.0)
+        .bind(scope)
+        .bind(&commit.tree_hash.0)
+        .bind(author_json)
+        .bind(&commit.message)
+        .bind(commit.timestamp)
+        .bind(meta_json)
+        .execute(&mut **tx)
+        .await
+        .map_err(Self::storage_err)?;
+        for (i, p) in commit.parents.iter().enumerate() {
+            sqlx::query(
+                r#"INSERT INTO version_commit_parents (commit_id, parent_id, ordinal)
+                   VALUES ($1, $2, $3)"#,
+            )
+            .bind(commit.id.0)
+            .bind(p.0)
+            .bind(i as i16)
+            .execute(&mut **tx)
+            .await
+            .map_err(Self::storage_err)?;
+        }
+        Ok(())
+    }
+
+    async fn insert_deltas(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        commit_id: &CommitId,
+        deltas: &[DeltaRow],
+    ) -> Result<()> {
+        for d in deltas {
+            sqlx::query(
+                r#"INSERT INTO version_entry_deltas
+                   (commit_id, uri, op, entry_json, rename_from)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (commit_id, uri) DO UPDATE
+                     SET op = EXCLUDED.op,
+                         entry_json = EXCLUDED.entry_json,
+                         rename_from = EXCLUDED.rename_from"#,
+            )
+            .bind(commit_id.0)
+            .bind(&d.uri)
+            .bind(&d.op)
+            .bind(&d.entry_json)
+            .bind(&d.rename_from)
+            .execute(&mut **tx)
+            .await
+            .map_err(Self::storage_err)?;
+        }
+        Ok(())
+    }
+
+    // ---- HEAD / 分支 ---------------------------------------------------------
+
+    async fn get_head(&self, scope: &str) -> Result<Option<CommitId>> {
+        let row = sqlx::query("SELECT commit_id FROM version_heads WHERE scope = $1")
+            .bind(scope)
+            .fetch_optional(self.pg())
+            .await
+            .map_err(Self::storage_err)?;
+        Ok(row.and_then(|r| r.try_get::<Uuid, _>("commit_id").ok()).map(CommitId))
+    }
+
+    async fn set_head(&self, scope: &str, commit: &CommitId) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO version_heads (scope, commit_id) VALUES ($1, $2)
+               ON CONFLICT (scope) DO UPDATE SET commit_id = EXCLUDED.commit_id"#,
+        )
+        .bind(scope)
+        .bind(commit.0)
+        .execute(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(())
+    }
+
+    async fn get_branch(&self, scope: &str, name: &BranchName) -> Result<Option<Branch>> {
+        let row = sqlx::query(
+            r#"SELECT name, head, branch_type, lifecycle_json, created_from, created_at
+               FROM version_branches WHERE scope = $1 AND name = $2"#,
+        )
+        .bind(scope)
+        .bind(name.as_str())
+        .fetch_optional(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        let Some(row) = row else { return Ok(None); };
+        Ok(Some(branch_from_row(row)?))
+    }
+
+    async fn update_branch_head(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        scope: &str,
+        name: &BranchName,
+        head: &CommitId,
+    ) -> Result<()> {
+        sqlx::query("UPDATE version_branches SET head = $1 WHERE scope = $2 AND name = $3")
+            .bind(head.0)
+            .bind(scope)
+            .bind(name.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(Self::storage_err)?;
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// 内部辅助
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+struct DeltaRow {
+    uri: String,
+    op: String,
+    entry_json: Option<serde_json::Value>,
+    rename_from: Option<String>,
+}
+
+/// 把 delta 应用到快照上（就地修改）。
+fn apply_deltas(snapshot: &mut HashMap<String, String>, deltas: &[DeltaRow]) {
+    for d in deltas {
+        match d.op.as_str() {
+            "add" | "update" => {
+                if let Some(v) = &d.entry_json {
+                    snapshot.insert(d.uri.clone(), v.to_string());
+                }
+            }
+            "delete" => {
+                snapshot.remove(&d.uri);
+            }
+            "rename" => {
+                if let Some(from) = &d.rename_from {
+                    if let Some(v) = snapshot.remove(from) {
+                        snapshot.insert(d.uri.clone(), v);
+                    }
+                }
+            }
+            _ => {} // 未知 op 忽略
+        }
+    }
+}
+
+fn branch_from_row(row: sqlx::postgres::PgRow) -> Result<Branch> {
+    let name: String = row.try_get("name").map_err(PgVersionStore::storage_err)?;
+    let head: Uuid = row.try_get("head").map_err(PgVersionStore::storage_err)?;
+    let created_from: Uuid = row
+        .try_get("created_from")
+        .map_err(PgVersionStore::storage_err)?;
+    let created_at: DateTime<Utc> = row
+        .try_get("created_at")
+        .map_err(PgVersionStore::storage_err)?;
+    let bt_str: String = row.try_get("branch_type").map_err(PgVersionStore::storage_err)?;
+    let lc_val: serde_json::Value = row
+        .try_get("lifecycle_json")
+        .map_err(PgVersionStore::storage_err)?;
+    Ok(Branch {
+        name: BranchName::new(name),
+        head: CommitId(head),
+        created_from: CommitId(created_from),
+        created_at,
+        branch_type: parse_branch_type(&bt_str),
+        lifecycle: serde_json::from_value(lc_val).unwrap_or(BranchLifecycle::Active),
+    })
+}
+
+fn parse_branch_type(s: &str) -> BranchType {
+    match s {
+        "StateFork" => BranchType::StateFork,
+        "Experiment" => BranchType::Experiment,
+        "Collaboration" => BranchType::Collaboration,
+        "Staging" => BranchType::Staging,
+        _ => BranchType::Main,
+    }
+}
+
+fn branch_type_str(bt: BranchType) -> &'static str {
+    match bt {
+        BranchType::Main => "Main",
+        BranchType::StateFork => "StateFork",
+        BranchType::Experiment => "Experiment",
+        BranchType::Collaboration => "Collaboration",
+        BranchType::Staging => "Staging",
+    }
+}
+
+/// Jaccard 相似度（用于知识合并的冲突检测）。
+fn jaccard(a: &str, b: &str) -> f64 {
+    let tokens = |s: &str| -> HashSet<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_lowercase())
+            .collect()
+    };
+    let sa = tokens(a);
+    let sb = tokens(b);
+    if sa.is_empty() && sb.is_empty() {
+        return 1.0;
+    }
+    let inter = sa.intersection(&sb).count() as f64;
+    let union = sa.union(&sb).count() as f64;
+    if union == 0.0 { 0.0 } else { inter / union }
+}
+
+// ===========================================================================
+// VersionStore 实现
+// ===========================================================================
+
+#[async_trait]
+impl VersionStore for PgVersionStore {
+    // ---- Commit -----------------------------------------------------------
+
+    #[tracing::instrument(skip(self, changes, meta), fields(scope = %scope, adds = changes.adds.len(), updates = changes.updates.len(), deletes = changes.deletes.len()))]
+    async fn commit(
+        &self,
+        scope: &ContextUri,
+        changes: ChangeSet,
+        meta: CommitMeta,
+    ) -> Result<CommitId> {
+        let scope_key = Self::scope_key(scope);
+        let parent = self.get_head(&scope_key).await?;
+        let parents: Vec<CommitId> = parent.iter().cloned().collect();
+        let commit_id = CommitId::new();
+        let now = Utc::now();
+
+        // 把 ChangeSet 转成 DeltaRow
+        let mut deltas = Vec::new();
+        for uri in &changes.adds {
+            deltas.push(DeltaRow {
+                uri: uri.to_string(),
+                op: "add".into(),
+                entry_json: Some(serde_json::json!({})),
+                rename_from: None,
+            });
+        }
+        for upd in &changes.updates {
+            deltas.push(DeltaRow {
+                uri: upd.uri.to_string(),
+                op: "update".into(),
+                entry_json: Some(serde_json::json!({
+                    "diff_summary": upd.diff_summary,
+                    "new_hash": upd.new_hash.0,
+                })),
+                rename_from: None,
+            });
+        }
+        for uri in &changes.deletes {
+            deltas.push(DeltaRow {
+                uri: uri.to_string(),
+                op: "delete".into(),
+                entry_json: None,
+                rename_from: None,
+            });
+        }
+        for r in &changes.renames {
+            deltas.push(DeltaRow {
+                uri: r.to.to_string(),
+                op: "rename".into(),
+                entry_json: None,
+                rename_from: Some(r.from.to_string()),
+            });
+        }
+
+        let commit = Commit {
+            id: commit_id.clone(),
+            parents,
+            tree_hash: ContentHash(format!("tree-{}", commit_id.0)),
+            author: Author { agent_id: None, user_id: None, system: true },
+            message: String::new(),
+            timestamp: now,
+            metadata: meta,
+        };
+
+        let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+        self.insert_commit_row(&mut tx, &commit, &scope_key).await?;
+        self.insert_deltas(&mut tx, &commit_id, &deltas).await?;
+        // 更新 scope HEAD
+        sqlx::query(
+            r#"INSERT INTO version_heads (scope, commit_id) VALUES ($1, $2)
+               ON CONFLICT (scope) DO UPDATE SET commit_id = EXCLUDED.commit_id"#,
+        )
+        .bind(&scope_key)
+        .bind(commit_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(Self::storage_err)?;
+        tx.commit().await.map_err(Self::storage_err)?;
+        Ok(commit_id)
+    }
+
+    async fn log(&self, scope: &ContextUri, opts: &LogOpts) -> Result<Vec<Commit>> {
+        let scope_key = Self::scope_key(scope);
+        let start = if let Some(branch) = &opts.branch {
+            self.get_branch(&scope_key, branch).await?.map(|b| b.head)
+        } else {
+            self.get_head(&scope_key).await?
+        };
+        let Some(head) = start else { return Ok(vec![]); };
+
+        // 拓扑遍历（BFS 沿 parents）
+        let mut out = Vec::new();
+        let mut visited: HashSet<CommitId> = HashSet::new();
+        let mut stack = vec![head];
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if let Some(commit) = self.load_commit(&id).await? {
+                for p in &commit.parents {
+                    stack.push(p.clone());
+                }
+                out.push(commit);
+            }
+            if let Some(max) = opts.max_count {
+                if out.len() >= max {
+                    break;
+                }
+            }
+        }
+        out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(out)
+    }
+
+    // ---- Branch -----------------------------------------------------------
+
+    async fn create_branch(
+        &self,
+        scope: &ContextUri,
+        name: BranchName,
+        from: CommitId,
+        bt: BranchType,
+    ) -> Result<Branch> {
+        let scope_key = Self::scope_key(scope);
+        if self.get_branch(&scope_key, &name).await?.is_some() {
+            return Err(VersionError::BranchExists(name.as_str().to_string()));
+        }
+        let now = Utc::now();
+        sqlx::query(
+            r#"INSERT INTO version_branches
+               (scope, name, head, branch_type, lifecycle_json, created_from, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(&scope_key)
+        .bind(name.as_str())
+        .bind(from.0)
+        .bind(branch_type_str(bt))
+        .bind(serde_json::to_value(BranchLifecycle::Active).unwrap_or(serde_json::json!({})))
+        .bind(from.0)
+        .bind(now)
+        .execute(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(Branch {
+            name,
+            head: from.clone(),
+            created_from: from,
+            created_at: now,
+            branch_type: bt,
+            lifecycle: BranchLifecycle::Active,
+        })
+    }
+
+    async fn list_branches(&self, scope: &ContextUri) -> Result<Vec<Branch>> {
+        let scope_key = Self::scope_key(scope);
+        let rows = sqlx::query(
+            r#"SELECT name, head, branch_type, lifecycle_json, created_from, created_at
+               FROM version_branches WHERE scope = $1 ORDER BY created_at ASC"#,
+        )
+        .bind(&scope_key)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        rows.into_iter().map(branch_from_row).collect()
+    }
+
+    async fn delete_branch(&self, scope: &ContextUri, name: &BranchName) -> Result<()> {
+        let scope_key = Self::scope_key(scope);
+        sqlx::query("DELETE FROM version_branches WHERE scope = $1 AND name = $2")
+            .bind(&scope_key)
+            .bind(name.as_str())
+            .execute(self.pg())
+            .await
+            .map_err(Self::storage_err)?;
+        Ok(())
+    }
+
+    async fn switch_head(&self, scope: &ContextUri, branch: &BranchName) -> Result<()> {
+        let scope_key = Self::scope_key(scope);
+        let b = self.get_branch(&scope_key, branch).await?.ok_or_else(|| {
+            VersionError::NotFound(format!("branch {}", branch.as_str()))
+        })?;
+        self.set_head(&scope_key, &b.head).await
+    }
+
+    // ---- Tag --------------------------------------------------------------
+
+    async fn create_tag(&self, scope: &ContextUri, tag: Tag) -> Result<()> {
+        let scope_key = Self::scope_key(scope);
+        let (tt, cond_expr) = match &tag.tag_type {
+            TagType::Immutable => ("Immutable", None),
+            TagType::Mutable => ("Mutable", None),
+            TagType::Semantic { condition } => ("Semantic", Some(condition.expr.clone())),
+        };
+        sqlx::query(
+            r#"INSERT INTO version_tags (scope, name, target, tag_type, message, timestamp, condition_expr)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (scope, name) DO UPDATE
+               SET target = EXCLUDED.target,
+                   message = EXCLUDED.message,
+                   tag_type = EXCLUDED.tag_type,
+                   condition_expr = EXCLUDED.condition_expr"#,
+        )
+        .bind(&scope_key)
+        .bind(tag.name.as_str())
+        .bind(tag.target.0)
+        .bind(tt)
+        .bind(&tag.message)
+        .bind(tag.created_at)
+        .bind(cond_expr)
+        .execute(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(())
+    }
+
+    async fn list_tags(&self, scope: &ContextUri) -> Result<Vec<Tag>> {
+        let scope_key = Self::scope_key(scope);
+        let rows = sqlx::query(
+            r#"SELECT name, target, tag_type, message, timestamp, condition_expr
+               FROM version_tags WHERE scope = $1"#,
+        )
+        .bind(&scope_key)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let name: String = row.try_get("name").map_err(Self::storage_err)?;
+            let target: Uuid = row.try_get("target").map_err(Self::storage_err)?;
+            let tt: String = row.try_get("tag_type").map_err(Self::storage_err)?;
+            let message: Option<String> = row.try_get("message").ok();
+            let timestamp: DateTime<Utc> = row.try_get("timestamp").map_err(Self::storage_err)?;
+            let cond_expr: Option<String> = row.try_get("condition_expr").ok().flatten();
+            let tag_type = match tt.as_str() {
+                "Immutable" => TagType::Immutable,
+                "Semantic" => TagType::Semantic {
+                    condition: agent_context_db_version::SemanticCondition {
+                        expr: cond_expr.unwrap_or_default(),
+                    },
+                },
+                _ => TagType::Mutable,
+            };
+            out.push(Tag {
+                name: TagName::new(name),
+                target: CommitId(target),
+                tag_type,
+                message: message.unwrap_or_default(),
+                created_by: Author { agent_id: None, user_id: None, system: true },
+                created_at: timestamp,
+            });
+        }
+        Ok(out)
+    }
+
+    // ---- 读取 / 时间旅行 -----------------------------------------------------
+
+    async fn read_at(
+        &self,
+        uri: &ContextUri,
+        ref_: VersionRef,
+        _level: ContentLevel,
+    ) -> Result<ContentPayload> {
+        let scope_key = Self::scope_key(uri);
+        let commit_id = match ref_ {
+            VersionRef::Commit(c) => c,
+            VersionRef::Branch(name) => self
+                .get_branch(&scope_key, &name)
+                .await?
+                .ok_or_else(|| VersionError::NotFound(format!("branch {}", name.as_str())))?
+                .head,
+            VersionRef::Tag(name) => {
+                let row = sqlx::query(
+                    "SELECT target FROM version_tags WHERE scope = $1 AND name = $2",
+                )
+                .bind(&scope_key)
+                .bind(name.as_str())
+                .fetch_optional(self.pg())
+                .await
+                .map_err(Self::storage_err)?
+                .ok_or_else(|| VersionError::NotFound(format!("tag {}", name.as_str())))?;
+                let target: Uuid = row.try_get("target").map_err(Self::storage_err)?;
+                CommitId(target)
+            }
+            VersionRef::Head => self
+                .get_head(&scope_key)
+                .await?
+                .ok_or_else(|| VersionError::NotFound(format!("HEAD of {scope_key}")))?,
+        };
+        let snapshot = self.reconstruct_snapshot(&commit_id).await?;
+        let json = snapshot
+            .get(&uri.to_string())
+            .ok_or_else(|| VersionError::NotFound(uri.to_string()))?;
+        Ok(payload_from_json(json))
+    }
+
+    async fn asof_read(
+        &self,
+        uri: &ContextUri,
+        when: AsOfTime,
+        level: ContentLevel,
+    ) -> Result<ContentPayload> {
+        let commit_id = match when {
+            AsOfTime::Commit(c) => c,
+            AsOfTime::Timestamp(ts) => {
+                let scope_key = Self::scope_key(uri);
+                let row = sqlx::query(
+                    r#"SELECT id FROM version_commits
+                       WHERE scope = $1 AND timestamp <= $2
+                       ORDER BY timestamp DESC LIMIT 1"#,
+                )
+                .bind(&scope_key)
+                .bind(ts)
+                .fetch_optional(self.pg())
+                .await
+                .map_err(Self::storage_err)?
+                .ok_or_else(|| VersionError::NotFound(format!("no commit before {ts}")))?;
+                let id: Uuid = row.try_get("id").map_err(Self::storage_err)?;
+                CommitId(id)
+            }
+        };
+        self.read_at(uri, VersionRef::Commit(commit_id), level).await
+    }
+
+    // ---- 合并 / Diff ---------------------------------------------------------
+
+    #[tracing::instrument(skip(self), fields(scope = %scope, from = %from, into = %into, strategy = ?strategy))]
+    async fn merge(
+        &self,
+        scope: &ContextUri,
+        from: &BranchName,
+        into: &BranchName,
+        strategy: MergeStrategy,
+    ) -> Result<MergeResult> {
+        let scope_key = Self::scope_key(scope);
+        let from_head = self.get_branch(&scope_key, from).await?
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", from.as_str())))?.head;
+        let into_head = self.get_branch(&scope_key, into).await?
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", into.as_str())))?.head;
+
+        // Fast-forward 检测
+        if self.is_ancestor(&into_head, &from_head).await? {
+            let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+            self.update_branch_head(&mut tx, &scope_key, into, &from_head).await?;
+            tx.commit().await.map_err(Self::storage_err)?;
+            self.set_head(&scope_key, &from_head).await?;
+            return Ok(MergeResult { commit: from_head, conflicts: vec![] });
+        }
+
+        let from_snap = self.reconstruct_snapshot(&from_head).await?;
+        let into_snap = self.reconstruct_snapshot(&into_head).await?;
+
+        // 冲突检测 + 合并策略
+        let mut merged = into_snap.clone();
+        let mut conflicts = Vec::new();
+        for (uri, fv) in &from_snap {
+            match merged.get(uri) {
+                None => {
+                    merged.insert(uri.clone(), fv.clone());
+                }
+                Some(iv) if iv == fv => {}
+                Some(iv) => match strategy {
+                    MergeStrategy::Theirs | MergeStrategy::FastForward => {
+                        merged.insert(uri.clone(), fv.clone());
+                    }
+                    MergeStrategy::Ours => {}
+                    MergeStrategy::ThreeWay => {
+                        // 无 base 时保守：标为冲突并采用 into 侧
+                        if let Ok(u) = ContextUri::parse(uri.as_str()) {
+                            conflicts.push(u);
+                        }
+                        // 保持 into 侧值
+                        let _ = iv;
+                    }
+                },
+            }
+        }
+
+        // 创建 merge commit（两个 parent，delta 相对 into_head）
+        let deltas = Self::diff_snapshots(&into_snap, &merged);
+        let commit_id = CommitId::new();
+        let now = Utc::now();
+        let merge_commit = Commit {
+            id: commit_id.clone(),
+            parents: vec![into_head.clone(), from_head.clone()],
+            tree_hash: ContentHash(format!("tree-{}", commit_id.0)),
+            author: Author { agent_id: None, user_id: None, system: true },
+            message: format!("merge {} <- {} conflicts={}", into.as_str(), from.as_str(), conflicts.len()),
+            timestamp: now,
+            metadata: CommitMeta::default(),
+        };
+
+        let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+        self.insert_commit_row(&mut tx, &merge_commit, &scope_key).await?;
+        self.insert_deltas(&mut tx, &commit_id, &deltas).await?;
+        self.update_branch_head(&mut tx, &scope_key, into, &commit_id).await?;
+        tx.commit().await.map_err(Self::storage_err)?;
+        self.set_head(&scope_key, &commit_id).await?;
+        Ok(MergeResult { commit: commit_id, conflicts })
+    }
+
+    async fn diff_commits(
+        &self,
+        _scope: &ContextUri,
+        a: &CommitId,
+        b: &CommitId,
+    ) -> Result<TreeDiff> {
+        let sa = self.reconstruct_snapshot(a).await?;
+        let sb = self.reconstruct_snapshot(b).await?;
+        let mut diff = TreeDiff::default();
+        for uri in sb.keys() {
+            if !sa.contains_key(uri) {
+                if let Ok(u) = ContextUri::parse(uri.as_str()) {
+                    diff.adds.push(u);
+                }
+            } else if sa.get(uri) != sb.get(uri) {
+                if let Ok(u) = ContextUri::parse(uri.as_str()) {
+                    diff.updates.push(u);
+                }
+            }
+        }
+        for uri in sa.keys() {
+            if !sb.contains_key(uri) {
+                if let Ok(u) = ContextUri::parse(uri.as_str()) {
+                    diff.deletes.push(u);
+                }
+            }
+        }
+        Ok(diff)
+    }
+
+    // ---- 历史改写 ------------------------------------------------------------
+
+    #[tracing::instrument(skip(self), fields(scope = %scope, commit = %commit.0, onto = %onto, strategy = ?strategy))]
+    async fn cherry_pick(
+        &self,
+        scope: &ContextUri,
+        commit: &CommitId,
+        onto: &BranchName,
+        strategy: ConflictStrategy,
+    ) -> Result<CommitId> {
+        let scope_key = Self::scope_key(scope);
+        let target = self.get_branch(&scope_key, onto).await?
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", onto.as_str())))?.head;
+        self.cherry_pick_at_branch(scope, commit, &target, Some(onto), strategy).await
+    }
+
+    #[tracing::instrument(skip(self), fields(scope = %scope, branch = %branch, onto = %onto, strategy = ?strategy))]
+    async fn rebase(
+        &self,
+        scope: &ContextUri,
+        branch: &BranchName,
+        onto: &BranchName,
+        strategy: ConflictStrategy,
+    ) -> Result<Vec<CommitId>> {
+        let scope_key = Self::scope_key(scope);
+        let branch_head = self.get_branch(&scope_key, branch).await?
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", branch.as_str())))?.head;
+        let onto_head = self.get_branch(&scope_key, onto).await?
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", onto.as_str())))?.head;
+
+        // 收集 branch 独有 commit 序列（自 branch_head 沿 first_parent 上溯，直到进入 onto 祖先）
+        let mut own = Vec::new();
+        let mut cur = branch_head.clone();
+        loop {
+            if self.is_ancestor(&cur, &onto_head).await? {
+                break;
+            }
+            own.push(cur.clone());
+            match self.first_parent(&cur).await? {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        own.reverse(); // 旧 → 新
+
+        // 逐个 cherry-pick 到 onto —— 冲突时立即停止并向上抛错，
+        // 已应用的 commit 不会被回滚（Git 的默认行为，交由调用方决定 abort/continue）
+        let mut applied = Vec::new();
+        let mut target = onto_head;
+        for cid in &own {
+            let new = self
+                .cherry_pick_at_branch(scope, cid, &target, None, strategy)
+                .await
+                .map_err(|e| match e {
+                    VersionError::MergeConflict(msg) => VersionError::MergeConflict(format!(
+                        "rebase halted at {}: {msg}",
+                        cid.0
+                    )),
+                    other => other,
+                })?;
+            applied.push(new.clone());
+            target = new;
+        }
+        // 更新 branch HEAD
+        let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+        self.update_branch_head(&mut tx, &scope_key, branch, &target).await?;
+        tx.commit().await.map_err(Self::storage_err)?;
+        Ok(applied)
+    }
+
+    async fn squash(
+        &self,
+        scope: &ContextUri,
+        commits: Vec<CommitId>,
+        message: &str,
+    ) -> Result<SquashResult> {
+        if commits.len() < 2 {
+            return Err(VersionError::Storage("squash needs >= 2 commits".into()));
+        }
+        let scope_key = Self::scope_key(scope);
+        // 假设 commits 按新旧顺序给出（最新在末尾）
+        let newest = commits.last().unwrap().clone();
+        let oldest = commits.first().unwrap().clone();
+        let parent = self.first_parent(&oldest).await?;
+        let base_snap = if let Some(p) = &parent {
+            self.reconstruct_snapshot(p).await?
+        } else {
+            HashMap::new()
+        };
+        let tip_snap = self.reconstruct_snapshot(&newest).await?;
+        let deltas = Self::diff_snapshots(&base_snap, &tip_snap);
+
+        let new_id = CommitId::new();
+        let now = Utc::now();
+        let parents = parent.iter().cloned().collect();
+        let new_commit = Commit {
+            id: new_id.clone(),
+            parents,
+            tree_hash: ContentHash(format!("tree-{}", new_id.0)),
+            author: Author { agent_id: None, user_id: None, system: true },
+            message: message.to_string(),
+            timestamp: now,
+            metadata: CommitMeta::default(),
+        };
+
+        let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+        self.insert_commit_row(&mut tx, &new_commit, &scope_key).await?;
+        self.insert_deltas(&mut tx, &new_id, &deltas).await?;
+        tx.commit().await.map_err(Self::storage_err)?;
+        Ok(SquashResult { new_commit: new_id, squashed_count: commits.len() })
+    }
+
+    // ---- GC / 语义标签 -------------------------------------------------------
+
+    #[tracing::instrument(skip(self, policy), fields(scope = %scope))]
+    async fn gc(&self, scope: &ContextUri, policy: &GcPolicy) -> Result<GcReport> {
+        let scope_key = Self::scope_key(scope);
+        let cutoff = Utc::now() - chrono::Duration::days(policy.max_age_days);
+        // 找到候选 —— 不是任何分支/tag HEAD 的祖先，且 timestamp < cutoff
+        // 简化：先按时间戳 + LIMIT keep_recent 排除
+        let rows = sqlx::query(
+            r#"SELECT id FROM version_commits
+               WHERE scope = $1 AND timestamp < $2
+               AND id NOT IN (SELECT head FROM version_branches WHERE scope = $1)
+               AND id NOT IN (SELECT target FROM version_tags WHERE scope = $1)
+               ORDER BY timestamp ASC
+               OFFSET $3"#,
+        )
+        .bind(&scope_key)
+        .bind(cutoff)
+        .bind(policy.keep_recent as i64)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        let ids: Vec<Uuid> = rows.into_iter().filter_map(|r| r.try_get("id").ok()).collect();
+        let removed = ids.len();
+        // 删除 commit + 级联 delta 与 parent 引用
+        for id in &ids {
+            sqlx::query("DELETE FROM version_commits WHERE id = $1")
+                .bind(id)
+                .execute(self.pg())
+                .await
+                .map_err(Self::storage_err)?;
+            // 缓存失效
+            self.cache_del_snapshot(&CommitId(*id)).await;
+        }
+        Ok(GcReport { removed_commits: removed, freed_snapshots: removed })
+    }
+
+    async fn evaluate_semantic_tags(
+        &self,
+        scope: &ContextUri,
+    ) -> Result<Vec<(TagName, CommitId)>> {
+        use cel_interpreter::{Context as CelCtx, Program};
+
+        let scope_key = Self::scope_key(scope);
+        // 拉取所有 Semantic tag（含 expr）
+        let tag_rows = sqlx::query(
+            r#"SELECT name, condition_expr FROM version_tags
+               WHERE scope = $1 AND tag_type = 'Semantic'
+                 AND condition_expr IS NOT NULL AND length(condition_expr) > 0"#,
+        )
+        .bind(&scope_key)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        if tag_rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 编译所有表达式（失败的跳过 —— 不阻塞其他）
+        let mut compiled: Vec<(TagName, Program)> = Vec::new();
+        for row in tag_rows {
+            let name: String = row.try_get("name").map_err(Self::storage_err)?;
+            let expr: String = row.try_get("condition_expr").map_err(Self::storage_err)?;
+            match Program::compile(&expr) {
+                Ok(prog) => compiled.push((TagName::new(name), prog)),
+                Err(e) => {
+                    tracing::warn!("evaluate_semantic_tags: skip tag {name} — invalid CEL: {e}");
+                }
+            }
+        }
+        if compiled.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 遍历该 scope 最近 500 个 commit，逐个求值
+        const MAX_COMMITS: i64 = 500;
+        let commit_rows = sqlx::query(
+            r#"SELECT id, message, timestamp, metadata_json
+               FROM version_commits WHERE scope = $1
+               ORDER BY timestamp DESC LIMIT $2"#,
+        )
+        .bind(&scope_key)
+        .bind(MAX_COMMITS)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+
+        let mut matched: Vec<(TagName, CommitId)> = Vec::new();
+        for row in commit_rows {
+            let id: Uuid = row.try_get("id").map_err(Self::storage_err)?;
+            let message: String = row.try_get("message").map_err(Self::storage_err)?;
+            let timestamp: DateTime<Utc> = row.try_get("timestamp").map_err(Self::storage_err)?;
+            let meta_val: serde_json::Value = row
+                .try_get::<serde_json::Value, _>("metadata_json")
+                .unwrap_or(serde_json::json!({}));
+            let parents = self.load_parents(&CommitId(id)).await?;
+            let parents_json: Vec<serde_json::Value> = parents
+                .iter()
+                .map(|p| serde_json::Value::String(p.0.to_string()))
+                .collect();
+            let commit_json = serde_json::json!({
+                "id": id.to_string(),
+                "message": message,
+                "timestamp": timestamp.timestamp(),
+                "parents": parents_json,
+                "metadata": meta_val,
+            });
+
+            for (tag_name, program) in &compiled {
+                let mut ctx = CelCtx::default();
+                if ctx.add_variable("commit", commit_json.clone()).is_err() {
+                    continue;
+                }
+                match program.execute(&ctx) {
+                    Ok(v) => {
+                        if matches!(v, cel_interpreter::Value::Bool(true)) {
+                            matched.push((tag_name.clone(), CommitId(id)));
+                        }
+                    }
+                    Err(_) => {
+                        // 求值失败（类型错误等）—— 静默跳过
+                    }
+                }
+            }
+        }
+        Ok(matched)
+    }
+
+    // ---- 因果分析 ------------------------------------------------------------
+
+    async fn provenance(&self, uri: &ContextUri) -> Result<ProvenanceGraph> {
+        // 语义：只返回**显式证据溯源** —— CommitMeta.provenance 中写入方主动声明的链接。
+        // 不沿 commit parent DAG 回溯（那是 CausalDag / impact_analysis / evolution 的职责）。
+        // 详见 VersionStore::provenance 的文档注释。
+        //
+        // 收集所有修改此 URI 的 commit，按时间倒序 —— 最新在前
+        let rows = sqlx::query(
+            r#"SELECT d.commit_id AS cid, c.metadata_json AS meta
+               FROM version_entry_deltas d
+               JOIN version_commits c ON c.id = d.commit_id
+               WHERE d.uri = $1
+               ORDER BY c.timestamp DESC"#,
+        )
+        .bind(uri.to_string())
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+
+        let mut nodes: Vec<agent_context_db_version::ProvenanceLink> = Vec::new();
+        for row in &rows {
+            let meta_val: serde_json::Value = row
+                .try_get::<serde_json::Value, _>("meta")
+                .unwrap_or(serde_json::json!({}));
+            if let Ok(meta) = serde_json::from_value::<CommitMeta>(meta_val) {
+                nodes.extend(meta.provenance);
+            }
+        }
+        Ok(ProvenanceGraph {
+            root_uri: uri.clone(),
+            nodes,
+            depth: rows.len(),
+        })
+    }
+
+    async fn impact_analysis(&self, commit: &CommitId) -> Result<ImpactAnalysis> {
+        // 找到 commit 修改的所有 URI，作为 downstream_uris
+        let rows = sqlx::query(
+            r#"SELECT DISTINCT uri FROM version_entry_deltas WHERE commit_id = $1"#,
+        )
+        .bind(commit.0)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        let downstream_uris: Vec<ContextUri> = rows
+            .into_iter()
+            .filter_map(|r| r.try_get::<String, _>("uri").ok())
+            .filter_map(|s| ContextUri::parse(s.as_str()).ok())
+            .collect();
+        // 找到含此 commit 的分支
+        let branch_rows = sqlx::query(
+            r#"SELECT name FROM version_branches WHERE head = $1"#,
+        )
+        .bind(commit.0)
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        let affected_branches = branch_rows
+            .into_iter()
+            .filter_map(|r| r.try_get::<String, _>("name").ok())
+            .map(BranchName::new)
+            .collect();
+        Ok(ImpactAnalysis {
+            commit: commit.clone(),
+            downstream_uris,
+            affected_branches,
+        })
+    }
+
+    // ---- 语义 diff -----------------------------------------------------------
+
+    async fn semantic_diff(
+        &self,
+        scope: &ContextUri,
+        a: &CommitId,
+        b: &CommitId,
+    ) -> Result<StructuredDiff> {
+        // 简化：把 TreeDiff 映射为 StructuredDiff（entity_changes 每个 URI 一条）
+        let tree = self.diff_commits(scope, a, b).await?;
+        use agent_context_db_version::{ChangeType, EntityChange};
+        let mut entity_changes = Vec::new();
+        for uri in tree.adds {
+            entity_changes.push(EntityChange {
+                entity_uri: uri,
+                field: "*".into(),
+                old_value: None,
+                new_value: Some(serde_json::json!({})),
+                change_type: ChangeType::Set,
+            });
+        }
+        for uri in tree.updates {
+            entity_changes.push(EntityChange {
+                entity_uri: uri,
+                field: "*".into(),
+                old_value: Some(serde_json::json!({})),
+                new_value: Some(serde_json::json!({})),
+                change_type: ChangeType::Set,
+            });
+        }
+        for uri in tree.deletes {
+            entity_changes.push(EntityChange {
+                entity_uri: uri,
+                field: "*".into(),
+                old_value: Some(serde_json::json!({})),
+                new_value: None,
+                change_type: ChangeType::Remove,
+            });
+        }
+        Ok(StructuredDiff {
+            entity_changes,
+            relation_changes: vec![],
+            fact_corrections: vec![],
+            confidence_delta: 0.0,
+            summary: String::new(),
+        })
+    }
+
+    // ---- 时态演化 ------------------------------------------------------------
+
+    async fn evolution(&self, uri: &ContextUri) -> Result<Vec<TemporalVersion>> {
+        let rows = sqlx::query(
+            r#"SELECT d.commit_id AS cid, c.timestamp AS ts
+               FROM version_entry_deltas d
+               JOIN version_commits c ON c.id = d.commit_id
+               WHERE d.uri = $1
+               ORDER BY c.timestamp ASC"#,
+        )
+        .bind(uri.to_string())
+        .fetch_all(self.pg())
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let cid: Uuid = r.try_get("cid").ok()?;
+                let ts: DateTime<Utc> = r.try_get("ts").ok()?;
+                Some(TemporalVersion {
+                    commit_id: CommitId(cid),
+                    timestamp: ts,
+                    content_hash: ContentHash(format!("hash-{cid}")),
+                    valid_from: ts,
+                    valid_until: None,
+                })
+            })
+            .collect())
+    }
+
+    // ---- 知识图谱合并（uwu-crdt LwwMap）------------------------------------
+
+    async fn knowledge_merge(
+        &self,
+        scope: &ContextUri,
+        from: &BranchName,
+        into: &BranchName,
+        strategy: KnowledgeMergeStrategy,
+    ) -> Result<MergeResult> {
+        use uwu_crdt::LwwMap;
+
+        let scope_key = Self::scope_key(scope);
+        let from_head = self
+            .get_branch(&scope_key, from)
+            .await?
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", from.as_str())))?
+            .head;
+        let into_head = self
+            .get_branch(&scope_key, into)
+            .await?
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", into.as_str())))?
+            .head;
+
+        // Fast-forward
+        if self.is_ancestor(&into_head, &from_head).await? {
+            let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+            self.update_branch_head(&mut tx, &scope_key, into, &from_head).await?;
+            tx.commit().await.map_err(Self::storage_err)?;
+            self.set_head(&scope_key, &from_head).await?;
+            return Ok(MergeResult { commit: from_head, conflicts: vec![] });
+        }
+
+        let from_snap = self.reconstruct_snapshot(&from_head).await?;
+        let into_snap = self.reconstruct_snapshot(&into_head).await?;
+        let from_clock = self.commit_timestamp(&from_head).await?
+            .map(|t| t.timestamp() as u64).unwrap_or(0);
+        let into_clock = self.commit_timestamp(&into_head).await?
+            .map(|t| t.timestamp() as u64).unwrap_or(0);
+
+        let mut from_map: LwwMap<String, String> = LwwMap::new();
+        for (k, v) in &from_snap {
+            from_map.set(k.clone(), v.clone(), from_clock, from.as_str());
+        }
+        let mut into_map: LwwMap<String, String> = LwwMap::new();
+        for (k, v) in &into_snap {
+            into_map.set(k.clone(), v.clone(), into_clock, into.as_str());
+        }
+        let merged = uwu_crdt::merge(&from_map, &into_map);
+
+        let conflicts: Vec<ContextUri> = match strategy {
+            KnowledgeMergeStrategy::ContradictionDetection { threshold } => {
+                let mut cs = Vec::new();
+                for (uri_str, fv) in &from_snap {
+                    if let Some(iv) = into_snap.get(uri_str) {
+                        if fv == iv {
+                            continue;
+                        }
+                        if jaccard(fv, iv) < threshold as f64 {
+                            if let Ok(u) = ContextUri::parse(uri_str.as_str()) {
+                                cs.push(u);
+                            }
+                        }
+                    }
+                }
+                cs
+            }
+            KnowledgeMergeStrategy::EntityAutoMerge
+            | KnowledgeMergeStrategy::GraphMerge { .. } => Vec::new(),
+        };
+
+        let merged_snap: HashMap<String, String> =
+            merged.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let deltas = Self::diff_snapshots(&into_snap, &merged_snap);
+
+        let new_id = CommitId::new();
+        let now = Utc::now();
+        let merge_commit = Commit {
+            id: new_id.clone(),
+            parents: vec![into_head.clone(), from_head.clone()],
+            tree_hash: ContentHash(format!("tree-{}", new_id.0)),
+            author: Author { agent_id: None, user_id: None, system: true },
+            message: format!(
+                "knowledge_merge {} <- {} conflicts={}",
+                into.as_str(),
+                from.as_str(),
+                conflicts.len()
+            ),
+            timestamp: now,
+            metadata: CommitMeta::default(),
+        };
+
+        let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+        self.insert_commit_row(&mut tx, &merge_commit, &scope_key).await?;
+        self.insert_deltas(&mut tx, &new_id, &deltas).await?;
+        self.update_branch_head(&mut tx, &scope_key, into, &new_id).await?;
+        tx.commit().await.map_err(Self::storage_err)?;
+        self.set_head(&scope_key, &new_id).await?;
+        Ok(MergeResult { commit: new_id, conflicts })
+    }
+}
+
+// ===========================================================================
+// 私有辅助（PgVersionStore 上不便加为 trait 方法的）
+// ===========================================================================
+
+impl PgVersionStore {
+    /// cherry_pick 的内部形态：直接指定 target commit，可选携带目标分支名（用于更新 HEAD）。
+    ///
+    /// 冲突检测：对被 pick 的每个 URI，若 target 当前值既不等于 base（parent），
+    /// 也不等于 commit 的新值，说明 target 独立修改过。此时根据 `strategy`：
+    /// - `Fail`：报 `MergeConflict` 停止（与 Git `cherry-pick` 默认一致）。
+    /// - `Ours`：保留 target 当前值（该 URI 的 delta 被丢弃）。
+    /// - `Theirs`：采用 cherry commit 的新值（覆盖 target 独立修改）。
+    async fn cherry_pick_at_branch(
+        &self,
+        scope: &ContextUri,
+        commit: &CommitId,
+        target: &CommitId,
+        onto_branch: Option<&BranchName>,
+        strategy: ConflictStrategy,
+    ) -> Result<CommitId> {
+        let scope_key = Self::scope_key(scope);
+        let parent = self.first_parent(commit).await?;
+        let base_snap = if let Some(p) = &parent {
+            self.reconstruct_snapshot(p).await?
+        } else {
+            HashMap::new()
+        };
+        let commit_snap = self.reconstruct_snapshot(commit).await?;
+        let cherry_deltas = Self::diff_snapshots(&base_snap, &commit_snap);
+
+        let mut target_snap = self.reconstruct_snapshot(target).await?;
+
+        // 冲突检测 + 策略分派
+        let mut conflicts: Vec<String> = Vec::new();
+        let mut skip_uris: HashSet<String> = HashSet::new(); // Ours 策略下跳过 apply 的 URI
+        for d in &cherry_deltas {
+            let target_val = target_snap.get(&d.uri).cloned();
+            let base_val = base_snap.get(&d.uri).cloned();
+            let commit_val = commit_snap.get(&d.uri).cloned();
+            // target 值与 base 相同 → 无独立修改，安全 apply
+            // target 值与 commit 目标值相同 → 已达目标，等价于 no-op
+            // 否则 target 已改过且方向不同 → 冲突，按策略处理
+            if target_val != base_val && target_val != commit_val {
+                match strategy {
+                    ConflictStrategy::Fail => conflicts.push(d.uri.clone()),
+                    ConflictStrategy::Ours => {
+                        skip_uris.insert(d.uri.clone());
+                    }
+                    ConflictStrategy::Theirs => { /* 落入下方 apply_deltas 覆盖 */ }
+                }
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(VersionError::MergeConflict(format!(
+                "cherry-pick {} onto {}: {} URI(s) conflicted: {}",
+                commit.0,
+                target.0,
+                conflicts.len(),
+                conflicts.join(", ")
+            )));
+        }
+
+        // 应用 delta（Ours 策略下过滤 skip_uris）
+        let effective_deltas: Vec<DeltaRow> = if skip_uris.is_empty() {
+            cherry_deltas
+        } else {
+            cherry_deltas.into_iter().filter(|d| !skip_uris.contains(&d.uri)).collect()
+        };
+        let target_before = target_snap.clone();
+        apply_deltas(&mut target_snap, &effective_deltas);
+        let final_deltas = Self::diff_snapshots(&target_before, &target_snap);
+
+        let new_id = CommitId::new();
+        let now = Utc::now();
+        let src_commit = self.load_commit(commit).await?;
+        let new_commit = Commit {
+            id: new_id.clone(),
+            parents: vec![target.clone()],
+            tree_hash: ContentHash(format!("tree-{}", new_id.0)),
+            author: src_commit
+                .as_ref()
+                .map(|c| c.author.clone())
+                .unwrap_or(Author { agent_id: None, user_id: None, system: true }),
+            message: format!(
+                "cherry-pick {} onto {}",
+                commit.0,
+                onto_branch.map(|b| b.as_str().to_string()).unwrap_or_else(|| target.0.to_string())
+            ),
+            timestamp: now,
+            metadata: CommitMeta::default(),
+        };
+        let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+        self.insert_commit_row(&mut tx, &new_commit, &scope_key).await?;
+        self.insert_deltas(&mut tx, &new_id, &final_deltas).await?;
+        if let Some(b) = onto_branch {
+            self.update_branch_head(&mut tx, &scope_key, b, &new_id).await?;
+        }
+        tx.commit().await.map_err(Self::storage_err)?;
+        Ok(new_id)
+    }
+}
+
+/// 从 JSON 字符串重建 ContentPayload；失败时退化为纯文本。
+fn payload_from_json(json: &str) -> ContentPayload {
+    serde_json::from_str::<ContentPayload>(json).unwrap_or(ContentPayload::Text {
+        sparse: json.to_string(),
+        dense: String::new(),
+        full: json.to_string(),
+    })
+}

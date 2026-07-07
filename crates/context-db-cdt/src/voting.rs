@@ -29,7 +29,12 @@ pub struct Vote {
 }
 
 /// 投票操作。
-pub enum VoteOp { Add(EvolvableInsight), Upvote(ContextUri, Vote), Downvote(ContextUri, Vote), Edit(ContextUri, String) }
+pub enum VoteOp {
+    Add(EvolvableInsight),
+    Upvote(ContextUri, Vote),
+    Downvote(ContextUri, Vote),
+    Edit(ContextUri, String),
+}
 
 impl EvolvableInsight {
     /// 加权净分 = Σ(upvote.weight) - Σ(downvote.weight)。
@@ -39,20 +44,33 @@ impl EvolvableInsight {
         self.votes.net_score = up - down;
     }
     /// 净分 ≤ 0 → 淘汰。
-    pub fn should_deprecate(&self) -> bool { self.votes.net_score <= 0.0 }
+    pub fn should_deprecate(&self) -> bool {
+        self.votes.net_score <= 0.0
+    }
 }
 
 /// 投票演化引擎。
 pub struct InsightEvolutionEngine;
 
 impl InsightEvolutionEngine {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
     pub fn vote(&self, insight: &mut EvolvableInsight, op: VoteOp) {
         match op {
             VoteOp::Add(i) => *insight = i,
-            VoteOp::Upvote(_, v) => { insight.votes.upvotes.push(v); insight.recompute_score(); }
-            VoteOp::Downvote(_, v) => { insight.votes.downvotes.push(v); insight.recompute_score(); }
-            VoteOp::Edit(_, new) => { insight.content = new; insight.last_updated = Utc::now(); }
+            VoteOp::Upvote(_, v) => {
+                insight.votes.upvotes.push(v);
+                insight.recompute_score();
+            }
+            VoteOp::Downvote(_, v) => {
+                insight.votes.downvotes.push(v);
+                insight.recompute_score();
+            }
+            VoteOp::Edit(_, new) => {
+                insight.content = new;
+                insight.last_updated = Utc::now();
+            }
         }
     }
     pub fn cleanup(insights: &mut Vec<EvolvableInsight>) -> usize {

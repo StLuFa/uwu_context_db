@@ -25,32 +25,35 @@ pub mod retriever;
 
 pub use associative::AssociativeExpander;
 pub use innovation::{IncrementalRetrievalLearner, PredictivePrefetcher, RelevanceFeedback};
-pub use intent::{LlmIntentAnalyzer, RuleBasedIntentAnalyzer};
+pub use intent::{
+    BuiltinIntentPolicyProvider, CompiledIntentPolicy, EventMeshIntentTraceSink,
+    FileIntentPolicyProvider, IntentCaller, IntentCandidate, IntentDecision, IntentExecutionGraph,
+    IntentExecutionPlan, IntentFeedbackEvent, IntentFeedbackLearning, IntentInput, IntentKind,
+    IntentPolicyLayer, IntentPolicyLayerKind, IntentPolicyPack, IntentPolicyProvider,
+    IntentPolicyRef, IntentPolicyReloadReport, IntentPolicyReloadStatus,
+    IntentPolicySignature, IntentPolicySignatureVerifier, IntentPolicySnapshot,
+    IntentRoute, IntentTraceEvent, IntentTraceSink, LayeredIntentPolicyProvider,
+    RuleBasedIntentAnalyzer, SignedIntentPolicyPack, TracingIntentTraceSink,
+};
 pub use operators::{ExecContext, ExecStats, RecordBatch};
 pub use perf::{
     BatchFsRequest, CacheTier, MaterializedView, ParallelGenerator, PartitionedRetriever,
     QueryCompiler, TieredVectorIndex, VectorQuantizer,
 };
-pub use planner::{CboOptimizer, LogicalPlan, PhysicalPlan, StatisticsCollector, VectorFilter};
+pub use planner::{
+    CboOptimizer, IntentPlannerHint, LogicalPlan, PhysicalPlan, StatisticsCollector, VectorFilter,
+};
 pub use quality::{CompressionAwareLoader, HallucinationDetector, PressureLevel, QualityReport};
 pub use query::{Condition, MergeStrategy, Predicate, Query, SortKey};
-pub use retriever::ContextRetriever;
+pub use retriever::{ContextRetriever, ContextRetrieverBuilder, RuleBasedPlanner};
 
-use agent_context_db_core::{ContentLevel, ContentPayload, ContentType, ContextUri, LlmClient, LlmOpts, Result};
+use agent_context_db_core::{ContentLevel, ContentPayload, ContentType, ContextUri, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // ===========================================================================
 // 检索器端口（分层 + 计划驱动）
 // ===========================================================================
-
-/// 分层检索器 trail（已废弃 — 使用 PlanRetriever）。
-#[deprecated(note = "使用 PlanRetriever + QueryPlanner 替代")]
-#[async_trait]
-pub trait HierarchicalRetriever: Send + Sync {
-    async fn retrieve(&self, query: &str, ctx: &RetrieveContext) -> Result<RetrievalResult>;
-}
 
 /// 计划驱动检索器 — 查询 DSL → CBO 优化 → 物理计划执行（推荐）。
 #[async_trait]
@@ -97,43 +100,30 @@ pub struct RetrievalTrace {
 
 #[derive(Debug, Clone)]
 pub enum TraceStep {
-    IntentAnalysis { raw: String, num_queries: usize },
-    PlanOptimized { logical: String, physical: String },
-    Execute { plan: String, hits: usize, duration_ms: u64 },
-    Rerank { input: usize, kept: usize, model: String },
-    Load { uri: ContextUri, level: ContentLevel, tokens: usize },
-}
-
-// ===========================================================================
-// 意图分析器（已废弃 — 使用 QueryPlanner）
-// ===========================================================================
-
-#[deprecated(note = "使用 QueryPlanner（plan/execute 模式）替代")]
-#[async_trait]
-pub trait IntentAnalyzer: Send + Sync {
-    async fn analyze(&self, query: &str, ctx: &RetrieveContext)
-        -> Result<Vec<TypedQuery>>;
-}
-
-#[deprecated(note = "使用 Query + LogicalPlan 替代")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypedQuery {
-    pub kind: QueryKind,
-    pub text: String,
-    pub target_dirs: Vec<ContextUri>,
-    pub expected_type: Option<ContentType>,
-}
-
-#[deprecated(note = "使用 Query + Predicate 替代")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QueryKind {
-    SemanticSearch,
-    EntityLookup,
-    EventRecall,
-    SkillReuse,
-    PatternMatch,
-    StateSnapshot,
-    PersonaRelation,
+    IntentAnalysis {
+        raw: String,
+        num_queries: usize,
+        decision: Option<IntentDecision>,
+    },
+    PlanOptimized {
+        logical: String,
+        physical: String,
+    },
+    Execute {
+        plan: String,
+        hits: usize,
+        duration_ms: u64,
+    },
+    Rerank {
+        input: usize,
+        kept: usize,
+        model: String,
+    },
+    Load {
+        uri: ContextUri,
+        level: ContentLevel,
+        tokens: usize,
+    },
 }
 
 // ===========================================================================
@@ -190,23 +180,29 @@ impl Reranker for LlmReranker {
                  - 0.0 = completely unrelated\n\
                  Respond with ONLY a number between 0.0 and 1.0."
             );
-            let score = match self.llm.complete(&prompt, &LlmOpts {
-                max_tokens: Some(10),
-                temperature: Some(0.0),
-                ..Default::default()
-            }).await {
+            let score = match self
+                .llm
+                .complete(
+                    &prompt,
+                    &LlmOpts {
+                        max_tokens: Some(10),
+                        temperature: Some(0.0),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 Ok(text) => text.trim().parse::<f32>().unwrap_or(hit.relevance),
                 Err(_) => hit.relevance,
             };
             rescored.push((hit, score));
         }
-        rescored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        rescored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         rescored.truncate(self.keep);
-        Ok(rescored.into_iter().map(|(h, s)| {
-            RetrievalHit { relevance: s, ..h }
-        }).collect())
+        Ok(rescored
+            .into_iter()
+            .map(|(h, s)| RetrievalHit { relevance: s, ..h })
+            .collect())
     }
 }
 

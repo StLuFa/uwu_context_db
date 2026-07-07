@@ -50,7 +50,10 @@ pub struct SemanticCrdtMerger {
 
 impl SemanticCrdtMerger {
     pub fn new(node_id: impl Into<String>) -> Self {
-        Self { node_id: node_id.into(), llm: None }
+        Self {
+            node_id: node_id.into(),
+            llm: None,
+        }
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
@@ -82,16 +85,15 @@ impl SemanticCrdtMerger {
         // 4. quality_score: 加权平均（按 clock）
         let total_clock = (local.clock + remote.clock) as f32;
         let quality_score = if total_clock > 0.0 {
-            (local.quality_score * local.clock as f32 + remote.quality_score * remote.clock as f32) / total_clock
+            (local.quality_score * local.clock as f32 + remote.quality_score * remote.clock as f32)
+                / total_clock
         } else {
             (local.quality_score + remote.quality_score) / 2.0
         };
 
         // 5. principle: 对比冲突
         let (principle, strategy, conflicts) = match (&local.principle, &remote.principle) {
-            (Some(lp), Some(rp)) if lp == rp => {
-                (lp.clone(), MergeStrategy::FastForward, 0)
-            }
+            (Some(lp), Some(rp)) if lp == rp => (lp.clone(), MergeStrategy::FastForward, 0),
             (Some(lp), Some(rp)) => {
                 // 冲突 → LLM 仲裁或取高 clock 的
                 if let Some(ref llm) = self.llm {
@@ -142,14 +144,27 @@ Agent B (clock={rb}): "{rp}"
 If they say the same thing differently → unify into a single clear statement.
 If they genuinely disagree → keep the one with higher clock ({winner}).
 Return ONLY the merged principle text, no JSON, no markup."#,
-            la = local.clock, lp = local_principle,
-            rb = remote.clock, rp = remote_principle,
-            winner = if local.clock >= remote.clock { "Agent A" } else { "Agent B" },
+            la = local.clock,
+            lp = local_principle,
+            rb = remote.clock,
+            rp = remote_principle,
+            winner = if local.clock >= remote.clock {
+                "Agent A"
+            } else {
+                "Agent B"
+            },
         );
 
-        llm.complete(&prompt, &LlmOpts { max_tokens: Some(256), temperature: Some(0.0), ..Default::default() })
-            .await
-            .ok()
-            .map(|s| s.trim().to_string())
+        llm.complete(
+            &prompt,
+            &LlmOpts {
+                max_tokens: Some(256),
+                temperature: Some(0.0),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
     }
 }

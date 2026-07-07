@@ -18,16 +18,20 @@ pub struct MemoryRateLimiter {
 
 impl MemoryRateLimiter {
     pub fn new(max_concurrency: usize) -> Self {
-        Self { semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))) }
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
+        }
     }
 }
 
 #[async_trait]
 impl RateLimiter for MemoryRateLimiter {
     async fn acquire(&self) -> Result<()> {
-        let _permit = self.semaphore.acquire().await.map_err(|e| {
-            crate::ContextError::Storage(format!("rate limiter closed: {e}"))
-        })?;
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| crate::ContextError::Storage(format!("rate limiter closed: {e}")))?;
         Ok(())
     }
 

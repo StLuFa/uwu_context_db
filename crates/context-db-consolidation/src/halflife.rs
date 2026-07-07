@@ -84,8 +84,7 @@ Return a JSON object with these fields:
 
     /// 启发性规则回退（不依赖 LLM）。
     fn heuristic_predict(content: &str) -> HalfLifePrediction {
-        let has_code = content.contains('(')
-            && content.contains(')')
+        let has_code = content.contains('(') && content.contains(')')
             || content.contains("::")
             || content.contains("fn ");
         let has_principle = content.contains("原则")
@@ -100,10 +99,7 @@ Return a JSON object with these fields:
                 "contains specific API/function references — likely version-dependent",
             )
         } else if has_principle {
-            (
-                365.0,
-                "contains general principles — slow to change",
-            )
+            (365.0, "contains general principles — slow to change")
         } else {
             (180.0, "mixed content — moderate decay")
         };
@@ -129,10 +125,7 @@ Return a JSON object with these fields:
 /// 检索命中且被采纳时，重置 stability 并延长有效期。
 ///
 /// SM-2 风格: stability_new = stability * (1 + reinforcements * 0.5)
-pub fn reinforce_on_adoption(
-    current_stability: f64,
-    reinforcements: u32,
-) -> (f64, u32) {
+pub fn reinforce_on_adoption(current_stability: f64, reinforcements: u32) -> (f64, u32) {
     let new_stability = current_stability * (1.0 + reinforcements as f64 * 0.5);
     (new_stability, reinforcements.saturating_add(1))
 }

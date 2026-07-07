@@ -1,0 +1,41 @@
+//! Privacy-preserving federated KnowledgeNetwork.
+
+pub mod access;
+pub mod aggregation;
+pub mod capability;
+pub mod corroboration;
+pub mod event_mesh_transport;
+pub mod fabric;
+pub mod governance;
+pub mod identity;
+pub mod intent;
+pub mod learning;
+pub mod nats;
+pub mod persistence;
+pub mod planner;
+pub mod privacy;
+pub mod semantic_graph;
+pub mod topology;
+pub mod transport;
+pub mod trust;
+pub mod types;
+
+pub use access::*;
+pub use aggregation::*;
+pub use capability::*;
+pub use corroboration::*;
+pub use event_mesh_transport::*;
+pub use fabric::*;
+pub use governance::*;
+pub use identity::*;
+pub use intent::*;
+pub use learning::*;
+pub use nats::*;
+pub use persistence::*;
+pub use planner::*;
+pub use privacy::*;
+pub use semantic_graph::*;
+pub use topology::*;
+pub use transport::*;
+pub use trust::*;
+pub use types::*;

@@ -37,9 +37,13 @@ impl ConsistencyLevel {
     pub fn for_content_type(ct: ContentType) -> Self {
         match ct {
             ContentType::Fact | ContentType::Error => ConsistencyLevel::Strong,
-            ContentType::Skill | ContentType::Procedure | ContentType::Heuristic => ConsistencyLevel::Eventual,
+            ContentType::Skill | ContentType::Procedure | ContentType::Heuristic => {
+                ConsistencyLevel::Eventual
+            }
             ContentType::Hypothesis => ConsistencyLevel::SessionBound,
-            ContentType::Preference | ContentType::Profile | ContentType::Goal => ConsistencyLevel::None,
+            ContentType::Preference | ContentType::Profile | ContentType::Goal => {
+                ConsistencyLevel::None
+            }
             ContentType::Belief => ConsistencyLevel::Eventual,
             _ => ConsistencyLevel::Eventual,
         }
@@ -73,12 +77,16 @@ impl CapPolicyEngine {
     /// 是否需要为这个条目牺牲可用性以保持一致性。
     /// （CAP 定理中的 CP 选择）
     pub fn should_sacrifice_availability(entry: &MarketEntry) -> bool {
-        matches!(ConsistencyLevel::for_content_type(entry.content_type), ConsistencyLevel::Strong)
+        matches!(
+            ConsistencyLevel::for_content_type(entry.content_type),
+            ConsistencyLevel::Strong
+        )
     }
 
     /// 批量选择：取最严格的一致性级别。
     pub fn strictest(entries: &[MarketEntry]) -> ConsistencyLevel {
-        entries.iter()
+        entries
+            .iter()
             .map(|e| ConsistencyLevel::for_content_type(e.content_type))
             .max_by_key(|l| match l {
                 ConsistencyLevel::Strong => 3,

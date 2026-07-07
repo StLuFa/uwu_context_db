@@ -16,7 +16,8 @@ pub enum ZeroCopyPayload<'a> {
 
 /// 零拷贝读取器 trait — 后端实现可返回借用或拥有数据。
 pub trait ZeroCopyReader: Send + Sync {
-    fn read_ref<'a>(&'a self, uri: &ContextUri, level: ContentLevel) -> Result<ZeroCopyPayload<'a>>;
+    fn read_ref<'a>(&'a self, uri: &ContextUri, level: ContentLevel)
+    -> Result<ZeroCopyPayload<'a>>;
 }
 
 /// 基于内存 ContextStore 的零拷贝适配。
@@ -37,18 +38,20 @@ impl ZeroCopyAdapter {
 }
 
 impl ZeroCopyReader for ZeroCopyAdapter {
-    fn read_ref<'a>(&'a self, uri: &ContextUri, level: ContentLevel) -> Result<ZeroCopyPayload<'a>> {
+    fn read_ref<'a>(
+        &'a self,
+        uri: &ContextUri,
+        level: ContentLevel,
+    ) -> Result<ZeroCopyPayload<'a>> {
         let guard = self.entries.lock();
         let entry = guard
             .get(&uri.to_string())
             .ok_or_else(|| crate::ContextError::NotFound(uri.to_string().clone()))?;
 
         match level {
-            ContentLevel::L0 => {
-                Ok(ZeroCopyPayload::Text(Cow::Owned(
-                    entry.payload.sparse_text().to_string(),
-                )))
-            }
+            ContentLevel::L0 => Ok(ZeroCopyPayload::Text(Cow::Owned(
+                entry.payload.sparse_text().to_string(),
+            ))),
             ContentLevel::L1 => {
                 let dense = match &entry.payload {
                     crate::ContentPayload::Text { dense, .. } => dense.as_str(),

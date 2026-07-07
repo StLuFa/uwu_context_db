@@ -42,7 +42,10 @@ pub struct SchemaRef {
 
 impl SchemaRef {
     pub fn json_schema(blob: BlobRef) -> Self {
-        Self { format: "json-schema".into(), blob: Some(blob) }
+        Self {
+            format: "json-schema".into(),
+            blob: Some(blob),
+        }
     }
 }
 
@@ -70,7 +73,9 @@ pub enum MediaType {
 // ===========================================================================
 
 /// 三层内容级别：L0 摘要 / L1 概览 / L2 原始详情。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub enum ContentLevel {
     #[default]
     L0,
@@ -103,9 +108,9 @@ pub enum ContentPayload {
     },
     /// 图像内容：缩略图 → 特征向量 → 原始像素
     Image {
-        thumbnail: Vec<u8>,  // L0 ~256x256 JPEG
-        features: Vec<f32>,  // L1 CLIP/DINO embedding
-        raw: BlobRef,        // L2 原始像素（存 BlobStore）
+        thumbnail: Vec<u8>, // L0 ~256x256 JPEG
+        features: Vec<f32>, // L1 CLIP/DINO embedding
+        raw: BlobRef,       // L2 原始像素（存 BlobStore）
     },
     /// 音频内容：转写 → 语音 embedding → 原始波形
     Audio {
@@ -115,11 +120,11 @@ pub enum ContentPayload {
     },
     /// 结构化内容：JSON 原生存储 + 可选 schema 引用
     Structured {
-        summary: String,           // L0 人类可读摘要
+        summary: String, // L0 人类可读摘要
         /// L1 可选 schema 描述（BlobRef 指向 JSON Schema / Avro / Protobuf 定义）。
         /// 用于校验 `data` 结构、驱动 UI 渲染。`None` 视为 schemaless。
         schema: Option<SchemaRef>,
-        data: serde_json::Value,   // L2 完整 JSON
+        data: serde_json::Value, // L2 完整 JSON
     },
     /// 多部分组合（如带图的文章）
     Composite {
@@ -153,7 +158,11 @@ impl ContentPayload {
     pub fn decode_within_budget(&self, budget: usize) -> DecodedContent {
         let estimate = |s: &str| s.len() / 4;
         match self {
-            ContentPayload::Text { sparse, dense, full } => {
+            ContentPayload::Text {
+                sparse,
+                dense,
+                full,
+            } => {
                 let l0 = sparse.clone();
                 let l1 = if budget >= estimate(dense) {
                     Some(dense.clone())

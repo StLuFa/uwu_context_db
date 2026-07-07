@@ -2,15 +2,11 @@
 //!
 //! 依赖 core 的 `LlmClient` 端口进行语义处理。
 
-use agent_context_db_core::{
-    ContextUri, LlmClient, LlmOpts, MemoryClass, Result,
-};
+use agent_context_db_core::{ContextUri, LlmClient, LlmOpts, MemoryClass, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::{
-    CandidateAction, DedupDecision, MemoryCandidate, MemoryExtractor,
-};
+use crate::{CandidateAction, DedupDecision, MemoryCandidate, MemoryExtractor};
 
 /// 基于 `LlmClient` 的记忆提取器实现。
 pub struct MemoryExtractorImpl {
@@ -46,14 +42,13 @@ Only include entries with confidence > 0.5.
             ..Default::default()
         };
 
-        let response = self.llm.complete(&prompt, &opts).await
-            .map_err(|e| agent_context_db_core::ContextError::Storage(
-                format!("llm extract: {e}")
-            ))?;
+        let response = self.llm.complete(&prompt, &opts).await.map_err(|e| {
+            agent_context_db_core::ContextError::Storage(format!("llm extract: {e}"))
+        })?;
 
         // 解析 JSON
-        let candidates: Vec<MemoryCandidate> = serde_json::from_str(&response)
-            .unwrap_or_else(|_| {
+        let candidates: Vec<MemoryCandidate> =
+            serde_json::from_str(&response).unwrap_or_else(|_| {
                 vec![MemoryCandidate {
                     class: MemoryClass::Cases,
                     content: response.chars().take(200).collect(),
@@ -97,10 +92,10 @@ Return a JSON array of objects with: "candidate_index", "action", "reason", "mer
             ..Default::default()
         };
 
-        let response = self.llm.complete(&prompt, &opts).await
-            .map_err(|e| agent_context_db_core::ContextError::Storage(
-                format!("llm dedup: {e}")
-            ))?;
+        let response =
+            self.llm.complete(&prompt, &opts).await.map_err(|e| {
+                agent_context_db_core::ContextError::Storage(format!("llm dedup: {e}"))
+            })?;
 
         // 解析或 fallback
         #[derive(serde::Deserialize)]

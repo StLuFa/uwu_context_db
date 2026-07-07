@@ -32,8 +32,13 @@ pub struct PgContextStore {
 impl PgContextStore {
     /// C.3: 构造时验证后端类型，避免运行时 expect panic。
     pub fn new(pool: Arc<DbPool>) -> Self {
-        let _ = pool.as_postgres().expect("PgContextStore requires postgres backend");
-        Self { pool, read_cache: None }
+        let _ = pool
+            .as_postgres()
+            .expect("PgContextStore requires postgres backend");
+        Self {
+            pool,
+            read_cache: None,
+        }
     }
 
     /// 注入读取缓存（使用 uwu_database::Cache 或任意 ReadCache 实现）。
@@ -43,7 +48,9 @@ impl PgContextStore {
     }
 
     fn pg_pool(&self) -> &sqlx::PgPool {
-        self.pool.as_postgres().expect("PgContextStore: backend validated at construction")
+        self.pool
+            .as_postgres()
+            .expect("PgContextStore: backend validated at construction")
     }
 
     /// I.3: 统一 map_err 辅助 —— 记录 tracing::error! 并返回 `ContextError::Storage`。
@@ -62,19 +69,17 @@ impl PgContextStore {
 /// 从 ContentPayload 提取各层文本（L0/L1/L2）。
 fn extract_payload_levels(payload: &ContentPayload) -> (String, Option<String>, String) {
     match payload {
-        ContentPayload::Text { sparse, dense, full } => {
-            (sparse.clone(), Some(dense.clone()), full.clone())
-        }
+        ContentPayload::Text {
+            sparse,
+            dense,
+            full,
+        } => (sparse.clone(), Some(dense.clone()), full.clone()),
         ContentPayload::Image { .. } => ("[image]".to_string(), None, String::new()),
-        ContentPayload::Audio { transcript, .. } => {
-            (transcript.clone(), None, transcript.clone())
-        }
+        ContentPayload::Audio { transcript, .. } => (transcript.clone(), None, transcript.clone()),
         ContentPayload::Structured { summary, data, .. } => {
             (summary.clone(), Some(data.to_string()), String::new())
         }
-        ContentPayload::Composite { summary, .. } => {
-            (summary.clone(), None, String::new())
-        }
+        ContentPayload::Composite { summary, .. } => (summary.clone(), None, String::new()),
     }
 }
 
@@ -95,11 +100,10 @@ fn payload_from_levels(l0: &str, l1: Option<&str>, _l2_ref: Option<Uuid>) -> Con
 impl ContentRepo for PgContextStore {
     #[tracing::instrument(skip(self, entry), fields(uri = %entry.uri))]
     async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
-        let mut tx = self.pg_pool().begin().await
-            .map_err(|e| {
-                tracing::error!(error = %e, "begin transaction failed");
-                ContextError::Storage(format!("begin transaction failed: {e}"))
-            })?;
+        let mut tx = self.pg_pool().begin().await.map_err(|e| {
+            tracing::error!(error = %e, "begin transaction failed");
+            ContextError::Storage(format!("begin transaction failed: {e}"))
+        })?;
         let uri_str = entry.uri.to_string();
         let tenant_str = entry.tenant.0.to_string();
         let (l0_text, l1_text, l2_text) = extract_payload_levels(&entry.payload);
@@ -111,18 +115,14 @@ impl ContentRepo for PgContextStore {
             MediaType::Video => "video",
             MediaType::Binary => "binary",
         };
-        let memory_class: Option<String> = entry.metadata.memory_class.map(|c| {
-            memory_class_name(c)
+        let memory_class: Option<String> =
+            entry.metadata.memory_class.map(|c| memory_class_name(c));
+        let state_scope: Option<String> = entry.metadata.state_scope.map(|s| match s {
+            StateScope::Short => "short".to_string(),
+            StateScope::Mid => "mid".to_string(),
+            StateScope::Long => "long".to_string(),
         });
-        let state_scope: Option<String> = entry.metadata.state_scope.map(|s| {
-            match s {
-                StateScope::Short => "short".to_string(),
-                StateScope::Mid => "mid".to_string(),
-                StateScope::Long => "long".to_string(),
-            }
-        });
-        let tags = serde_json::to_value(&entry.metadata.tags)
-            .unwrap_or(serde_json::json!([]));
+        let tags = serde_json::to_value(&entry.metadata.tags).unwrap_or(serde_json::json!([]));
         let custom = &entry.metadata.custom;
         let mvcc = entry.mvcc_version.0 as i64 + 1;
 
@@ -167,8 +167,7 @@ impl ContentRepo for PgContextStore {
         .map_err(|e| Self::storage_err("write", e))?;
 
         // Insert version record
-        let entry_json = serde_json::to_value(&entry)
-            .unwrap_or(serde_json::Value::Null);
+        let entry_json = serde_json::to_value(&entry).unwrap_or(serde_json::Value::Null);
         sqlx::query(
             r#"
             INSERT INTO context_versions
@@ -195,7 +194,8 @@ impl ContentRepo for PgContextStore {
         .await
         .map_err(|e| Self::storage_err("write version", e))?;
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| Self::storage_err("commit", e))?;
 
         Ok(MvccVersion(mvcc as u64))
@@ -203,7 +203,10 @@ impl ContentRepo for PgContextStore {
 
     #[tracing::instrument(skip(self), fields(uri = %uri))]
     async fn delete(&self, uri: &ContextUri) -> Result<()> {
-        let mut tx = self.pg_pool().begin().await
+        let mut tx = self
+            .pg_pool()
+            .begin()
+            .await
             .map_err(|e| Self::storage_err("begin transaction", e))?;
         let uri_str = uri.to_string();
         let affected = sqlx::query("DELETE FROM context_entries WHERE uri = $1")
@@ -222,26 +225,29 @@ impl ContentRepo for PgContextStore {
             .await
             .map_err(|e| Self::storage_err("delete versions", e))?;
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| Self::storage_err("commit", e))?;
         Ok(())
     }
 
     #[tracing::instrument(skip(self), fields(from = %from, to = %to))]
     async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
-        let mut tx = self.pg_pool().begin().await
+        let mut tx = self
+            .pg_pool()
+            .begin()
+            .await
             .map_err(|e| Self::storage_err("begin transaction", e))?;
         let from_str = from.to_string();
         let to_str = to.to_string();
 
-        let affected = sqlx::query(
-            "UPDATE context_entries SET uri = $1, updated_at = now() WHERE uri = $2",
-        )
-        .bind(&to_str)
-        .bind(&from_str)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Self::storage_err("rename", e))?;
+        let affected =
+            sqlx::query("UPDATE context_entries SET uri = $1, updated_at = now() WHERE uri = $2")
+                .bind(&to_str)
+                .bind(&from_str)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::storage_err("rename", e))?;
 
         if affected.rows_affected() == 0 {
             return Err(ContextError::NotFound(from_str));
@@ -255,7 +261,8 @@ impl ContentRepo for PgContextStore {
             .await
             .map_err(|e| Self::storage_err("rename versions", e))?;
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| Self::storage_err("commit", e))?;
         Ok(())
     }
@@ -263,8 +270,13 @@ impl ContentRepo for PgContextStore {
     /// D.1: 批量写入 — 单事务 UNNEST 批量插入。
     #[tracing::instrument(skip(self, entries), fields(count = entries.len()))]
     async fn batch_write(&self, entries: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
-        if entries.is_empty() { return Ok(vec![]); }
-        let mut tx = self.pg_pool().begin().await
+        if entries.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut tx = self
+            .pg_pool()
+            .begin()
+            .await
             .map_err(|e| Self::storage_err("batch begin", e))?;
 
         let mut versions = Vec::with_capacity(entries.len());
@@ -285,7 +297,9 @@ impl ContentRepo for PgContextStore {
             .map_err(|e| Self::storage_err("batch write entry", e))?;
             versions.push(MvccVersion(mvcc as u64));
         }
-        tx.commit().await.map_err(|e| Self::storage_err("batch commit", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| Self::storage_err("batch commit", e))?;
         Ok(versions)
     }
 }
@@ -300,13 +314,20 @@ pub struct PgStoreConfig {
 
 impl Default for PgStoreConfig {
     fn default() -> Self {
-        Self { max_connections: 10, min_connections: 1, statement_cache_capacity: 100 }
+        Self {
+            max_connections: 10,
+            min_connections: 1,
+            statement_cache_capacity: 100,
+        }
     }
 }
 
 impl PgStoreConfig {
     pub fn from_uwu_config(cfg: &agent_context_db_core::config::StorageConfig) -> Self {
-        Self { max_connections: cfg.max_connections as u32, ..Default::default() }
+        Self {
+            max_connections: cfg.max_connections as u32,
+            ..Default::default()
+        }
     }
 }
 
@@ -337,7 +358,9 @@ impl FsOps for PgContextStore {
         for (uri_str, abstract_, memory_class_str) in rows {
             let rest = uri_str.strip_prefix(&prefix).unwrap_or(&uri_str);
             #[allow(deprecated)]
-            let mc = memory_class_str.as_deref().and_then(|s| parse_memory_class(s));
+            let mc = memory_class_str
+                .as_deref()
+                .and_then(|s| parse_memory_class(s));
             let ct = mc.map(|m| m.to_content_type());
             let slash_pos = rest.find('/');
             if let Some(pos) = slash_pos {
@@ -345,23 +368,25 @@ impl FsOps for PgContextStore {
                 if !seen.contains_key(dir_name) {
                     let dir_uri = ContextUri::parse(format!("{}{}", prefix, dir_name))
                         .map_err(|e| ContextError::Storage(format!("bad uri: {e}")))?;
-                    seen.insert(dir_name.to_string(), DirEntry {
-                        uri: dir_uri,
-                        is_dir: true,
-                        abstract_: String::new(),
-                        content_type: ct,
-                    });
+                    seen.insert(
+                        dir_name.to_string(),
+                        DirEntry {
+                            uri: dir_uri,
+                            is_dir: true,
+                            abstract_: String::new(),
+                            content_type: ct,
+                        },
+                    );
                 }
             } else {
                 let context_uri = ContextUri::parse(uri_str.clone())
                     .map_err(|e| ContextError::Storage(format!("bad uri: {e}")))?;
-                seen.entry(rest.to_string())
-                    .or_insert(DirEntry {
-                        uri: context_uri,
-                        is_dir: false,
-                        abstract_,
-                        content_type: ct,
-                    });
+                seen.entry(rest.to_string()).or_insert(DirEntry {
+                    uri: context_uri,
+                    is_dir: false,
+                    abstract_,
+                    content_type: ct,
+                });
             }
         }
 
@@ -401,7 +426,10 @@ impl FsOps for PgContextStore {
             .map_err(|e| Self::storage_err("find", e))?
         };
 
-        Ok(results.into_iter().filter_map(|s: String| ContextUri::parse(s).ok()).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|s: String| ContextUri::parse(s).ok())
+            .collect())
     }
 
     async fn grep(&self, regex: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
@@ -451,13 +479,12 @@ impl FsOps for PgContextStore {
         let pg = self.pg_pool();
         let prefix = Self::dir_prefix(root);
 
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT uri FROM context_entries WHERE uri LIKE $1 ORDER BY uri",
-        )
-        .bind(format!("{}%", &prefix))
-        .fetch_all(pg)
-        .await
-        .map_err(|e| Self::storage_err("tree", e))?;
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT uri FROM context_entries WHERE uri LIKE $1 ORDER BY uri")
+                .bind(format!("{}%", &prefix))
+                .fetch_all(pg)
+                .await
+                .map_err(|e| Self::storage_err("tree", e))?;
 
         let root_node = TreeNode {
             uri: root.clone(),
@@ -535,7 +562,16 @@ impl FsOps for PgContextStore {
         if let Some(cache) = self.read_cache.as_ref() {
             if level != ContentLevel::L2 {
                 match &result {
-                    Ok(payload) => cache.put(uri, level, payload.clone(), std::time::Duration::from_secs(300)).await,
+                    Ok(payload) => {
+                        cache
+                            .put(
+                                uri,
+                                level,
+                                payload.clone(),
+                                std::time::Duration::from_secs(300),
+                            )
+                            .await
+                    }
                     Err(ContextError::NotFound(_)) => cache.put_negative(uri, level).await,
                     Err(_) => {} // 其他错误不缓存，避免污染
                 }
@@ -593,9 +629,8 @@ impl VersionOps for PgContextStore {
         .await
         .map_err(|e| Self::storage_err("rollback read", e))?;
 
-        let json = entry_json.ok_or_else(|| {
-            ContextError::VersionConflict(format!("no version {:?}", to))
-        })?;
+        let json = entry_json
+            .ok_or_else(|| ContextError::VersionConflict(format!("no version {:?}", to)))?;
 
         let mut entry: ContextEntry = serde_json::from_value(json)?;
 
@@ -606,12 +641,7 @@ impl VersionOps for PgContextStore {
         Ok(())
     }
 
-    async fn diff(
-        &self,
-        uri: &ContextUri,
-        a: MvccVersion,
-        b: MvccVersion,
-    ) -> Result<ContextDiff> {
+    async fn diff(&self, uri: &ContextUri, a: MvccVersion, b: MvccVersion) -> Result<ContextDiff> {
         let pg = self.pg_pool();
         let uri_str = uri.to_string();
 
@@ -636,7 +666,10 @@ impl VersionOps for PgContextStore {
 
         let summary = match (v_a, v_b) {
             (Some(a_str), Some(b_str)) => {
-                format!("{}: v{:?} → v{:?}\n---\n{}\n+++\n{}", uri_str, a.0, b.0, a_str, b_str)
+                format!(
+                    "{}: v{:?} → v{:?}\n---\n{}\n+++\n{}",
+                    uri_str, a.0, b.0, a_str, b_str
+                )
             }
             _ => format!("{}: one or both versions not found", uri_str),
         };
@@ -711,7 +744,11 @@ impl ContentStore for PgContextStore {
             let uri = ContextUri::parse(&uri_str)
                 .map_err(|e| ContextError::InvalidUri(format!("scan_by_prefix parse: {e}")))?;
             let payload = <Self as ContentStore>::read(self, &uri, ContentLevel::L0).await?;
-            entries.push(ContextEntry::new_text(uri, TenantId(uuid::Uuid::nil()), payload.sparse_text()));
+            entries.push(ContextEntry::new_text(
+                uri,
+                TenantId(uuid::Uuid::nil()),
+                payload.sparse_text(),
+            ));
         }
         Ok(entries)
     }
@@ -738,7 +775,10 @@ impl BrowsingOps for PgContextStore {
         .fetch_all(pg)
         .await
         .map_err(|e| Self::storage_err("find", e))?;
-        Ok(rows.into_iter().map(ContextUri::parse).collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok(rows
+            .into_iter()
+            .map(ContextUri::parse)
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     async fn grep(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<GrepHit>> {
@@ -748,7 +788,12 @@ impl BrowsingOps for PgContextStore {
 
 #[async_trait]
 impl GraphStore for PgContextStore {
-    async fn add_edge(&self, from: &ContextUri, to: &ContextUri, kind: GraphRelation) -> Result<()> {
+    async fn add_edge(
+        &self,
+        from: &ContextUri,
+        to: &ContextUri,
+        kind: GraphRelation,
+    ) -> Result<()> {
         let pg = self.pg_pool();
         sqlx::query(
             "INSERT INTO context_relations (from_uri, to_uri, relation_kind, created_at)
@@ -775,7 +820,11 @@ impl GraphStore for PgContextStore {
         Ok(())
     }
 
-    async fn neighbors(&self, uri: &ContextUri, kind: Option<GraphRelation>) -> Result<Vec<ContextUri>> {
+    async fn neighbors(
+        &self,
+        uri: &ContextUri,
+        kind: Option<GraphRelation>,
+    ) -> Result<Vec<ContextUri>> {
         let pg = self.pg_pool();
         let uri_str = uri.to_string();
         let rows: Vec<String> = if let Some(k) = kind {
@@ -802,7 +851,10 @@ impl GraphStore for PgContextStore {
             .await
             .map_err(|e| Self::storage_err("neighbors", e))?
         };
-        Ok(rows.into_iter().map(ContextUri::parse).collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok(rows
+            .into_iter()
+            .map(ContextUri::parse)
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     async fn batch_traverse(
@@ -874,26 +926,26 @@ impl BlobStore for PgContextStore {
 
     async fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {
         let pg = self.pg_pool();
-        let data: Vec<u8> = sqlx::query_scalar(
-            "SELECT data FROM context_blobs WHERE content_hash = $1",
-        )
-        .bind(&blob_ref.hash.0)
-        .fetch_optional(pg)
-        .await
-        .map_err(|e| Self::storage_err("blob get", e))?
-        .ok_or_else(|| ContextError::NotFound(format!("blob not found: {}", blob_ref.hash.0)))?;
+        let data: Vec<u8> =
+            sqlx::query_scalar("SELECT data FROM context_blobs WHERE content_hash = $1")
+                .bind(&blob_ref.hash.0)
+                .fetch_optional(pg)
+                .await
+                .map_err(|e| Self::storage_err("blob get", e))?
+                .ok_or_else(|| {
+                    ContextError::NotFound(format!("blob not found: {}", blob_ref.hash.0))
+                })?;
         Ok(data)
     }
 
     async fn dedup_check(&self, hash: &ContentHash) -> Result<bool> {
         let pg = self.pg_pool();
-        let exists: Option<String> = sqlx::query_scalar(
-            "SELECT content_hash FROM context_blobs WHERE content_hash = $1",
-        )
-        .bind(&hash.0)
-        .fetch_optional(pg)
-        .await
-        .map_err(|e| Self::storage_err("dedup_check", e))?;
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT content_hash FROM context_blobs WHERE content_hash = $1")
+                .bind(&hash.0)
+                .fetch_optional(pg)
+                .await
+                .map_err(|e| Self::storage_err("dedup_check", e))?;
         Ok(exists.is_some())
     }
 }
@@ -913,7 +965,9 @@ impl PgEngine {
     }
 
     pub fn from_pool(pool: Arc<DbPool>) -> Self {
-        Self { store: Arc::new(PgContextStore::new(pool)) }
+        Self {
+            store: Arc::new(PgContextStore::new(pool)),
+        }
     }
 }
 
@@ -1025,7 +1079,8 @@ fn build_tree_level(
     for (_name, (child_uri, is_dir)) in seen {
         if is_dir {
             let child_prefix = format!("{}{}/", prefix, _name);
-            let sub_children = build_tree_level(&child_prefix, all_uris, current_depth + 1, max_depth);
+            let sub_children =
+                build_tree_level(&child_prefix, all_uris, current_depth + 1, max_depth);
             children.push(TreeNode {
                 uri: child_uri,
                 is_dir: true,
@@ -1079,12 +1134,12 @@ mod pg_tests {
     use super::*;
     use agent_context_db_core::{ContentRef, ContextMeta, ContextStore, StateScope};
     use std::sync::Arc;
+    use uuid::Uuid;
     use uwu_database::config::{
         CacheBackend, CacheConfig, DbConfig, DeployConfig, RuntimeConfig, SqlBackend,
         VectorBackend, VectorConfig,
     };
     use uwu_database::sql;
-    use uuid::Uuid;
 
     fn pg_url() -> Option<String> {
         std::env::var("DATABASE_URL").ok()
@@ -1109,8 +1164,16 @@ mod pg_tests {
                 statement_cache_capacity: 100,
                 application_name: Some("ctx_db_test".into()),
             },
-            cache: CacheConfig { backend: CacheBackend::None, capacity: 0, url: None },
-            vector: VectorConfig { backend: VectorBackend::Memory, url: None, api_key: None },
+            cache: CacheConfig {
+                backend: CacheBackend::None,
+                capacity: 0,
+                url: None,
+            },
+            vector: VectorConfig {
+                backend: VectorBackend::Memory,
+                url: None,
+                api_key: None,
+            },
         }
     }
 
@@ -1122,8 +1185,9 @@ mod pg_tests {
 
         // 运行 context-db 迁移（手动创建表结构以确保存在）
         arc_pool.as_postgres().unwrap();
-        arc_pool.exec(&format!(
-            "CREATE TABLE IF NOT EXISTS context_entries (\
+        arc_pool
+            .exec(&format!(
+                "CREATE TABLE IF NOT EXISTS context_entries (\
                 uri             TEXT PRIMARY KEY,\
                 tenant_id       UUID NOT NULL,\
                 l0_abstract     TEXT NOT NULL,\
@@ -1138,9 +1202,12 @@ mod pg_tests {
                 created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),\
                 updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()\
             )"
-        )).await.unwrap();
-        arc_pool.exec(&format!(
-            "CREATE TABLE IF NOT EXISTS context_versions (\
+            ))
+            .await
+            .unwrap();
+        arc_pool
+            .exec(&format!(
+                "CREATE TABLE IF NOT EXISTS context_versions (\
                 uri             TEXT NOT NULL,\
                 mvcc_version    BIGINT NOT NULL,\
                 tenant_id       UUID NOT NULL,\
@@ -1156,7 +1223,9 @@ mod pg_tests {
                 created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),\
                 PRIMARY KEY (uri, mvcc_version)\
             )"
-        )).await.unwrap();
+            ))
+            .await
+            .unwrap();
 
         PgContextStore::new(arc_pool)
     }
@@ -1185,7 +1254,9 @@ mod pg_tests {
         let v = ContentRepo::write(&store, e).await.unwrap();
         assert_eq!(v.0, 1);
 
-        let payload = ContentStore::read(&store, &uri, ContentLevel::L0).await.unwrap();
+        let payload = ContentStore::read(&store, &uri, ContentLevel::L0)
+            .await
+            .unwrap();
         assert!(matches!(&payload, ContentPayload::Text { sparse, .. } if sparse == "hello world"));
     }
 
@@ -1195,11 +1266,17 @@ mod pg_tests {
         let t = tenant();
         let uri = ctx_uri("mem/skills/s1");
 
-        ContentRepo::write(&store, entry(&uri, t, "v1")).await.unwrap();
-        let v2 = ContentRepo::write(&store, entry(&uri, t, "v2 updated")).await.unwrap();
+        ContentRepo::write(&store, entry(&uri, t, "v1"))
+            .await
+            .unwrap();
+        let v2 = ContentRepo::write(&store, entry(&uri, t, "v2 updated"))
+            .await
+            .unwrap();
 
         assert_eq!(v2.0, 2, "version should increment on update");
-        let payload = ContentStore::read(&store, &uri, ContentLevel::L0).await.unwrap();
+        let payload = ContentStore::read(&store, &uri, ContentLevel::L0)
+            .await
+            .unwrap();
         assert!(matches!(&payload, ContentPayload::Text { sparse, .. } if sparse == "v2 updated"));
     }
 
@@ -1237,12 +1314,12 @@ mod pg_tests {
         // 通过数据库直接验证
         let pool = store.pg_pool();
         let row: (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT l0_abstract, memory_class, state_scope FROM context_entries WHERE uri = $1"
+            "SELECT l0_abstract, memory_class, state_scope FROM context_entries WHERE uri = $1",
         )
-            .bind(&uri.to_string())
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        .bind(&uri.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
         assert_eq!(row.0, "L0 summary");
         assert_eq!(row.1, Some("cases".into()));
         assert_eq!(row.2, Some("long".into()));
@@ -1256,7 +1333,9 @@ mod pg_tests {
         let t = tenant();
         let uri = ctx_uri("tmp/to_delete");
 
-        ContentRepo::write(&store, entry(&uri, t, "bye")).await.unwrap();
+        ContentRepo::write(&store, entry(&uri, t, "bye"))
+            .await
+            .unwrap();
         ContentRepo::delete(&store, &uri).await.unwrap();
 
         let r = FsOps::read(&store, &uri, ContentLevel::L0).await;
@@ -1280,21 +1359,35 @@ mod pg_tests {
         let from = ctx_uri("old/name");
         let to = ctx_uri("new/name");
 
-        agent_context_db_core::ContentRepo::write(&store, entry(&from, t, "move me")).await.unwrap();
-        agent_context_db_core::ContentRepo::rename(&store, &from, &to).await.unwrap();
+        agent_context_db_core::ContentRepo::write(&store, entry(&from, t, "move me"))
+            .await
+            .unwrap();
+        agent_context_db_core::ContentRepo::rename(&store, &from, &to)
+            .await
+            .unwrap();
 
         // 旧路径不可读
-        assert!(agent_context_db_core::ContentStore::read(&store, &from, ContentLevel::L0).await.is_err());
+        assert!(
+            agent_context_db_core::ContentStore::read(&store, &from, ContentLevel::L0)
+                .await
+                .is_err()
+        );
         // 新路径可读
-        let p = agent_context_db_core::ContentStore::read(&store, &to, ContentLevel::L0).await.unwrap();
+        let p = agent_context_db_core::ContentStore::read(&store, &to, ContentLevel::L0)
+            .await
+            .unwrap();
         assert!(matches!(p, ContentPayload::Text { sparse, .. } if sparse == "move me"));
     }
 
     #[tokio::test]
     async fn test_rename_nonexistent_returns_not_found() {
         let store = setup_store().await;
-        let r = agent_context_db_core::ContentRepo::rename(&store, &ctx_uri("ghost/src"), &ctx_uri("ghost/dst")).await;
+        let r = agent_context_db_core::ContentRepo::rename(
+            &store,
+            &ctx_uri("ghost/src"),
+            &ctx_uri("ghost/dst"),
+        )
+        .await;
         assert!(r.is_err());
     }
-
 }

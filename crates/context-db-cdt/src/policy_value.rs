@@ -32,9 +32,18 @@ impl CognitiveValue {
     pub fn compute(state: &CognitiveState) -> Self {
         let consistency = state.graph_density;
         let confidence = state.avg_confidence;
-        let coverage = if state.active_hypotheses.is_empty() { 1.0 } else { 0.5 };
+        let coverage = if state.active_hypotheses.is_empty() {
+            1.0
+        } else {
+            0.5
+        };
         let composite = consistency * 0.4 + confidence * 0.35 + coverage * 0.25;
-        Self { knowledge_consistency: consistency, epistemic_confidence: confidence, evidence_coverage: coverage, composite }
+        Self {
+            knowledge_consistency: consistency,
+            epistemic_confidence: confidence,
+            evidence_coverage: coverage,
+            composite,
+        }
     }
 }
 
@@ -42,17 +51,31 @@ impl CognitiveValue {
 pub struct PolicyModule;
 
 impl PolicyModule {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
     pub fn generate(&self, state: &CognitiveState) -> Vec<ActionCandidate> {
         // 基于认知状态生成改进候选
         let mut candidates = Vec::new();
         if !state.recent_errors.is_empty() {
-            candidates.push(ActionCandidate { description: "analyze and fix recent errors".into(), confidence: 0.7, expected_effects: vec!["reduce errors".into()] });
+            candidates.push(ActionCandidate {
+                description: "analyze and fix recent errors".into(),
+                confidence: 0.7,
+                expected_effects: vec!["reduce errors".into()],
+            });
         }
         if !state.active_hypotheses.is_empty() {
-            candidates.push(ActionCandidate { description: "validate active hypotheses".into(), confidence: 0.6, expected_effects: vec!["confirm or falsify".into()] });
+            candidates.push(ActionCandidate {
+                description: "validate active hypotheses".into(),
+                confidence: 0.6,
+                expected_effects: vec!["confirm or falsify".into()],
+            });
         }
-        candidates.push(ActionCandidate { description: "consolidate high-confidence knowledge".into(), confidence: 0.5, expected_effects: vec!["improve coherence".into()] });
+        candidates.push(ActionCandidate {
+            description: "consolidate high-confidence knowledge".into(),
+            confidence: 0.5,
+            expected_effects: vec!["improve coherence".into()],
+        });
         candidates
     }
 }
@@ -61,7 +84,9 @@ impl PolicyModule {
 pub struct ValueModule;
 
 impl ValueModule {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
     pub fn evaluate(&self, state: &CognitiveState) -> CognitiveValue {
         CognitiveValue::compute(state)
     }

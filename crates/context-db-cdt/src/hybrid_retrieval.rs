@@ -12,7 +12,13 @@ pub struct RetrievalWeights {
 }
 
 impl Default for RetrievalWeights {
-    fn default() -> Self { Self { relevance: 0.4, recency: 0.3, confidence: 0.3 } }
+    fn default() -> Self {
+        Self {
+            relevance: 0.4,
+            recency: 0.3,
+            confidence: 0.3,
+        }
+    }
 }
 
 /// 三维混合评分器。
@@ -21,8 +27,12 @@ pub struct HybridRetriever {
 }
 
 impl HybridRetriever {
-    pub fn new(weights: RetrievalWeights) -> Self { Self { weights } }
-    pub fn with_default() -> Self { Self::new(RetrievalWeights::default()) }
+    pub fn new(weights: RetrievalWeights) -> Self {
+        Self { weights }
+    }
+    pub fn with_default() -> Self {
+        Self::new(RetrievalWeights::default())
+    }
 
     /// 三维加权评分 — Relevance + Recency + EpistemicConfidence。
     pub fn score(

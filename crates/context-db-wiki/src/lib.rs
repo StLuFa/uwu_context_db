@@ -16,11 +16,11 @@ use agent_context_db_core::ContextUri;
 use agent_context_db_storage::{IndexPoint, VectorIndex};
 use async_trait::async_trait;
 use std::sync::Arc;
+use wiki_core::Result;
 use wiki_core::storage::{
     BlobStore, DocStore, DocVersionStore, LinkStore, OpLog, TextIndex, VectorSearchResult,
     VectorStore, WikiStorage,
 };
-use wiki_core::Result;
 
 // ===========================================================================
 // 关键桥接：wiki VectorStore → context-db VectorIndex
@@ -40,9 +40,9 @@ impl WikiVectorStoreAdapter {
 
     /// wiki id → ContextUri（要求 id 是有效的 uwu:// URI；否则报错）。
     fn parse_id(id: &str) -> Result<ContextUri> {
-        ContextUri::parse(id).map_err(|e| wiki_core::WikiError::Storage(
-            format!("wiki id is not a valid uwu URI: {id} — {e}")
-        ))
+        ContextUri::parse(id).map_err(|e| {
+            wiki_core::WikiError::Storage(format!("wiki id is not a valid uwu URI: {id} — {e}"))
+        })
     }
 }
 
@@ -214,7 +214,12 @@ mod tests {
         let adapter = WikiVectorStoreAdapter::new(index);
 
         adapter
-            .upsert("wiki_blocks", "uwu://wiki/b1", vec![1.0, 0.0], serde_json::json!({"doc": "d1"}))
+            .upsert(
+                "wiki_blocks",
+                "uwu://wiki/b1",
+                vec![1.0, 0.0],
+                serde_json::json!({"doc": "d1"}),
+            )
             .await
             .unwrap();
         let hits = adapter
@@ -224,11 +229,16 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "uwu://wiki/b1");
 
-        adapter.delete("wiki_blocks", "uwu://wiki/b1").await.unwrap();
-        assert!(adapter
-            .search("wiki_blocks", vec![1.0, 0.0], 5, None)
+        adapter
+            .delete("wiki_blocks", "uwu://wiki/b1")
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert!(
+            adapter
+                .search("wiki_blocks", vec![1.0, 0.0], 5, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

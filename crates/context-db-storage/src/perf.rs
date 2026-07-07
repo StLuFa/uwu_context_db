@@ -13,7 +13,12 @@ use std::sync::Arc;
 pub struct BatchWriteBuffer {
     inner: Arc<dyn ContentRepo>,
     /// 待提交的写操作
-    pending: Mutex<Vec<(ContextEntry, tokio::sync::oneshot::Sender<Result<MvccVersion>>)>>,
+    pending: Mutex<
+        Vec<(
+            ContextEntry,
+            tokio::sync::oneshot::Sender<Result<MvccVersion>>,
+        )>,
+    >,
     /// 批量大小阈值
     batch_size: usize,
     /// 刷新间隔
@@ -63,14 +68,19 @@ impl BatchWriteBuffer {
             guard.push((entry, tx));
             guard.len() >= self.batch_size
         };
-        if should_flush { self.flush().await; }
-        rx.await.map_err(|_| ContextError::Storage("batch write cancelled".into()))?
+        if should_flush {
+            self.flush().await;
+        }
+        rx.await
+            .map_err(|_| ContextError::Storage("batch write cancelled".into()))?
     }
 
     async fn flush(&self) {
         let batch: Vec<_> = {
             let mut guard = self.pending.lock();
-            if guard.is_empty() { return; }
+            if guard.is_empty() {
+                return;
+            }
             std::mem::take(&mut *guard)
         };
         // 批量写入
@@ -98,14 +108,19 @@ pub struct WriteAheadLogger {
 
 impl WriteAheadLogger {
     pub fn new() -> Self {
-        Self { entries: Mutex::new(Vec::new()), seq: std::sync::atomic::AtomicU64::new(1) }
+        Self {
+            entries: Mutex::new(Vec::new()),
+            seq: std::sync::atomic::AtomicU64::new(1),
+        }
     }
 
     pub fn log(&self, uri: &str, entry: &ContextEntry) -> u64 {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(json) = serde_json::to_string(entry) {
             self.entries.lock().push(WalEntry {
-                sequence: seq, uri: uri.to_string(), entry_json: json,
+                sequence: seq,
+                uri: uri.to_string(),
+                entry_json: json,
                 timestamp: chrono::Utc::now(),
             });
         }
@@ -168,7 +183,11 @@ pub struct DedupStats {
 impl DedupStore {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(DedupInner { blobs: HashMap::new(), index: HashMap::new(), stats: DedupStats::default() }),
+            inner: Mutex::new(DedupInner {
+                blobs: HashMap::new(),
+                index: HashMap::new(),
+                stats: DedupStats::default(),
+            }),
             persistence: None,
         }
     }
@@ -180,8 +199,12 @@ impl DedupStore {
         self
     }
 
-    fn blob_key(hash: &str) -> String { format!("dedup:blob:{hash}") }
-    fn idx_key(uri: &str) -> String { format!("dedup:idx:{uri}") }
+    fn blob_key(hash: &str) -> String {
+        format!("dedup:blob:{hash}")
+    }
+    fn idx_key(uri: &str) -> String {
+        format!("dedup:idx:{uri}")
+    }
 
     /// 存储内容（自动去重+压缩）。若挂载了持久化后端，则 write-through 到后端（best-effort）。
     pub fn store(&self, uri: &str, data: &[u8]) -> String {
@@ -217,7 +240,9 @@ impl DedupStore {
                     if let Some(bytes) = compressed {
                         let _ = cache.set(&Self::blob_key(&hash_c), &bytes, None).await;
                     }
-                    let _ = cache.set(&Self::idx_key(&uri_c), hash_c.as_bytes(), None).await;
+                    let _ = cache
+                        .set(&Self::idx_key(&uri_c), hash_c.as_bytes(), None)
+                        .await;
                 });
             }
         }
@@ -240,13 +265,12 @@ impl DedupStore {
         let uri_owned = uri.to_string();
         // 若无 tokio 运行时则放弃（保持同步 API）
         let rt = tokio::runtime::Handle::try_current().ok()?;
-        let (hash, compressed) = rt
-            .block_on(async move {
-                let hash_bytes = cache.get(&Self::idx_key(&uri_owned)).await.ok()??;
-                let hash = String::from_utf8(hash_bytes).ok()?;
-                let compressed = cache.get(&Self::blob_key(&hash)).await.ok()??;
-                Some((hash, compressed))
-            })?;
+        let (hash, compressed) = rt.block_on(async move {
+            let hash_bytes = cache.get(&Self::idx_key(&uri_owned)).await.ok()??;
+            let hash = String::from_utf8(hash_bytes).ok()?;
+            let compressed = cache.get(&Self::blob_key(&hash)).await.ok()??;
+            Some((hash, compressed))
+        })?;
         let data = decompress(&compressed)?;
         // 回填内存
         let mut inner = self.inner.lock();
@@ -255,7 +279,9 @@ impl DedupStore {
         Some(data)
     }
 
-    pub fn stats(&self) -> DedupStats { self.inner.lock().stats.clone() }
+    pub fn stats(&self) -> DedupStats {
+        self.inner.lock().stats.clone()
+    }
 }
 
 #[cfg(test)]
@@ -292,7 +318,9 @@ mod tests {
         let wal = WriteAheadLogger::new();
         let uri = agent_context_db_core::ContextUri::parse("uwu://t/x").unwrap();
         let entry = agent_context_db_core::ContextEntry::new_text(
-            uri, agent_context_db_core::TenantId(uuid::Uuid::nil()), "test",
+            uri,
+            agent_context_db_core::TenantId(uuid::Uuid::nil()),
+            "test",
         );
         wal.log("uwu://t/x", &entry);
         assert_eq!(wal.drain().len(), 1);

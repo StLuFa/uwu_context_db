@@ -40,42 +40,43 @@ pub use event::{
     ContextTemplate, InheritanceChain, InheritanceNode, OverrideAction, OverrideRule,
     TemplateEngine, TemplateEntry,
 };
-pub use event_store::{
-    Bridge, CorrelationId, Envelope, EventKind, EventMesh, EventMeshBuilder, EventSet,
-    EventStore, EventTypeId, FlowChannel, FlowHandle, FlowReceiver, JsonlStore,
-    JsonlStoreOptions, MemoryStore, ReplayFilter, ReplayId, SegmentedStore,
-    SegmentedStoreOptions, SerializedEnvelope, Subscription, Topic, TopicPattern,
-    TypeRegistry, TypedSubscription,
-};
 pub use event_store::EventMetadata;
+pub use event_store::{
+    Bridge, CorrelationId, Envelope, EventKind, EventMesh, EventMeshBuilder, EventSet, EventStore,
+    EventTypeId, FlowChannel, FlowHandle, FlowReceiver, JsonlStore, JsonlStoreOptions, MemoryStore,
+    ReplayFilter, ReplayId, SegmentedStore, SegmentedStoreOptions, SerializedEnvelope,
+    Subscription, Topic, TopicPattern, TypeRegistry, TypedSubscription,
+};
 pub use lifecycle::{
-    AccessEvent, AccessOutcome, DegradeAction, EbbinghausModel, ForgettingCurve,
-    ForgettingModel, ImportanceScore, ImportanceWeights, LifecycleAction, LifecycleEngine,
-    LifecyclePolicy, LifecycleRule, TokenBudget,
+    AccessEvent, AccessOutcome, DegradeAction, EbbinghausModel, ForgettingCurve, ForgettingModel,
+    ImportanceScore, ImportanceWeights, LifecycleAction, LifecycleEngine, LifecyclePolicy,
+    LifecycleRule, TokenBudget,
 };
-pub use lsh::LshIndex;
-pub use rate_limiter::{MemoryRateLimiter, RateLimiter};
-pub use read_cache::{MemoryReadCache, ReadCache};
 pub use llm::{JsonSchema, LlmClient, LlmError, LlmOpts, LlmStream};
-pub use observability::{
-    ProvenanceEdge, ProvenanceGraph, ProvenanceNode, ProvenanceRelationType,
-    QualityDimension, QualityScore, QualityScorer,
-};
-pub use pack::{AclRule, ContextPack, PackMeta, PathAcl, Permissions, Principal};
-#[allow(deprecated)]
-pub use similarity::{Cluster, CrossAgentDedup, DedupRecommendation, KnowledgeNetwork, LocalKnowledgeNetwork, SimilarityResult, VectorSimilarity};
+pub use lsh::LshIndex;
 pub use model::{
     BlobRef, ConsolidationMeta, ConsolidationStatus, ContentHash, ContentLevel, ContentPart,
     ContentPayload, ContentType, ContextDiff, ContextEntry, ContextMeta, DecodedContent,
-    DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit,
-    LineageEntry, MediaType, MvccVersion, StateScope, TenantId, TreeNode, ValidityRecord,
-    VersionEntry,
+    DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit, LineageEntry,
+    MediaType, MvccVersion, StateScope, TenantId, TreeNode, ValidityRecord, VersionEntry,
 };
 #[allow(deprecated)]
 pub use model::{ContentRef, MemoryClass};
+pub use observability::{
+    ProvenanceEdge, ProvenanceGraph, ProvenanceNode, ProvenanceRelationType, QualityDimension,
+    QualityScore, QualityScorer,
+};
+pub use pack::{AclRule, ContextPack, PackMeta, PathAcl, Permissions, Principal};
+pub use rate_limiter::{MemoryRateLimiter, RateLimiter};
+pub use read_cache::{MemoryReadCache, ReadCache};
+#[allow(deprecated)]
+pub use similarity::{
+    Cluster, CrossAgentDedup, DedupRecommendation, KnowledgeNetwork, LocalKnowledgeNetwork,
+    SimilarityResult, VectorSimilarity,
+};
 pub use store::{
     BlobStore, BrowsingOps, ContentRepo, ContentStore, ContextStore, FsOps, GraphRelation,
     GraphStore, StorageEngine, TenantOps, VersionOps,
 };
-pub use uri::{ContextUri, UriCategory, SCHEME};
+pub use uri::{ContextUri, SCHEME, UriCategory};
 pub use vector::{IndexHit, IndexPoint, VectorIndex};

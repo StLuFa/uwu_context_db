@@ -28,9 +28,10 @@ pub mod security;
 pub mod semantic_axis;
 pub mod tiered_cache;
 
+use crate::quality::{HorizonAwareQualityScorer, HorizonQualitySignals, QualityRoute};
 use agent_context_db_core::{
-    ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType,
-    LineageEntry, LlmClient, LlmError, LlmOpts, MvccVersion, Result, ValidityRecord,
+    ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType, LineageEntry,
+    LlmClient, LlmError, LlmOpts, MvccVersion, Result, StateScope, ValidityRecord,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -101,7 +102,9 @@ pub struct MemoryResolver {
 
 impl MemoryResolver {
     pub fn new() -> Self {
-        Self { domain_saturation_threshold: 50 }
+        Self {
+            domain_saturation_threshold: 50,
+        }
     }
 
     /// 决策 四操作（ADD / UPDATE / INVALIDATE / NOOP）。
@@ -117,8 +120,8 @@ impl MemoryResolver {
         &self,
         product: &ConsolidationProduct,
         existing: Option<&ContextEntry>,
-        similar_count: usize,     // 语义相似条目的数量
-        has_contradiction: bool,  // 是否与已有 fact 矛盾
+        similar_count: usize,    // 语义相似条目的数量
+        has_contradiction: bool, // 是否与已有 fact 矛盾
     ) -> ResolveAction {
         // 1. 质量太低 → 不操作
         if product.quality_score < 0.15 {
@@ -174,9 +177,15 @@ impl MemoryResolver {
 pub struct EpistemicTyper;
 
 impl EpistemicTyper {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
-    pub fn classify(&self, _content: &str, meta: &agent_context_db_core::ContextMeta) -> EpistemicType {
+    pub fn classify(
+        &self,
+        _content: &str,
+        meta: &agent_context_db_core::ContextMeta,
+    ) -> EpistemicType {
         meta.epistemic_type().unwrap_or(EpistemicType::Fact)
     }
 }
@@ -187,9 +196,7 @@ impl EpistemicTyper {
 
 /// 无知地图 — 建模"缺失了什么"。
 pub struct IgnoranceMap {
-    blind_spots: parking_lot::RwLock<
-        std::collections::HashMap<String, BlindSpot>,
-    >,
+    blind_spots: parking_lot::RwLock<std::collections::HashMap<String, BlindSpot>>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +208,9 @@ pub struct BlindSpot {
 
 impl IgnoranceMap {
     pub fn new() -> Self {
-        Self { blind_spots: parking_lot::RwLock::new(std::collections::HashMap::new()) }
+        Self {
+            blind_spots: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        }
     }
 
     pub fn record_missing(&self, query: &str) {
@@ -228,7 +237,9 @@ trait Sigmoid {
 }
 
 impl Sigmoid for f64 {
-    fn sigmoid(self) -> Self { 1.0 / (1.0 + (-self).exp()) }
+    fn sigmoid(self) -> Self {
+        1.0 / (1.0 + (-self).exp())
+    }
 }
 
 // ===========================================================================
@@ -246,9 +257,8 @@ pub struct CalibrationRecord {
 /// 置信度校准器 — per-type 温度缩放，修复 LLM 过度自信。
 pub struct ConfidenceCalibrator {
     /// 按 epistemic_type 分组的校准数据
-    calibration_data: parking_lot::RwLock<
-        std::collections::HashMap<EpistemicType, CalibrationRecord>,
-    >,
+    calibration_data:
+        parking_lot::RwLock<std::collections::HashMap<EpistemicType, CalibrationRecord>>,
 }
 
 impl ConfidenceCalibrator {
@@ -274,16 +284,13 @@ impl ConfidenceCalibrator {
     }
 
     /// Sleeptime 阶段更新校准数据。
-    pub fn update(
-        &self,
-        epistemic: EpistemicType,
-        declared: f32,
-        adopted: bool,
-    ) {
+    pub fn update(&self, epistemic: EpistemicType, declared: f32, adopted: bool) {
         let mut data = self.calibration_data.write();
         let record = data.entry(epistemic).or_default();
         record.declared_confidences.push(declared);
-        record.actual_adoption_rates.push(if adopted { 1.0 } else { 0.0 });
+        record
+            .actual_adoption_rates
+            .push(if adopted { 1.0 } else { 0.0 });
 
         // 每 10 个数据点重新拟合温度
         if record.declared_confidences.len() % 10 == 0 {
@@ -296,7 +303,10 @@ impl ConfidenceCalibrator {
         if record.declared_confidences.len() < 5 {
             return 1.0;
         }
-        let n = record.declared_confidences.len().min(record.actual_adoption_rates.len());
+        let n = record
+            .declared_confidences
+            .len()
+            .min(record.actual_adoption_rates.len());
         let mut sum_ratio = 0.0;
         let mut count = 0;
         for i in 0..n {
@@ -305,7 +315,8 @@ impl ConfidenceCalibrator {
             if declared > 0.0 && declared < 1.0 {
                 // ratio = logit(actual) / logit(declared)
                 // temperature = 1/ratio
-                let actual_logit = (actual.max(0.01).min(0.99) / (1.0 - actual.max(0.01).min(0.99))).ln();
+                let actual_logit =
+                    (actual.max(0.01).min(0.99) / (1.0 - actual.max(0.01).min(0.99))).ln();
                 let declared_logit = (declared / (1.0 - declared)).ln();
                 if declared_logit != 0.0 {
                     sum_ratio += actual_logit / declared_logit;
@@ -384,13 +395,13 @@ impl ConsolidationEngine {
 
     /// Generate→Critique→Revise 收敛循环。
     #[tracing::instrument(skip(self, entry), fields(uri = %entry.uri.as_str()))]
-    pub async fn consolidate(
-        &self,
-        entry: &ContextEntry,
-    ) -> Result<ConsolidationProduct> {
+    pub async fn consolidate(&self, entry: &ContextEntry) -> Result<ConsolidationProduct> {
         let content = entry.l0_text().to_string();
         let ct = entry.content_type().unwrap_or(ContentType::Fact);
-        let et = entry.metadata.epistemic_type().unwrap_or(EpistemicType::Fact);
+        let et = entry
+            .metadata
+            .epistemic_type()
+            .unwrap_or(EpistemicType::Fact);
 
         // Generate (LLM-driven)
         let mut current = self.generate(entry, &content, ct, et).await;
@@ -452,11 +463,18 @@ Produce a concise, self-contained principle that captures the key knowledge.
 Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup)."#
         );
 
-        let consolidated = match self.llm.complete(&prompt, &LlmOpts {
-            max_tokens: Some(512),
-            temperature: Some(0.1),
-            ..Default::default()
-        }).await {
+        let consolidated = match self
+            .llm
+            .complete(
+                &prompt,
+                &LlmOpts {
+                    max_tokens: Some(512),
+                    temperature: Some(0.1),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
             Ok(text) => text.trim().to_string(),
             Err(_) => content.to_string(),
         };
@@ -488,7 +506,11 @@ Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup).
         }
     }
 
-    async fn critique(&self, product: &ConsolidationProduct, _entry: &ContextEntry) -> CritiqueResult {
+    async fn critique(
+        &self,
+        product: &ConsolidationProduct,
+        _entry: &ContextEntry,
+    ) -> CritiqueResult {
         let prompt = format!(
             r#"Evaluate the quality of this consolidated insight:
 
@@ -520,21 +542,42 @@ Return a JSON object with:
                     Some(ref v) => CritiqueResult {
                         quality_score: v["quality_score"].as_f64().unwrap_or(0.7) as f32,
                         confidence: v["confidence"].as_f64().unwrap_or(0.7) as f32,
-                        suggestions: v["suggestions"].as_array()
-                            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                        suggestions: v["suggestions"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|s| s.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                     },
                     None => {
                         // Parse failed — fall back to heuristic
-                        let score = if product.content.len() >= 10 { 0.8 } else { 0.3 };
-                        CritiqueResult { quality_score: score, confidence: score, suggestions: vec![] }
+                        let score = if product.content.len() >= 10 {
+                            0.8
+                        } else {
+                            0.3
+                        };
+                        CritiqueResult {
+                            quality_score: score,
+                            confidence: score,
+                            suggestions: vec![],
+                        }
                     }
                 }
             }
             Err(_) => {
                 // LLM unavailable — fall back to heuristic
-                let score = if !product.content.is_empty() && product.content.len() >= 10 { 0.8 } else { 0.3 };
-                CritiqueResult { quality_score: score, confidence: score, suggestions: vec![] }
+                let score = if !product.content.is_empty() && product.content.len() >= 10 {
+                    0.8
+                } else {
+                    0.3
+                };
+                CritiqueResult {
+                    quality_score: score,
+                    confidence: score,
+                    suggestions: vec![],
+                }
             }
         }
     }
@@ -560,11 +603,18 @@ Return ONLY the revised insight text (no JSON, no markup)."#,
                 product.content, critique.suggestions
             );
 
-            if let Ok(response) = self.llm.complete(&prompt, &LlmOpts {
-                max_tokens: Some(512),
-                temperature: Some(0.0),
-                ..Default::default()
-            }).await {
+            if let Ok(response) = self
+                .llm
+                .complete(
+                    &prompt,
+                    &LlmOpts {
+                        max_tokens: Some(512),
+                        temperature: Some(0.0),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 revised.content = response.trim().to_string();
             }
             revised.metadata.status = ConsolidationStatus::InProgress;
@@ -606,7 +656,9 @@ pub struct CritiqueResult {
 pub struct DualTimeline;
 
 impl DualTimeline {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// 为条目创建有效期记录。
     pub fn mark_valid(meta: &mut agent_context_db_core::ContextMeta, from: DateTime<Utc>) {
@@ -642,9 +694,7 @@ impl DualTimeline {
     /// 检查条目在指定时间点是否有效。
     pub fn is_valid(meta: &agent_context_db_core::ContextMeta, at: DateTime<Utc>) -> bool {
         match &meta.validity {
-            Some(v) => {
-                at >= v.valid_from && v.valid_until.map_or(true, |until| at <= until)
-            }
+            Some(v) => at >= v.valid_from && v.valid_until.map_or(true, |until| at <= until),
             None => true, // 无记录默认有效
         }
     }
@@ -658,7 +708,11 @@ impl DualTimeline {
     ) -> usize {
         let mut propagated = 0;
         for (descendant, meta) in descendants.iter().zip(metas.iter_mut()) {
-            if meta.validity.as_ref().map_or(true, |v| v.valid_until.is_none()) {
+            if meta
+                .validity
+                .as_ref()
+                .map_or(true, |v| v.valid_until.is_none())
+            {
                 let reason = format!("parent {} was invalidated", parent_uri);
                 Self::invalidate(meta, parent_uri, &reason);
                 propagated += 1;
@@ -689,7 +743,10 @@ pub struct BackwardEvolver {
 
 impl BackwardEvolver {
     pub fn new() -> Self {
-        Self { similarity_threshold: 0.3, graph: None }
+        Self {
+            similarity_threshold: 0.3,
+            graph: None,
+        }
     }
 
     /// 注入关系图存储，启用图边扩展路径。
@@ -739,7 +796,8 @@ impl BackwardEvolver {
 
         // 阶段 2：图边扩展 — 沿 EvolvedFrom / EvolvedTo 扩 1 跳
         if let Some(graph) = &self.graph {
-            let seeds: Vec<agent_context_db_core::ContextUri> = affected_uris.iter().cloned().collect();
+            let seeds: Vec<agent_context_db_core::ContextUri> =
+                affected_uris.iter().cloned().collect();
             if !seeds.is_empty() {
                 let kinds = [
                     agent_context_db_core::GraphRelation::EvolvedFrom,
@@ -862,11 +920,7 @@ impl SleeptimeExecutor {
     }
 
     /// 记录一次跨条目 patch 共现事件（供 EntanglementDetection 汇总）。
-    pub fn record_co_patch(
-        &self,
-        a: &ContextUri,
-        b: &ContextUri,
-    ) {
+    pub fn record_co_patch(&self, a: &ContextUri, b: &ContextUri) {
         self.entanglement.record_co_patch(a, b);
     }
 
@@ -889,13 +943,20 @@ impl SleeptimeExecutor {
             None => return vec![],
         };
         let rif = crate::rif::RifSuppressor::new(index, 0.15);
-        let suppressed = rif.on_adopted(&adopted.uri, embedding).await.unwrap_or_default();
+        let suppressed = rif
+            .on_adopted(&adopted.uri, embedding)
+            .await
+            .unwrap_or_default();
 
         // 采纳自身：喂给校准器（adopted=true）
-        engine.calibrator.update(adopted.epistemic_type, adopted.confidence, true);
+        engine
+            .calibrator
+            .update(adopted.epistemic_type, adopted.confidence, true);
         // 被抑制邻居：视作"未采纳"，帮助收紧同类型温度
         for _ in &suppressed {
-            engine.calibrator.update(adopted.epistemic_type, adopted.confidence, false);
+            engine
+                .calibrator
+                .update(adopted.epistemic_type, adopted.confidence, false);
         }
         suppressed
     }
@@ -910,7 +971,10 @@ impl SleeptimeExecutor {
 
         // 从存储中加载 scope 下的条目
         let entries: Vec<ContextEntry> = if let Some(ref store) = self.store {
-            store.scan_by_prefix(&scope.to_string(), 100).await.unwrap_or_default()
+            store
+                .scan_by_prefix(&scope.to_string(), 100)
+                .await
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -918,49 +982,129 @@ impl SleeptimeExecutor {
         for task in &self.tasks {
             match task {
                 SleeptimeTask::QualityReassessment => {
-                    // TODO(sleeptime-quality): 实际质量重评分
-                    //
-                    // 当前只发 tracing，未真正更新 entries 的 quality_score / confidence。
-                    //
-                    // 落地前需要用户确认以下语义：
-                    //   1) 输入信号来源
-                    //      - 访问频率 / 最近命中率（来自 RIF 反馈）
-                    //      - ForgettingModel.retention() 当前值
-                    //      - ConsistencyChecker 是否检出违规
-                    //      - 外部标注（用户 explicit reject / adopt）
-                    //   2) 评分函数
-                    //      - 贝叶斯后验更新（Beta(α, β) 增量）？
-                    //      - 简单加权 EWMA？
-                    //      - 与 lifecycle::BayesianModel 复用还是独立？
-                    //   3) 触发/收敛条件
-                    //      - 每个 entry 每次 sleeptime 都重评，还是抽样？
-                    //      - 分数变化阈值（避免抖动写入）
-                    //   4) 写回路径
-                    //      - 直接改 ContextEntry.metadata.quality_score（需要 store.put）
-                    //      - 还是走 VersionStore.commit 留下 provenance
-                    //
-                    // 与 ForgettingModel 的边界：ForgettingModel 管 retention 曲线，
-                    // QualityReassessment 管 quality_score 本身，二者正交但都影响检索排序。
-                    tracing::info!(scope=%scope, count=%entries.len(), "sleeptime: quality reassessment (not implemented — see TODO)");
+                    let scorer = HorizonAwareQualityScorer::default();
+                    let Some(store) = self.store.as_ref() else {
+                        tracing::info!(scope=%scope, count=%entries.len(), "sleeptime: quality reassessment skipped without store");
+                        report.tasks_executed += 1;
+                        continue;
+                    };
+
+                    let mut reassessed = 0usize;
+                    let mut promoted_mid = 0usize;
+                    let mut promoted_long = 0usize;
+                    let mut archived = 0usize;
+                    let mut training_candidates = 0usize;
+
+                    for entry in &entries {
+                        let signals = HorizonQualitySignals {
+                            adoption_rate: entry
+                                .metadata
+                                .quality_score
+                                .unwrap_or(0.5)
+                                .clamp(0.0, 1.0),
+                            recall_rate: entry
+                                .metadata
+                                .quality_score
+                                .unwrap_or(0.5)
+                                .clamp(0.0, 1.0),
+                            downstream_success_rate: 0.5,
+                            contradiction_count: 0,
+                            corroboration_count: 0,
+                            repeated_observations: 1,
+                            user_confirmed: false,
+                            user_corrected: false,
+                            retrieval_ignored_rate: 0.0,
+                            info_gain: 0.0,
+                            now: Utc::now(),
+                        };
+                        let outcome = scorer.reassess(entry, signals);
+                        if !outcome.should_writeback {
+                            continue;
+                        }
+
+                        let mut updated = entry.clone();
+                        updated.metadata.quality_score = Some(outcome.posterior.overall);
+                        match outcome.route {
+                            QualityRoute::CompressToMidTerm => {
+                                updated.metadata.state_scope = Some(StateScope::Mid);
+                                promoted_mid += 1;
+                            }
+                            QualityRoute::PromoteToLongTerm | QualityRoute::IncludeInTraining => {
+                                updated.metadata.state_scope = Some(StateScope::Long);
+                                promoted_long += 1;
+                                if matches!(outcome.route, QualityRoute::IncludeInTraining) {
+                                    training_candidates += 1;
+                                }
+                            }
+                            QualityRoute::Archive
+                            | QualityRoute::ForgetCandidate
+                            | QualityRoute::ForgetShortTerm => {
+                                updated
+                                    .metadata
+                                    .tags
+                                    .push("quality:archive-candidate".into());
+                                archived += 1;
+                            }
+                            QualityRoute::Rehearse => {
+                                updated.metadata.tags.push("quality:rehearse".into());
+                            }
+                            QualityRoute::Revalidate => {
+                                updated.metadata.tags.push("quality:revalidate".into());
+                            }
+                            QualityRoute::ExcludeFromTraining => {
+                                updated
+                                    .metadata
+                                    .tags
+                                    .push("quality:exclude-training".into());
+                            }
+                            _ => {}
+                        }
+                        if store.write(updated).await.is_ok() {
+                            reassessed += 1;
+                        }
+                    }
+
+                    report.quality_reassessed = reassessed;
+                    report.quality_promoted_mid = promoted_mid;
+                    report.quality_promoted_long = promoted_long;
+                    report.quality_archived = archived;
+                    report.training_candidates = training_candidates;
+                    tracing::info!(scope=%scope, reassessed, promoted_mid, promoted_long, archived, training_candidates, "sleeptime: horizon-aware quality reassessment");
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::ConsistencyCheck => {
-                    let products: Vec<ConsolidationProduct> = entries.iter().map(|e| {
-                        ConsolidationProduct {
-                            uri: e.uri.clone(), content_type: e.content_type().unwrap_or(ContentType::Fact),
-                            epistemic_type: e.metadata.epistemic_type().unwrap_or(EpistemicType::Fact),
+                    let products: Vec<ConsolidationProduct> = entries
+                        .iter()
+                        .map(|e| ConsolidationProduct {
+                            uri: e.uri.clone(),
+                            content_type: e.content_type().unwrap_or(ContentType::Fact),
+                            epistemic_type: e
+                                .metadata
+                                .epistemic_type()
+                                .unwrap_or(EpistemicType::Fact),
                             content: e.l0_text().to_string(),
-                            quality_score: e.metadata.quality_score.unwrap_or(0.5), confidence: 0.5,
-                            superseded_claim: None, evidence_uris: vec![], contradiction_uris: vec![],
-                            error_pattern: None, hypothesis_outcome: None, preconditions: None,
-                            expected_outcome: None, related_policy_uris: vec![],
+                            quality_score: e.metadata.quality_score.unwrap_or(0.5),
+                            confidence: 0.5,
+                            superseded_claim: None,
+                            evidence_uris: vec![],
+                            contradiction_uris: vec![],
+                            error_pattern: None,
+                            hypothesis_outcome: None,
+                            preconditions: None,
+                            expected_outcome: None,
+                            related_policy_uris: vec![],
                             metadata: ConsolidationMeta {
-                                source_session: None, generation: 0, status: ConsolidationStatus::Pending,
-                                patch_count: 0, lineage: vec![],
-                                validity: e.metadata.validity.clone(), half_life_days: None,
+                                source_session: None,
+                                generation: 0,
+                                status: ConsolidationStatus::Pending,
+                                patch_count: 0,
+                                lineage: vec![],
+                                validity: e.metadata.validity.clone(),
+                                half_life_days: None,
                             },
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     let violations = self.checker.check(&products);
                     report.contradictions_found = violations.len();
                     report.tasks_executed += 1;
@@ -969,7 +1113,8 @@ impl SleeptimeExecutor {
                     // 应用衰减，让长期不再共现的纠缠自然消退
                     self.entanglement.decay(0.05);
                     // 统计当前仍高于阈值的纠缠对数
-                    let count = entries.iter()
+                    let count = entries
+                        .iter()
                         .map(|e| self.entanglement.get_entangled(&e.uri).len())
                         .sum::<usize>();
                     report.entanglements_detected = count;
@@ -985,7 +1130,10 @@ impl SleeptimeExecutor {
                     // 采纳与否用 quality_score ≥ 0.7 作为启发式判据
                     let mut samples = 0usize;
                     for entry in &entries {
-                        let epistemic = entry.metadata.epistemic_type().unwrap_or(EpistemicType::Fact);
+                        let epistemic = entry
+                            .metadata
+                            .epistemic_type()
+                            .unwrap_or(EpistemicType::Fact);
                         let declared = entry.metadata.quality_score.unwrap_or(0.5);
                         let adopted = declared >= 0.7;
                         engine.calibrator.update(epistemic, declared, adopted);
@@ -995,29 +1143,45 @@ impl SleeptimeExecutor {
                     report.tasks_executed += 1;
                 }
                 SleeptimeTask::ContextRotPrune => {
-                    let pruned = entries.iter().filter(|e| {
-                        e.metadata.quality_score.unwrap_or(0.5) < 0.1
-                    }).count();
+                    let pruned = entries
+                        .iter()
+                        .filter(|e| e.metadata.quality_score.unwrap_or(0.5) < 0.1)
+                        .count();
                     report.pruned = pruned;
                     report.tasks_executed += 1;
                 }
                 SleeptimeTask::BackwardEvolve => {
-                    let products: Vec<ConsolidationProduct> = entries.iter().map(|e| {
-                        ConsolidationProduct {
-                            uri: e.uri.clone(), content_type: e.content_type().unwrap_or(ContentType::Fact),
-                            epistemic_type: e.metadata.epistemic_type().unwrap_or(EpistemicType::Fact),
+                    let products: Vec<ConsolidationProduct> = entries
+                        .iter()
+                        .map(|e| ConsolidationProduct {
+                            uri: e.uri.clone(),
+                            content_type: e.content_type().unwrap_or(ContentType::Fact),
+                            epistemic_type: e
+                                .metadata
+                                .epistemic_type()
+                                .unwrap_or(EpistemicType::Fact),
                             content: e.l0_text().to_string(),
-                            quality_score: e.metadata.quality_score.unwrap_or(0.5), confidence: 0.5,
-                            superseded_claim: None, evidence_uris: vec![], contradiction_uris: vec![],
-                            error_pattern: None, hypothesis_outcome: None, preconditions: None,
-                            expected_outcome: None, related_policy_uris: vec![],
+                            quality_score: e.metadata.quality_score.unwrap_or(0.5),
+                            confidence: 0.5,
+                            superseded_claim: None,
+                            evidence_uris: vec![],
+                            contradiction_uris: vec![],
+                            error_pattern: None,
+                            hypothesis_outcome: None,
+                            preconditions: None,
+                            expected_outcome: None,
+                            related_policy_uris: vec![],
                             metadata: ConsolidationMeta {
-                                source_session: None, generation: 0, status: ConsolidationStatus::Pending,
-                                patch_count: 0, lineage: vec![],
-                                validity: e.metadata.validity.clone(), half_life_days: None,
+                                source_session: None,
+                                generation: 0,
+                                status: ConsolidationStatus::Pending,
+                                patch_count: 0,
+                                lineage: vec![],
+                                validity: e.metadata.validity.clone(),
+                                half_life_days: None,
                             },
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     if let Some(last) = products.last() {
                         let mut evolver = BackwardEvolver::new();
                         if let Some(ref g) = self.graph {
@@ -1043,6 +1207,11 @@ pub struct SleeptimeReport {
     pub pruned: usize,
     pub blind_spots_updated: usize,
     pub calibration_samples: usize,
+    pub quality_reassessed: usize,
+    pub quality_promoted_mid: usize,
+    pub quality_promoted_long: usize,
+    pub quality_archived: usize,
+    pub training_candidates: usize,
 }
 
 // ===========================================================================
@@ -1077,7 +1246,9 @@ pub struct ConstraintViolation {
 
 impl ConsistencyChecker {
     pub fn new() -> Self {
-        Self { contradiction_threshold: 0.15 } // 余弦距离 < 0.15 = 高度矛盾
+        Self {
+            contradiction_threshold: 0.15,
+        } // 余弦距离 < 0.15 = 高度矛盾
     }
 
     /// 检查所有一致性约束。
@@ -1128,12 +1299,15 @@ impl ConsistencyChecker {
                     b.content.split_whitespace().collect();
                 let intersection = a_words.intersection(&b_words).count();
                 let union = a_words.union(&b_words).count();
-                let jaccard = if union > 0 { intersection as f32 / union as f32 } else { 0.0 };
+                let jaccard = if union > 0 {
+                    intersection as f32 / union as f32
+                } else {
+                    0.0
+                };
 
                 // 高重叠 + 语义对立 = 可能矛盾
-                let has_contradiction_marker = Self::detect_contradiction_marker(
-                    &a.content, &b.content,
-                );
+                let has_contradiction_marker =
+                    Self::detect_contradiction_marker(&a.content, &b.content);
 
                 if jaccard > 0.5 && has_contradiction_marker {
                     violations.push(ConstraintViolation {
@@ -1170,9 +1344,23 @@ impl ConsistencyChecker {
     /// 检测两个文本中是否存在语义矛盾标记（否定词 + 相同主题）。
     fn detect_contradiction_marker(a: &str, b: &str) -> bool {
         let negation_words = [
-            "not", "no", "never", "impossible", "cannot", "can't", "don't",
-            "doesn't", "false", "wrong", "incorrect", "不", "没有", "错误",
-            "无法", "不能", "不可",
+            "not",
+            "no",
+            "never",
+            "impossible",
+            "cannot",
+            "can't",
+            "don't",
+            "doesn't",
+            "false",
+            "wrong",
+            "incorrect",
+            "不",
+            "没有",
+            "错误",
+            "无法",
+            "不能",
+            "不可",
         ];
         let a_has_negation = negation_words.iter().any(|n| a.contains(n));
         let b_has_negation = negation_words.iter().any(|n| b.contains(n));
@@ -1181,7 +1369,10 @@ impl ConsistencyChecker {
     }
 
     /// 检查 Profile 冲突。
-    pub fn check_profile_conflicts(&self, products: &[ConsolidationProduct]) -> Vec<ConstraintViolation> {
+    pub fn check_profile_conflicts(
+        &self,
+        products: &[ConsolidationProduct],
+    ) -> Vec<ConstraintViolation> {
         let mut violations = Vec::new();
         let profiles: Vec<_> = products
             .iter()

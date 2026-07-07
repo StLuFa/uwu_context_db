@@ -38,12 +38,20 @@ impl InfluenceAnalyzer {
 
     /// 记录一次引用（entry_a 引用 entry_b）。
     pub fn record_citation(&self, citing: MarketId, cited: MarketId) {
-        self.citations.write().entry(cited).or_default().push(citing);
+        self.citations
+            .write()
+            .entry(cited)
+            .or_default()
+            .push(citing);
     }
 
     /// 记录一次采纳。
     pub fn record_adoption(&self, entry_id: MarketId, adopter: AgentId) {
-        self.adoptions.write().entry(entry_id).or_default().push(adopter);
+        self.adoptions
+            .write()
+            .entry(entry_id)
+            .or_default()
+            .push(adopter);
     }
 
     /// 计算所有条目的影响力分数。
@@ -57,9 +65,13 @@ impl InfluenceAnalyzer {
 
         for (cited, citing_list) in citations.iter() {
             graph.entry(*cited).or_default().extend(citing_list.clone());
-            if !all_entries.contains(cited) { all_entries.push(*cited); }
+            if !all_entries.contains(cited) {
+                all_entries.push(*cited);
+            }
             for c in citing_list {
-                if !all_entries.contains(c) { all_entries.push(*c); }
+                if !all_entries.contains(c) {
+                    all_entries.push(*c);
+                }
             }
         }
 
@@ -70,7 +82,8 @@ impl InfluenceAnalyzer {
         // 简化 PageRank：迭代 20 轮
         let n = all_entries.len();
         let damping = 0.85;
-        let mut ranks: HashMap<MarketId, f32> = all_entries.iter().map(|e| (*e, 1.0 / n as f32)).collect();
+        let mut ranks: HashMap<MarketId, f32> =
+            all_entries.iter().map(|e| (*e, 1.0 / n as f32)).collect();
 
         for _ in 0..20 {
             let mut new_ranks: HashMap<MarketId, f32> = HashMap::new();
@@ -80,7 +93,8 @@ impl InfluenceAnalyzer {
                 for (citing, cited_list) in graph.iter() {
                     if cited_list.contains(entry) {
                         let out_degree = graph.get(citing).map(|l| l.len()).unwrap_or(1);
-                        rank += damping * ranks.get(citing).unwrap_or(&0.0) / out_degree.max(1) as f32;
+                        rank +=
+                            damping * ranks.get(citing).unwrap_or(&0.0) / out_degree.max(1) as f32;
                     }
                 }
                 new_ranks.insert(*entry, rank);
@@ -89,20 +103,28 @@ impl InfluenceAnalyzer {
         }
 
         // 生成结果
-        let mut scores: Vec<InfluenceScore> = all_entries.iter().map(|e| {
-            let adoption_count = adoptions.get(e).map(|l| l.len()).unwrap_or(0);
-            let citation_count = citations.get(e).map(|l| l.len()).unwrap_or(0);
-            let betweenness = (citation_count as f32 / (citation_count + 5) as f32).clamp(0.0, 1.0);
-            InfluenceScore {
-                entry_id: *e,
-                pagerank: ranks.get(e).copied().unwrap_or(0.0),
-                adoption_count,
-                citation_count,
-                betweenness,
-            }
-        }).collect();
+        let mut scores: Vec<InfluenceScore> = all_entries
+            .iter()
+            .map(|e| {
+                let adoption_count = adoptions.get(e).map(|l| l.len()).unwrap_or(0);
+                let citation_count = citations.get(e).map(|l| l.len()).unwrap_or(0);
+                let betweenness =
+                    (citation_count as f32 / (citation_count + 5) as f32).clamp(0.0, 1.0);
+                InfluenceScore {
+                    entry_id: *e,
+                    pagerank: ranks.get(e).copied().unwrap_or(0.0),
+                    adoption_count,
+                    citation_count,
+                    betweenness,
+                }
+            })
+            .collect();
 
-        scores.sort_by(|a, b| b.pagerank.partial_cmp(&a.pagerank).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| {
+            b.pagerank
+                .partial_cmp(&a.pagerank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scores
     }
 
@@ -115,7 +137,8 @@ impl InfluenceAnalyzer {
 
     /// 查找桥梁知识（高介数 + 低质量 = 危险桥梁 → 跨Agent协同修复）。
     pub fn find_risky_bridges(&self, quality_threshold: f32) -> Vec<InfluenceScore> {
-        self.analyze().into_iter()
+        self.analyze()
+            .into_iter()
             .filter(|s| s.betweenness > 0.5 && s.pagerank < quality_threshold)
             .collect()
     }

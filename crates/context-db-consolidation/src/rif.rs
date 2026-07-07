@@ -15,7 +15,10 @@ pub struct RifSuppressor {
 
 impl RifSuppressor {
     pub fn new(vector_index: Arc<dyn VectorIndex>, epsilon: f32) -> Self {
-        Self { vector_index, suppression_epsilon: epsilon }
+        Self {
+            vector_index,
+            suppression_epsilon: epsilon,
+        }
     }
 
     /// 某 URI 被采纳后，找到其语义邻居并返回待抑制列表。

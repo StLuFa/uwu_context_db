@@ -1,0 +1,16 @@
+[package]
+name = "agent-context-db-llm-provider"
+version = "0.0.0"
+edition = "2024"
+description = "HTTP LLM providers for agent-context-db: OpenAI, Anthropic, and OpenAI-compatible/self-hosted endpoints"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

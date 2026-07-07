@@ -1,7 +1,7 @@
 //! CurriculumGenerator — 主动课程：知识图谱拓扑前沿 + ZPD 排序。
 
 use crate::TrainingGoal;
-use agent_context_db_core::{ContextUri, ContentType, Result};
+use agent_context_db_core::{ContentType, ContextUri, Result};
 use std::collections::HashMap;
 
 /// 课程生成器。
@@ -22,7 +22,10 @@ pub struct FrontierNode {
 
 impl CurriculumGenerator {
     pub fn new(exploration_ratio: f32) -> Self {
-        Self { exploration_ratio, zpd_difficulty: 0.6 }
+        Self {
+            exploration_ratio,
+            zpd_difficulty: 0.6,
+        }
     }
 
     /// 生成下一个训练目标。

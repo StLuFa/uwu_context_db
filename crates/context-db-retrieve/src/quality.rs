@@ -197,7 +197,10 @@ pub struct CompressionAwareLoader {
 
 impl CompressionAwareLoader {
     pub fn new(window_total: usize, window_used: usize) -> Self {
-        Self { window_total, window_used }
+        Self {
+            window_total,
+            window_used,
+        }
     }
 
     pub fn pressure(&self) -> PressureLevel {
@@ -212,10 +215,7 @@ impl CompressionAwareLoader {
     /// 为一批 URI 分配加载级别。
     ///
     /// 高相关性命中优先获得更高级别。
-    pub fn allocate_levels(
-        &self,
-        hits: &[crate::RetrievalHit],
-    ) -> Vec<(ContextUri, ContentLevel)> {
+    pub fn allocate_levels(&self, hits: &[crate::RetrievalHit]) -> Vec<(ContextUri, ContentLevel)> {
         let pressure = self.pressure();
         let remaining = self.remaining();
 
@@ -224,7 +224,11 @@ impl CompressionAwareLoader {
         let base_level = pressure.default_level();
 
         let mut sorted: Vec<&crate::RetrievalHit> = hits.iter().collect();
-        sorted.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         for hit in sorted {
             let level = if budget > 2000 && base_level == ContentLevel::L2 {
@@ -277,16 +281,18 @@ mod tests {
     fn allocate_respects_budget() {
         let loader = CompressionAwareLoader::new(10000, 9000); // 只剩 1000 tokens
 
-        let hits = vec![
-            crate::RetrievalHit {
-                uri: ContextUri::parse("uwu://t/x").unwrap(),
-                level: ContentLevel::L0,
-                content: ContentPayload::Abstract("a".into()),
-                relevance: 0.9,
-                parent_chain: vec![],
-                memory_class: None,
+        let hits = vec![crate::RetrievalHit {
+            uri: ContextUri::parse("uwu://t/x").unwrap(),
+            level: ContentLevel::L0,
+            content: ContentPayload::Text {
+                sparse: "a".into(),
+                dense: "a".into(),
+                full: "a".into(),
             },
-        ];
+            relevance: 0.9,
+            parent_chain: vec![],
+            content_type: None,
+        }];
 
         let plan = loader.allocate_levels(&hits);
         // Tight pressure + small budget → L0 only

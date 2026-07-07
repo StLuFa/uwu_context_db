@@ -38,7 +38,9 @@ pub struct TrajectoryEncoder {
 
 impl TrajectoryEncoder {
     pub fn new(agent_scope: impl Into<String>) -> Self {
-        Self { agent_scope: agent_scope.into() }
+        Self {
+            agent_scope: agent_scope.into(),
+        }
     }
 
     /// 编码一个轨迹为所有类型的记忆。
@@ -68,7 +70,10 @@ impl TrajectoryEncoder {
 
     /// 批量编码。
     pub fn encode_batch(&self, trajectories: &[Trajectory]) -> Vec<ContextEntry> {
-        trajectories.iter().flat_map(|t| self.encode_all(t)).collect()
+        trajectories
+            .iter()
+            .flat_map(|t| self.encode_all(t))
+            .collect()
     }
 
     // ── 内部提取方法 ──────────────────────────────
@@ -108,7 +113,12 @@ impl TrajectoryEncoder {
                 if step.contains("error") || step.contains("fail") || step.contains("panic") {
                     let content = format!("Step {} in `{}`: {}", i, traj.task_description, step);
                     let uri = self.make_uri("error", i + 1, &content);
-                    errors.push(self.text_entry(uri, &content, ContentType::Error, EpistemicType::Fact));
+                    errors.push(self.text_entry(
+                        uri,
+                        &content,
+                        ContentType::Error,
+                        EpistemicType::Fact,
+                    ));
                 }
             }
         }
@@ -122,15 +132,26 @@ impl TrajectoryEncoder {
 
         // 成功→假设"这个做法是正确的"；失败→假设"这个做法需要修正"
         let hyp = if traj.success {
-            format!("Hypothesis: approach used in `{}` is effective", traj.task_description)
+            format!(
+                "Hypothesis: approach used in `{}` is effective",
+                traj.task_description
+            )
         } else if let Some(ref err) = traj.error_message {
-            format!("Hypothesis: error `{}` in `{}` can be avoided by modifying approach", err, traj.task_description)
+            format!(
+                "Hypothesis: error `{}` in `{}` can be avoided by modifying approach",
+                err, traj.task_description
+            )
         } else {
             return hyps; // 无法生成假设
         };
 
         let uri = self.make_uri("hypothesis", 0, &hyp);
-        hyps.push(self.text_entry(uri, &hyp, ContentType::Hypothesis, EpistemicType::Hypothesis));
+        hyps.push(self.text_entry(
+            uri,
+            &hyp,
+            ContentType::Hypothesis,
+            EpistemicType::Hypothesis,
+        ));
         hyps
     }
 
@@ -180,10 +201,7 @@ impl TrajectoryEncoder {
                 .map(|(i, s)| format!("{}. {}", i + 1, s))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let content = format!(
-                "Procedure for `{}`:\n{}",
-                traj.task_description, steps_text
-            );
+            let content = format!("Procedure for `{}`:\n{}", traj.task_description, steps_text);
             let uri = self.make_uri("procedure", 0, &content);
             procs.push(self.text_entry(
                 uri,
@@ -233,11 +251,20 @@ impl TrajectoryEncoder {
         let short = &hash[..8];
         ContextUri::parse(&format!(
             "uwu://{}/x/{}/{}/{:02}-{}",
-            self.agent_scope, ctype, Utc::now().format("%Y%m%d"), index, short
+            self.agent_scope,
+            ctype,
+            Utc::now().format("%Y%m%d"),
+            index,
+            short
         ))
         .unwrap_or_else(|_| {
-            ContextUri::parse(&format!("uwu://{}/x/{}/fallback-{}", self.agent_scope, ctype, Uuid::new_v4()))
-                .unwrap()
+            ContextUri::parse(&format!(
+                "uwu://{}/x/{}/fallback-{}",
+                self.agent_scope,
+                ctype,
+                Uuid::new_v4()
+            ))
+            .unwrap()
         })
     }
 
@@ -306,7 +333,10 @@ mod tests {
         assert!(!encoding.facts.is_empty());
         assert!(!encoding.skills.is_empty());
         assert!(encoding.errors.is_empty()); // 成功 = 无错误
-        assert_eq!(encoding.facts[0].metadata.content_type, Some(ContentType::Fact));
+        assert_eq!(
+            encoding.facts[0].metadata.content_type,
+            Some(ContentType::Fact)
+        );
     }
 
     #[test]
@@ -316,9 +346,12 @@ mod tests {
         let encoding = encoder.encode(&traj);
 
         assert!(!encoding.errors.is_empty());
-        assert!(encoding.hypotheses.iter().any(|h| {
-            h.payload.sparse_text().contains("Hypothesis")
-        }));
+        assert!(
+            encoding
+                .hypotheses
+                .iter()
+                .any(|h| { h.payload.sparse_text().contains("Hypothesis") })
+        );
     }
 
     #[test]

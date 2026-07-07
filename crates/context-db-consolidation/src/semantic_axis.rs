@@ -38,7 +38,8 @@ impl SemanticAxis {
     /// 为新条目分配语义路径（基于向量最近类簇）。
     pub fn assign_path(&self, uri: &ContextUri, embedding: &[f32]) -> String {
         let segs = uri.segments();
-        let content_type = ContentType::from_path_segment(segs.get(2).map(|s| s.as_str()).unwrap_or("fact"));
+        let content_type =
+            ContentType::from_path_segment(segs.get(2).map(|s| s.as_str()).unwrap_or("fact"));
 
         if let Some(ct) = content_type {
             let clusters = self.clusters.read();
@@ -97,10 +98,7 @@ impl SemanticAxis {
         paths.clear();
         for (i, cluster) in type_clusters.iter().enumerate() {
             if !cluster.members.is_empty() {
-                paths.insert(
-                    cluster.label.clone(),
-                    cluster.members.clone(),
-                );
+                paths.insert(cluster.label.clone(), cluster.members.clone());
             }
         }
 
@@ -126,7 +124,8 @@ impl SemanticAxis {
 
     /// 当前类簇数量。
     pub fn cluster_count(&self, content_type: ContentType) -> usize {
-        self.clusters.read()
+        self.clusters
+            .read()
             .get(&content_type)
             .map(|c| c.len())
             .unwrap_or(0)
@@ -139,7 +138,9 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     let mut na = 0.0_f64;
     let mut nb = 0.0_f64;
     let len = a.len().min(b.len());
-    if len == 0 { return 1.0; }
+    if len == 0 {
+        return 1.0;
+    }
     for i in 0..len {
         dot += a[i] as f64 * b[i] as f64;
         na += a[i] as f64 * a[i] as f64;

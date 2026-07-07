@@ -1,0 +1,78 @@
+[pack]
+id = "context-db.default.intent"
+version = "1.0.0"
+engine_version = 1
+
+[governance]
+max_rules = 128
+max_regex_per_rule = 8
+max_pattern_len = 256
+allow_execution_graph = true
+
+[[intent]]
+id = "retrieve.event_recall"
+kind = "event_recall"
+priority = 90
+route = "temporal_index"
+keywords = ["when", "happened", "event", "那天", "之前", "上次"]
+target_dirs = ["memories/events", "memories/cases"]
+expected_type = "fact"
+plan = { prefer_temporal = true, require_high_precision = true, max_expansion_depth = 2 }
+
+[[intent]]
+id = "retrieve.entity_lookup"
+kind = "entity_lookup"
+priority = 95
+route = "local_exact"
+keywords = ["who", "person", "project", "entity", "谁", "项目", "实体"]
+target_dirs = ["memories/entities", "resources"]
+expected_type = "fact"
+plan = { prefer_exact = true, prefer_vector = true, require_high_precision = true, max_expansion_depth = 1 }
+
+[[intent]]
+id = "retrieve.skill_reuse"
+kind = "skill_reuse"
+priority = 85
+route = "local_hybrid"
+keywords = ["how to", "skill", "tool", "procedure", "怎么", "技能", "工具", "步骤"]
+target_dirs = ["memories/skills", "memories/tools", "experiences"]
+expected_type = "skill"
+plan = { prefer_exact = true, prefer_vector = true, max_expansion_depth = 2 }
+
+[[intent]]
+id = "retrieve.pattern_match"
+kind = "pattern_match"
+priority = 82
+route = "graph_traversal"
+keywords = ["pattern", "template", "模式", "模板", "惯例", "typically"]
+target_dirs = ["memories/patterns", "memories/cases"]
+expected_type = "heuristic"
+plan = { prefer_graph = true, max_expansion_depth = 2 }
+
+[[intent]]
+id = "retrieve.state_snapshot"
+kind = "state_snapshot"
+priority = 80
+route = "local_hybrid"
+keywords = ["current", "state", "now", "context", "当前", "现在", "状态"]
+target_dirs = ["state/short", "state/mid"]
+plan = { prefer_vector = true, max_expansion_depth = 1 }
+
+[[intent]]
+id = "retrieve.persona_relation"
+kind = "persona_relation"
+priority = 84
+route = "graph_traversal"
+keywords = ["relation", "persona", "关系", "朋友", "信任", "trust"]
+target_dirs = ["persona/relations"]
+expected_type = "fact"
+plan = { prefer_graph = true, require_high_precision = true, max_expansion_depth = 2 }
+
+[[intent]]
+id = "retrieve.semantic_default"
+kind = "semantic_search"
+priority = 10
+route = "local_vector"
+keywords = []
+target_dirs = ["memories", "resources", "skills", "wiki"]
+plan = { prefer_vector = true, max_expansion_depth = 1 }

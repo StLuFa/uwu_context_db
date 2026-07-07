@@ -26,8 +26,7 @@ impl VectorIndex for UwuVectorIndex {
         let record = uwu_database::Record {
             id: point.uri.to_string(),
             vector: point.vector,
-            metadata: serde_json::from_value(point.payload)
-                .unwrap_or_default(),
+            metadata: serde_json::from_value(point.payload).unwrap_or_default(),
         };
         self.inner
             .upsert(collection, &[record])
@@ -42,8 +41,8 @@ impl VectorIndex for UwuVectorIndex {
         top_k: usize,
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<IndexHit>> {
-        let filter_map: Option<std::collections::HashMap<String, serde_json::Value>> = filter
-            .and_then(|v| serde_json::from_value(v).ok());
+        let filter_map: Option<std::collections::HashMap<String, serde_json::Value>> =
+            filter.and_then(|v| serde_json::from_value(v).ok());
 
         let q = uwu_database::Query {
             vector: &query,
@@ -98,9 +97,6 @@ mod tests {
         };
         assert_eq!(record.id, "uwu://t/x");
         assert_eq!(record.vector, vec![1.0, 0.0]);
-        assert_eq!(
-            record.metadata.get("k").and_then(|v| v.as_str()),
-            Some("v")
-        );
+        assert_eq!(record.metadata.get("k").and_then(|v| v.as_str()), Some("v"));
     }
 }

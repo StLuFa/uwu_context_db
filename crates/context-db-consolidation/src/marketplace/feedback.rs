@@ -44,7 +44,10 @@ impl ReputationEngine {
             last_active: chrono::Utc::now(),
             ..Default::default()
         });
-        self.bonds.write().entry(agent.clone()).or_insert_with(|| ReputationBond::new(agent));
+        self.bonds
+            .write()
+            .entry(agent.clone())
+            .or_insert_with(|| ReputationBond::new(agent));
     }
 
     /// 处理一条反馈。
@@ -68,7 +71,7 @@ impl ReputationEngine {
     }
 
     /// 提升发布者声誉。
-    pub fn boost(&self, agent: &str) {
+    pub fn boost(&self, agent: &AgentId) {
         let mut kpis = self.kpis.write();
         if let Some(kpi) = kpis.get_mut(agent) {
             kpi.entries_published = kpi.entries_published.saturating_add(1);
@@ -78,7 +81,7 @@ impl ReputationEngine {
     }
 
     /// 降低发布者声誉。
-    pub fn ding(&self, agent: &str) {
+    pub fn ding(&self, agent: &AgentId) {
         let mut kpis = self.kpis.write();
         if let Some(kpi) = kpis.get_mut(agent) {
             kpi.downvote_count = kpi.downvote_count.saturating_add(1);
@@ -88,7 +91,7 @@ impl ReputationEngine {
     }
 
     /// 记录矛盾。
-    pub fn record_contradiction(&self, agent: &str) {
+    pub fn record_contradiction(&self, agent: &AgentId) {
         let mut kpis = self.kpis.write();
         if let Some(kpi) = kpis.get_mut(agent) {
             kpi.contradiction_count = kpi.contradiction_count.saturating_add(1);
@@ -103,7 +106,7 @@ impl ReputationEngine {
     }
 
     /// 记录抗体贡献。
-    pub fn record_immune_contribution(&self, agent: &str) {
+    pub fn record_immune_contribution(&self, agent: &AgentId) {
         let mut kpis = self.kpis.write();
         if let Some(kpi) = kpis.get_mut(agent) {
             kpi.immune_contributions = kpi.immune_contributions.saturating_add(1);
@@ -112,7 +115,7 @@ impl ReputationEngine {
     }
 
     /// 获取 Agent 的声誉 KPI。
-    pub fn get_kpi(&self, agent: &str) -> Option<ReputationKpi> {
+    pub fn get_kpi(&self, agent: &AgentId) -> Option<ReputationKpi> {
         self.kpis.read().get(agent).cloned()
     }
 
@@ -122,7 +125,7 @@ impl ReputationEngine {
         let mut bonds = self.bonds.write();
         for (agent, kpi) in kpis.iter() {
             if let Some(bond) = bonds.get_mut(agent) {
-                bond.promote(kpi);
+                bond.promote_if_qualified(kpi);
             }
         }
     }
@@ -130,7 +133,8 @@ impl ReputationEngine {
     /// Top-N 高声誉 Agent。
     pub fn top_agents(&self, n: usize) -> Vec<(AgentId, f32)> {
         let kpis = self.kpis.read();
-        let mut sorted: Vec<_> = kpis.iter()
+        let mut sorted: Vec<_> = kpis
+            .iter()
             .map(|(a, kpi)| (a.clone(), kpi.composite))
             .collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

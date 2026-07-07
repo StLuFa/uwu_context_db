@@ -40,11 +40,13 @@ Respond with ONLY the abstract text, no additional commentary.
             ..Default::default()
         };
 
-        self.llm.complete(&prompt, &opts).await
+        self.llm
+            .complete(&prompt, &opts)
+            .await
             .map(|s| s.trim().to_string())
-            .map_err(|e| agent_context_db_core::ContextError::Storage(
-                format!("llm generate_abstract: {e}")
-            ))
+            .map_err(|e| {
+                agent_context_db_core::ContextError::Storage(format!("llm generate_abstract: {e}"))
+            })
     }
 
     async fn generate_overview(&self, uri: &ContextUri) -> Result<String> {
@@ -68,11 +70,13 @@ Respond with ONLY the overview text.
             ..Default::default()
         };
 
-        self.llm.complete(&prompt, &opts).await
+        self.llm
+            .complete(&prompt, &opts)
+            .await
             .map(|s| s.trim().to_string())
-            .map_err(|e| agent_context_db_core::ContextError::Storage(
-                format!("llm generate_overview: {e}")
-            ))
+            .map_err(|e| {
+                agent_context_db_core::ContextError::Storage(format!("llm generate_overview: {e}"))
+            })
     }
 
     async fn aggregate_upward(&self, root: &ContextUri) -> Result<String> {
@@ -144,11 +148,13 @@ Format as Markdown. Respond with ONLY the overview text.
             ..Default::default()
         };
 
-        self.llm.complete(&prompt, &opts).await
+        self.llm
+            .complete(&prompt, &opts)
+            .await
             .map(|s| s.trim().to_string())
-            .map_err(|e| agent_context_db_core::ContextError::Storage(
-                format!("llm aggregate_upward: {e}")
-            ))
+            .map_err(|e| {
+                agent_context_db_core::ContextError::Storage(format!("llm aggregate_upward: {e}"))
+            })
     }
 
     async fn multimodal_to_text(&self, uri: &ContextUri) -> Result<(String, String)> {
@@ -181,10 +187,11 @@ Return your response as a JSON object:
                     ..Default::default()
                 };
 
-                let response = self.llm.complete(&prompt, &opts).await
-                    .map_err(|e| agent_context_db_core::ContextError::Storage(
-                        format!("llm multimodal_to_text: {e}")
-                    ))?;
+                let response = self.llm.complete(&prompt, &opts).await.map_err(|e| {
+                    agent_context_db_core::ContextError::Storage(format!(
+                        "llm multimodal_to_text: {e}"
+                    ))
+                })?;
 
                 // Parse JSON response
                 #[derive(serde::Deserialize)]
@@ -207,11 +214,9 @@ Return your response as a JSON object:
             Ok(ContentPayload::Text { sparse, dense, .. }) => {
                 Ok((sparse.chars().take(200).collect(), dense))
             }
-            Ok(_) => {
-                Err(agent_context_db_core::ContextError::Unsupported(
-                    format!("multimodal_to_text requires L2 Detail content for {uri}")
-                ))
-            }
+            Ok(_) => Err(agent_context_db_core::ContextError::Unsupported(format!(
+                "multimodal_to_text requires L2 Detail content for {uri}"
+            ))),
             Err(e) => Err(e),
         }
     }

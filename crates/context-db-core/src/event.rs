@@ -55,7 +55,9 @@ pub struct InheritanceChain {
 }
 
 impl InheritanceChain {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// 注册一个继承关系。
     pub fn register(&self, node: InheritanceNode) {
@@ -82,7 +84,9 @@ impl InheritanceChain {
         // 查父级
         if let Some(ref parent_id) = node.parent {
             let parent_node = nodes.iter().find(|n| &n.agent_id == parent_id)?;
-            let mapped = uri.to_string().replace(node.scope.as_str(), parent_node.scope.as_str());
+            let mapped = uri
+                .to_string()
+                .replace(node.scope.as_str(), parent_node.scope.as_str());
             Some((ContextUri::parse(mapped).unwrap(), true))
         } else {
             Some((uri.clone(), false))
@@ -151,11 +155,8 @@ impl TemplateEngine {
             let full_uri = format!("{}/{}", scope, uri_str);
             let uri = ContextUri::parse(full_uri).unwrap_or_else(|_| scope.clone());
 
-            let mut entry = ContextEntry::new_text(
-                uri,
-                crate::TenantId(uuid::Uuid::nil()),
-                abstract_,
-            );
+            let mut entry =
+                ContextEntry::new_text(uri, crate::TenantId(uuid::Uuid::nil()), abstract_);
             if let Some(mc) = tpl.memory_class {
                 entry.metadata.memory_class = Some(mc);
             }

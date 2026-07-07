@@ -42,11 +42,17 @@ pub struct ExplainableLineage {
 
 impl ExplainableLineage {
     pub fn new() -> Self {
-        Self { fs: None, max_depth: 3 }
+        Self {
+            fs: None,
+            max_depth: 3,
+        }
     }
 
     pub fn with_fs(fs: Arc<dyn FsOps>) -> Self {
-        Self { fs: Some(fs), max_depth: 3 }
+        Self {
+            fs: Some(fs),
+            max_depth: 3,
+        }
     }
 
     pub fn with_max_depth(mut self, depth: usize) -> Self {
@@ -205,4 +211,3 @@ fn extract_session_id(uri: &ContextUri) -> Option<String> {
     }
     None
 }
-

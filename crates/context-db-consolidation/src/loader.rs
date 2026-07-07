@@ -39,7 +39,10 @@ impl ProgressiveLoader {
                 format!(
                     "{} ({})",
                     entry.uri,
-                    entry.content_type().map(|c| c.as_path_segment()).unwrap_or("?"),
+                    entry
+                        .content_type()
+                        .map(|c| c.as_path_segment())
+                        .unwrap_or("?"),
                 )
             }
             LoadLevel::Abstract => entry.l0_text().to_string(),

@@ -6,8 +6,13 @@ use agent_context_db_core::{ContentType, ContextEntry, ContextUri};
 #[derive(Debug, Clone)]
 pub enum ThreatVerdict {
     Safe,
-    Suspicious { reason: String },
-    Blocked { threat_type: ThreatType, confidence: f32 },
+    Suspicious {
+        reason: String,
+    },
+    Blocked {
+        threat_type: ThreatType,
+        confidence: f32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -73,13 +78,18 @@ pub struct Antibody {
 
 impl ImmuneMemory {
     pub fn new() -> Self {
-        Self { antibodies: parking_lot::RwLock::new(Vec::new()) }
+        Self {
+            antibodies: parking_lot::RwLock::new(Vec::new()),
+        }
     }
 
     /// 记录一次检测到的威胁 → 生成抗体。
     pub fn record_threat(&self, content: &str, threat_type: ThreatType) {
         let mut antibodies = self.antibodies.write();
-        if let Some(existing) = antibodies.iter_mut().find(|a| content.contains(&a.pattern_signature)) {
+        if let Some(existing) = antibodies
+            .iter_mut()
+            .find(|a| content.contains(&a.pattern_signature))
+        {
             existing.detected_count += 1;
             return;
         }

@@ -1,6 +1,6 @@
 //! SkillLibrary — embedding 检索 + deposit（课程驱动）。
 
-use agent_context_db_core::{ContextUri, ContentType, Result, VectorIndex};
+use agent_context_db_core::{ContentType, ContextUri, Result, VectorIndex};
 use std::sync::Arc;
 
 /// Skill 条目。
@@ -27,15 +27,21 @@ impl SkillLibrary {
     /// 新任务时检索 top-K 相似 skill。
     pub async fn retrieve(&self, task_embedding: &[f32], k: usize) -> Vec<SkillEntry> {
         // 使用向量索引搜索相似 skill
-        let hits = self.index.search("skills", task_embedding.to_vec(), k, None).await.unwrap_or_default();
-        hits.into_iter().map(|h| SkillEntry {
-            uri: h.uri.clone(),
-            name: h.uri.to_string(),
-            description: String::new(),
-            precondition: String::new(),
-            success_rate: h.score,
-            embedding: vec![],
-        }).collect()
+        let hits = self
+            .index
+            .search("skills", task_embedding.to_vec(), k, None)
+            .await
+            .unwrap_or_default();
+        hits.into_iter()
+            .map(|h| SkillEntry {
+                uri: h.uri.clone(),
+                name: h.uri.to_string(),
+                description: String::new(),
+                precondition: String::new(),
+                success_rate: h.score,
+                embedding: vec![],
+            })
+            .collect()
     }
 
     /// 执行成功后存入 skill library。

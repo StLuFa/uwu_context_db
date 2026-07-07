@@ -73,7 +73,8 @@ Output a JSON object with:
 - "epistemic_tags": list of relevant epistemology types (fact, heuristic, procedure, hypothesis, belief)
 - "priority": 0.0-1.0 urgency score"#,
             knowledge = relevant_knowledge.join(", "),
-            trace_formatted = trace.iter()
+            trace_formatted = trace
+                .iter()
                 .enumerate()
                 .map(|(i, s)| format!("  {}. {}", i + 1, s))
                 .collect::<Vec<_>>()
@@ -175,7 +176,10 @@ mod tests {
             "deploy app",
             "kubectl apply",
             "connection timeout",
-            &["build docker image".to_string(), "kubectl apply".to_string()],
+            &[
+                "build docker image".to_string(),
+                "kubectl apply".to_string(),
+            ],
         );
         assert!(!g.reflection_text.is_empty());
         assert!(!g.action_improvement.is_empty());

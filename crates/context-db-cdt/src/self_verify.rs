@@ -27,7 +27,10 @@ pub struct CognitiveSelfVerifier {
 
 impl CognitiveSelfVerifier {
     pub fn new(success_threshold: f32) -> Self {
-        Self { graph: None, success_threshold }
+        Self {
+            graph: None,
+            success_threshold,
+        }
     }
 
     pub fn with_graph(mut self, graph: Box<dyn GraphStore>) -> Self {
@@ -41,7 +44,11 @@ impl CognitiveSelfVerifier {
     /// 1. 任务完成度
     /// 2. 执行后是否新增知识图谱矛盾
     /// 3. 认知增益（认识论置信度是否提升）
-    pub async fn verify(&self, _skill_uri: &ContextUri, execution: &Execution) -> VerificationResult {
+    pub async fn verify(
+        &self,
+        _skill_uri: &ContextUri,
+        execution: &Execution,
+    ) -> VerificationResult {
         // 1. 任务完成度
         if !execution.task_succeeded {
             return VerificationResult::Failed("task not completed".into());

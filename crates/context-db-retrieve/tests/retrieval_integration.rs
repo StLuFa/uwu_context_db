@@ -2,11 +2,11 @@
 //! 无 PG / Qdrant 依赖，满足 ARCHITECTURE.md M1 验收标准。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentRepo, ContextEntry, ContextUri, MemoryClass, TenantId,
+    ContentLevel, ContentPayload, ContentRepo, ContextEntry, ContextUri, FsOps, MemoryClass,
+    TenantId,
 };
 use agent_context_db_retrieve::{
-    HierarchicalRetriever, HierarchicalRetrieverImpl, IntentAnalyzer, RetrieveContext,
-    RuleBasedIntentAnalyzer, ScoreReranker,
+    ContextRetriever, RetrieveContext, RuleBasedIntentAnalyzer, RuleBasedPlanner, ScoreReranker,
 };
 use agent_context_db_testkit::MemoryContextStore;
 use std::sync::Arc;
@@ -17,13 +17,24 @@ fn tenant() -> TenantId {
 }
 
 fn uri(s: &str) -> ContextUri {
-    ContextUri(s.to_string())
+    ContextUri::parse(s).unwrap()
 }
 
 fn entry(uri_str: &str, abstract_: &str, class: MemoryClass) -> ContextEntry {
     let mut e = ContextEntry::new_text(uri(uri_str), tenant(), abstract_);
     e.metadata.memory_class = Some(class);
     e
+}
+
+fn retriever(store: Arc<MemoryContextStore>) -> ContextRetriever {
+    let fs: Arc<dyn FsOps> = store;
+    ContextRetriever::new(
+        fs,
+        None,
+        Arc::new(RuleBasedPlanner::new("t1", "a1")),
+        Arc::new(ScoreReranker { keep: 10 }),
+    )
+    .with_intent_analyzer(Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1")))
 }
 
 /// 构建一个包含多种记忆的 MemoryContextStore。
@@ -107,11 +118,7 @@ fn ctx() -> RetrieveContext {
 #[tokio::test]
 async fn retrieve_event_recall_returns_events() {
     let store = Arc::new(seed_store().await);
-    let intent: Arc<dyn IntentAnalyzer> =
-        Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1"));
-    let reranker = Arc::new(ScoreReranker { keep: 10 });
-
-    let retriever = HierarchicalRetrieverImpl::new(store.clone(), intent, reranker);
+    let retriever = retriever(store.clone());
 
     let result = retriever
         .retrieve("what happened during the outage?", &ctx())
@@ -120,85 +127,74 @@ async fn retrieve_event_recall_returns_events() {
 
     // 验证 trace 记录了意图分析
     assert!(!result.trace.steps.is_empty());
-    assert!(result.intent.iter().any(|tq| tq.kind
-        == agent_context_db_retrieve::QueryKind::EventRecall));
+    assert!(result.trace.steps.iter().any(|step| matches!(
+        step,
+        agent_context_db_retrieve::TraceStep::IntentAnalysis {
+            decision: Some(decision),
+            ..
+        } if decision.primary == agent_context_db_retrieve::IntentKind::EventRecall
+    )));
 
     // 命中应包含 event 条目
-    let has_event = result.hits.iter().any(|h| {
-        matches!(&h.content, ContentPayload::Abstract(s) if s.contains("TLS"))
-    });
+    let has_event = result
+        .hits
+        .iter()
+        .any(|h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("TLS")));
     assert!(has_event, "should find the TLS cert outage event");
 }
 
 #[tokio::test]
 async fn retrieve_howto_targets_skills() {
     let store = Arc::new(seed_store().await);
-    let intent: Arc<dyn IntentAnalyzer> =
-        Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1"));
-    let reranker = Arc::new(ScoreReranker { keep: 10 });
-
-    let retriever = HierarchicalRetrieverImpl::new(store.clone(), intent, reranker);
+    let retriever = retriever(store.clone());
 
     let result = retriever
         .retrieve("how to deploy the app?", &ctx())
         .await
         .unwrap();
 
-    let has_skill = result.hits.iter().any(|h| {
-        matches!(&h.content, ContentPayload::Abstract(s) if s.contains("docker"))
-    });
+    let has_skill = result
+        .hits
+        .iter()
+        .any(|h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("docker")));
     assert!(has_skill, "should find the docker deploy skill");
 }
 
 #[tokio::test]
 async fn retrieve_semantic_search_finds_preferences() {
     let store = Arc::new(seed_store().await);
-    let intent: Arc<dyn IntentAnalyzer> =
-        Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1"));
-    let reranker = Arc::new(ScoreReranker { keep: 10 });
-
-    let retriever = HierarchicalRetrieverImpl::new(store.clone(), intent, reranker);
+    let retriever = retriever(store.clone());
 
     let result = retriever
         .retrieve("what does the user prefer?", &ctx())
         .await
         .unwrap();
 
-    let has_pref = result.hits.iter().any(|h| {
-        matches!(&h.content, ContentPayload::Abstract(s) if s.contains("dark mode"))
-    });
+    let has_pref = result
+        .hits
+        .iter()
+        .any(|h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("dark mode")));
     assert!(has_pref, "should find the dark mode preference");
 }
 
 #[tokio::test]
 async fn retrieve_typed_calls_through_to_retrieve() {
     let store = Arc::new(seed_store().await);
-    let intent: Arc<dyn IntentAnalyzer> =
-        Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1"));
-    let reranker = Arc::new(ScoreReranker { keep: 10 });
+    let retriever = retriever(store.clone());
 
-    let retriever = HierarchicalRetrieverImpl::new(store.clone(), intent, reranker);
+    let result = retriever.retrieve("bug fix", &ctx()).await.unwrap();
 
-    // retrieve_typed 应该走完整管线（当前不过滤但不应报错）
-    let result = retriever
-        .retrieve_typed("bug fix", MemoryClass::Cases, &ctx())
-        .await
-        .unwrap();
-
-    let has_case = result.hits.iter().any(|h| {
-        matches!(&h.content, ContentPayload::Abstract(s) if s.contains("null pointer"))
-    });
+    let has_case = result
+        .hits
+        .iter()
+        .any(|h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("null pointer")));
     assert!(has_case, "should find the null pointer case");
 }
 
 #[tokio::test]
 async fn trace_is_populated_when_enabled() {
     let store = Arc::new(seed_store().await);
-    let intent: Arc<dyn IntentAnalyzer> =
-        Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1"));
-    let reranker = Arc::new(ScoreReranker { keep: 10 });
-
-    let retriever = HierarchicalRetrieverImpl::new(store.clone(), intent, reranker);
+    let retriever = retriever(store.clone());
 
     let result = retriever
         .retrieve("dark mode font preference", &ctx())
@@ -226,11 +222,7 @@ async fn trace_is_populated_when_enabled() {
 #[tokio::test]
 async fn empty_store_returns_empty_result() {
     let store = Arc::new(MemoryContextStore::new());
-    let intent: Arc<dyn IntentAnalyzer> =
-        Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1"));
-    let reranker = Arc::new(ScoreReranker { keep: 10 });
-
-    let retriever = HierarchicalRetrieverImpl::new(store.clone(), intent, reranker);
+    let retriever = retriever(store.clone());
 
     let result = retriever.retrieve("anything", &ctx()).await.unwrap();
     assert!(result.hits.is_empty());

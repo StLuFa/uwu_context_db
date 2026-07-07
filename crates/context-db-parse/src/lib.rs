@@ -117,7 +117,9 @@ mod tests {
         let d = DedupDecision {
             candidate: c,
             action: CandidateAction::Merge,
-            merge_target: Some(ContextUri::parse("uwu://t/user/u/memories/preferences/p1").unwrap()),
+            merge_target: Some(
+                ContextUri::parse("uwu://t/user/u/memories/preferences/p1").unwrap(),
+            ),
             reason: "same preference".into(),
         };
         assert_eq!(d.action, CandidateAction::Merge);

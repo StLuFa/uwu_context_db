@@ -179,8 +179,46 @@ pub fn context_db_migrations() -> Vec<SqlMigration> {
             CREATE TABLE IF NOT EXISTS version_commit_checkpoints (
                 commit_id       UUID PRIMARY KEY REFERENCES version_commits(id) ON DELETE CASCADE,
                 snapshot_json   JSONB NOT NULL,
-                created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                access_count    BIGINT NOT NULL DEFAULT 0
             );
+            CREATE INDEX IF NOT EXISTS idx_version_commit_checkpoints_heat
+                ON version_commit_checkpoints (last_accessed_at DESC, access_count DESC, created_at DESC);
+            "#,
+            None::<&str>,
+        ),
+        SqlMigration::new(
+            8,
+            "add_checkpoint_heat_columns",
+            r#"
+            ALTER TABLE version_commit_checkpoints
+                ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                ADD COLUMN IF NOT EXISTS access_count BIGINT NOT NULL DEFAULT 0;
+            CREATE INDEX IF NOT EXISTS idx_version_commit_checkpoints_heat
+                ON version_commit_checkpoints (last_accessed_at DESC, access_count DESC, created_at DESC);
+            "#,
+            None::<&str>,
+        ),
+        SqlMigration::new(
+            9,
+            "create_version_conflict_sessions",
+            r#"
+            CREATE TABLE IF NOT EXISTS version_conflict_sessions (
+                id             UUID PRIMARY KEY,
+                scope          TEXT NOT NULL,
+                operation_json JSONB NOT NULL,
+                session_json   JSONB NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'open',
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                finished_at    TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_version_conflict_sessions_scope_status
+                ON version_conflict_sessions (scope, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_version_conflict_sessions_open
+                ON version_conflict_sessions (updated_at DESC)
+                WHERE status = 'open';
             "#,
             None::<&str>,
         ),

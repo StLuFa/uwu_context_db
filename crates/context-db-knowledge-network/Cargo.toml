@@ -1,0 +1,17 @@
+[package]
+name = "agent-context-db-knowledge-network"
+version = "0.0.0"
+edition = "2024"
+description = "Privacy-preserving federated KnowledgeNetwork for context-db"
+
+[dependencies]
+agent-context-db-core = { path = "../context-db-core" }
+agent-context-db-marketplace-types = { path = "../context-db-marketplace-types" }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uwu_event_mesh = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }

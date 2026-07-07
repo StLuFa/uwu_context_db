@@ -38,14 +38,17 @@ pub struct CommunityDetector {
 }
 
 impl CommunityDetector {
-    pub fn new() -> Self { Self { min_agents: 2 } }
+    pub fn new() -> Self {
+        Self { min_agents: 2 }
+    }
 
     /// 从市场条目中检测社区。
     pub fn detect(&self, entries: &[MarketEntry]) -> Vec<Community> {
         // 构建 Agent-领域 共现图
         let mut agent_domains: HashMap<AgentId, HashSet<String>> = HashMap::new();
         for entry in entries {
-            agent_domains.entry(entry.publisher.clone())
+            agent_domains
+                .entry(entry.publisher.clone())
                 .or_default()
                 .insert(entry.domain.clone());
         }
@@ -54,20 +57,23 @@ impl CommunityDetector {
         let mut domain_agents: HashMap<String, Vec<AgentId>> = HashMap::new();
         for (agent, domains) in &agent_domains {
             for domain in domains {
-                domain_agents.entry(domain.clone()).or_default().push(agent.clone());
+                domain_agents
+                    .entry(domain.clone())
+                    .or_default()
+                    .push(agent.clone());
             }
         }
 
         // 过滤：领域内 Agent 数 ≥ min_agents
         let mut communities = Vec::new();
         for (domain, agents) in &domain_agents {
-            if agents.len() < self.min_agents { continue; }
+            if agents.len() < self.min_agents {
+                continue;
+            }
             let mut unique_agents = agents.clone();
             unique_agents.dedup();
 
-            let entry_count = entries.iter()
-                .filter(|e| e.domain == *domain)
-                .count();
+            let entry_count = entries.iter().filter(|e| e.domain == *domain).count();
 
             communities.push(Community {
                 id: format!("community-{}", domain),
@@ -81,7 +87,8 @@ impl CommunityDetector {
 
         // 找出桥梁条目（属于 ≥2 个社区的条目）
         for entry in entries {
-            let count = communities.iter()
+            let count = communities
+                .iter()
                 .filter(|c| c.domains.contains(&entry.domain))
                 .count();
             if count >= 2 {
@@ -113,7 +120,8 @@ impl SpeciationTracker {
 
     /// 记录一次命中。
     pub fn record_hit(&self, entry_id: MarketId, agent: AgentId) {
-        self.hit_distribution.write()
+        self.hit_distribution
+            .write()
             .entry(entry_id)
             .or_default()
             .entry(agent)
@@ -127,7 +135,9 @@ impl SpeciationTracker {
         let dist = self.hit_distribution.read();
         let hits = dist.get(entry_id)?;
         let total: usize = hits.values().sum();
-        if total < 10 { return None; }
+        if total < 10 {
+            return None;
+        }
 
         for (agent, count) in hits {
             let ratio = *count as f32 / total as f32;

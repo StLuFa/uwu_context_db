@@ -69,7 +69,10 @@ Return a JSON array of crystals:
 "#
         );
 
-        let response = self.llm.complete(&prompt, &LlmOpts::default()).await
+        let response = self
+            .llm
+            .complete(&prompt, &LlmOpts::default())
+            .await
             .map_err(|e| agent_context_db_core::ContextError::Storage(format!("distill: {e}")))?;
 
         #[derive(serde::Deserialize)]
@@ -82,14 +85,18 @@ Return a JSON array of crystals:
 
         let raw: Vec<RawCrystal> = serde_json::from_str(&response).unwrap_or_default();
 
-        Ok(raw.into_iter().enumerate().map(|(i, r)| KnowledgeCrystal {
-            id: format!("crystal-{}", i),
-            principle: r.principle,
-            evidence: experience_uris.to_vec(),
-            confidence: r.confidence,
-            preconditions: r.preconditions,
-            expected_outcome: r.expected_outcome,
-        }).collect())
+        Ok(raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| KnowledgeCrystal {
+                id: format!("crystal-{}", i),
+                principle: r.principle,
+                evidence: experience_uris.to_vec(),
+                confidence: r.confidence,
+                preconditions: r.preconditions,
+                expected_outcome: r.expected_outcome,
+            })
+            .collect())
     }
 }
 
@@ -126,7 +133,16 @@ impl<V: VersionStore> SelfHealer<V> {
         &self,
         scope: &ContextUri,
     ) -> std::result::Result<Vec<RepairAction>, crate::VersionError> {
-        let log = self.store.log(scope, &crate::LogOpts { max_count: Some(20), ..Default::default() }).await?;
+        let log = self
+            .store
+            .log(
+                scope,
+                &crate::LogOpts {
+                    max_count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await?;
         let mut actions = Vec::new();
 
         // 检测快速连续的回滚-重做循环（thrash）
@@ -169,13 +185,29 @@ impl<V: VersionStore> SelfHealer<V> {
         &self,
         scope: &ContextUri,
     ) -> std::result::Result<Vec<RepairAction>, crate::VersionError> {
-        let log = self.store.log(scope, &crate::LogOpts { max_count: Some(10), ..Default::default() }).await?;
+        let log = self
+            .store
+            .log(
+                scope,
+                &crate::LogOpts {
+                    max_count: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
-        let log_text: Vec<String> = log.iter().map(|c| {
-            format!("{} | adds:{} updates:{} deletes:{}",
-                c.message, c.metadata.changes.adds.len(),
-                c.metadata.changes.updates.len(), c.metadata.changes.deletes.len())
-        }).collect();
+        let log_text: Vec<String> = log
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} | adds:{} updates:{} deletes:{}",
+                    c.message,
+                    c.metadata.changes.adds.len(),
+                    c.metadata.changes.updates.len(),
+                    c.metadata.changes.deletes.len()
+                )
+            })
+            .collect();
 
         let prompt = format!(
             r#"Diagnose potential issues in this version history:
@@ -187,7 +219,10 @@ Return JSON array of repair actions:
             log_text.join("\n")
         );
 
-        let response = self.llm.complete(&prompt, &LlmOpts::default()).await
+        let response = self
+            .llm
+            .complete(&prompt, &LlmOpts::default())
+            .await
             .map_err(|e| crate::VersionError::Storage(format!("self-heal llm: {e}")))?;
 
         // 解析 LLM 建议的修复方案
@@ -222,7 +257,16 @@ impl<V: VersionStore> DreamConsolidator<V> {
         &self,
         scope: &ContextUri,
     ) -> std::result::Result<Vec<String>, crate::VersionError> {
-        let log = self.store.log(scope, &crate::LogOpts { max_count: Some(30), ..Default::default() }).await?;
+        let log = self
+            .store
+            .log(
+                scope,
+                &crate::LogOpts {
+                    max_count: Some(30),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         // 提取所有变更的 URI
         let mut changed_uris = Vec::new();
@@ -247,7 +291,11 @@ impl<V: VersionStore> DreamConsolidator<V> {
             if uris.len() < 3 {
                 // 低频聚类：仅记录统计信息
                 if uris.len() >= 2 {
-                    insights.push(format!("cluster '{}' with {} related changes", key, uris.len()));
+                    insights.push(format!(
+                        "cluster '{}' with {} related changes",
+                        key,
+                        uris.len()
+                    ));
                 }
                 continue;
             }
@@ -264,7 +312,11 @@ impl<V: VersionStore> DreamConsolidator<V> {
             }
 
             if summaries.is_empty() {
-                insights.push(format!("cluster '{}' with {} related changes (no content)", key, uris.len()));
+                insights.push(format!(
+                    "cluster '{}' with {} related changes (no content)",
+                    key,
+                    uris.len()
+                ));
                 continue;
             }
 
@@ -285,15 +337,27 @@ impl<V: VersionStore> DreamConsolidator<V> {
                 Ok(response) => {
                     let trimmed = response.trim().to_string();
                     if !trimmed.is_empty() {
-                        insights.push(format!("cluster '{key}' ({count} changes): {trimmed}",
-                            key = key, count = uris.len(), trimmed = trimmed));
+                        insights.push(format!(
+                            "cluster '{key}' ({count} changes): {trimmed}",
+                            key = key,
+                            count = uris.len(),
+                            trimmed = trimmed
+                        ));
                     } else {
-                        insights.push(format!("cluster '{}' with {} related changes", key, uris.len()));
+                        insights.push(format!(
+                            "cluster '{}' with {} related changes",
+                            key,
+                            uris.len()
+                        ));
                     }
                 }
                 Err(_) => {
                     // LLM 失败时降级为统计描述
-                    insights.push(format!("cluster '{}' with {} related changes", key, uris.len()));
+                    insights.push(format!(
+                        "cluster '{}' with {} related changes",
+                        key,
+                        uris.len()
+                    ));
                 }
             }
         }
@@ -330,7 +394,10 @@ pub struct CausalInference<V: VersionStore> {
 impl<V: VersionStore> CausalInference<V> {
     pub fn new(store: Arc<V>) -> Self {
         let temporal = TemporalReasoner::new(store.clone());
-        Self { store, _temporal: temporal }
+        Self {
+            store,
+            _temporal: temporal,
+        }
     }
 
     /// 检测一个 URI 的变更是否在统计上"导致"另一个 URI 的变更。
@@ -340,7 +407,16 @@ impl<V: VersionStore> CausalInference<V> {
         &self,
         scope: &ContextUri,
     ) -> std::result::Result<Vec<CausalHypothesis>, crate::VersionError> {
-        let log = self.store.log(scope, &crate::LogOpts { max_count: Some(100), ..Default::default() }).await?;
+        let log = self
+            .store
+            .log(
+                scope,
+                &crate::LogOpts {
+                    max_count: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         // 统计 URI 对的时序共现
         let mut pair_counts: HashMap<(String, String), (usize, usize)> = HashMap::new();
@@ -371,21 +447,27 @@ impl<V: VersionStore> CausalInference<V> {
             }
             let temporal_precedence = co_occurrence as f32 / total as f32;
             if temporal_precedence > 0.5 {
-                let (cause_uri, effect_uri) = match (ContextUri::parse(cause), ContextUri::parse(effect)) {
-                    (Ok(c), Ok(e)) => (c, e),
-                    _ => continue,
-                };
+                let (cause_uri, effect_uri) =
+                    match (ContextUri::parse(cause), ContextUri::parse(effect)) {
+                        (Ok(c), Ok(e)) => (c, e),
+                        _ => continue,
+                    };
                 hypotheses.push(CausalHypothesis {
                     cause_uri,
                     effect_uri,
                     temporal_precedence,
                     co_occurrence: co_occurrence as f32 / log.len().max(1) as f32,
-                    confidence: temporal_precedence * 0.7 + (co_occurrence as f32 / log.len().max(1) as f32) * 0.3,
+                    confidence: temporal_precedence * 0.7
+                        + (co_occurrence as f32 / log.len().max(1) as f32) * 0.3,
                 });
             }
         }
 
-        hypotheses.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        hypotheses.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(hypotheses)
     }
@@ -474,21 +556,25 @@ mod tests {
     #[test]
     fn causal_hypothesis_sorts_by_confidence() {
         let h1 = CausalHypothesis {
-            cause_uri: ContextUri("a".into()),
-            effect_uri: ContextUri("b".into()),
+            cause_uri: ContextUri::parse("uwu://t/agent/a/memories/events/cause-a").unwrap(),
+            effect_uri: ContextUri::parse("uwu://t/agent/a/memories/events/effect-b").unwrap(),
             temporal_precedence: 0.8,
             co_occurrence: 0.5,
             confidence: 0.71,
         };
         let h2 = CausalHypothesis {
-            cause_uri: ContextUri("c".into()),
-            effect_uri: ContextUri("d".into()),
+            cause_uri: ContextUri::parse("uwu://t/agent/a/memories/events/cause-c").unwrap(),
+            effect_uri: ContextUri::parse("uwu://t/agent/a/memories/events/effect-d").unwrap(),
             temporal_precedence: 0.3,
             co_occurrence: 0.1,
             confidence: 0.24,
         };
         let mut v = vec![h2, h1];
-        v.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         assert!(v[0].confidence > v[1].confidence);
     }
 }

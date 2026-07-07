@@ -33,7 +33,9 @@ pub struct CrdtMerger {
 
 impl CrdtMerger {
     pub fn new(node_id: impl Into<String>) -> Self {
-        Self { node_id: node_id.into() }
+        Self {
+            node_id: node_id.into(),
+        }
     }
 
     /// 判断两个条目是否可以 CRDT 合并（仅 mergeable 类型）。
@@ -56,9 +58,7 @@ impl CrdtMerger {
             MemoryClass::Profile | MemoryClass::Preferences => {
                 self.merge_lww(uri, entry_a, clock_a, entry_b, clock_b)
             }
-            _ => {
-                self.merge_set_union(uri, entry_a, entry_b)
-            }
+            _ => self.merge_set_union(uri, entry_a, entry_b),
         };
 
         CrdtMergeResult {
@@ -98,8 +98,7 @@ impl CrdtMerger {
 
         let mut merged = a.clone();
         merged.uri = uri.clone();
-        merged.mvcc_version =
-            agent_context_db_core::MvccVersion(clock_a.max(clock_b) + 1);
+        merged.mvcc_version = agent_context_db_core::MvccVersion(clock_a.max(clock_b) + 1);
         // 将合并文本写入 payload
         merged.payload = agent_context_db_core::ContentPayload::Text {
             sparse: merged_text.clone(),
@@ -130,10 +129,7 @@ impl CrdtMerger {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let mut all = items_a
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
+        let mut all = items_a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for item in items_b {
             if !all.iter().any(|x| x == item) {
                 all.push(item.to_string());
@@ -143,9 +139,8 @@ impl CrdtMerger {
         let merged_text = all.join("; ");
         let mut merged = a.clone();
         merged.uri = uri.clone();
-        merged.mvcc_version = agent_context_db_core::MvccVersion(
-            a.mvcc_version.0.max(b.mvcc_version.0) + 1,
-        );
+        merged.mvcc_version =
+            agent_context_db_core::MvccVersion(a.mvcc_version.0.max(b.mvcc_version.0) + 1);
         merged.payload = agent_context_db_core::ContentPayload::Text {
             sparse: merged_text.clone(),
             dense: merged_text.clone(),
@@ -191,13 +186,22 @@ mod tests {
         let merger = CrdtMerger::new("agent-a");
         let uri = ContextUri::parse("uwu://t1/agent/a/memories/preferences/p1").unwrap();
 
-        let mut a = entry("uwu://t1/agent/a/memories/preferences/p1", "theme: dark; lang: en");
-        let mut b = entry("uwu://t1/agent/a/memories/preferences/p1", "theme: light; lang: zh");
+        let mut a = entry(
+            "uwu://t1/agent/a/memories/preferences/p1",
+            "theme: dark; lang: en",
+        );
+        let mut b = entry(
+            "uwu://t1/agent/a/memories/preferences/p1",
+            "theme: light; lang: zh",
+        );
         a.mvcc_version = agent_context_db_core::MvccVersion(1);
         b.mvcc_version = agent_context_db_core::MvccVersion(5); // b wins
 
         let result = merger.merge(&uri, MemoryClass::Preferences, &a, &b);
-        assert!(result.merged.l0_abstract.contains("theme: light"));
+        assert!(matches!(
+            &result.merged.payload,
+            agent_context_db_core::ContentPayload::Text { sparse, .. } if sparse.contains("theme: light")
+        ));
         assert_eq!(result.strategy, CrdtStrategy::LwwKeyValue);
     }
 
@@ -211,8 +215,14 @@ mod tests {
 
         let result = merger.merge(&uri, MemoryClass::Skills, &a, &b);
         // docker; git; kubernetes — git 去重
-        assert!(result.merged.l0_abstract.contains("docker"));
-        assert!(result.merged.l0_abstract.contains("kubernetes"));
+        assert!(matches!(
+            &result.merged.payload,
+            agent_context_db_core::ContentPayload::Text { sparse, .. } if sparse.contains("docker")
+        ));
+        assert!(matches!(
+            &result.merged.payload,
+            agent_context_db_core::ContentPayload::Text { sparse, .. } if sparse.contains("kubernetes")
+        ));
         assert_eq!(result.strategy, CrdtStrategy::SetUnion);
     }
 

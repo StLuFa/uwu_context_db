@@ -5,8 +5,8 @@
 use agent_context_db_core::{ContentLevel, ContextEntry, ContextUri, TenantId};
 use agent_context_db_testkit::MemoryVersionStore;
 use agent_context_db_version::{
-    AsOfTime, BranchName, BranchType, ChangeSet, CommitMeta, CommitTrigger, LogOpts,
-    MergeStrategy, UriChange, VersionRef, VersionStore,
+    AsOfTime, BranchName, BranchType, ChangeSet, CommitMeta, CommitTrigger, LogOpts, MergeStrategy,
+    UriChange, VersionRef, VersionStore,
 };
 
 fn scope() -> ContextUri {
@@ -41,7 +41,11 @@ async fn m2_acceptance_fork_rewrite_rollback() {
         )
         .await
         .unwrap();
-    store.put_entry_version(&baseline, &state_uri, &entry(&state_uri, "{\"mood\": \"neutral\"}"));
+    store.put_entry_version(
+        &baseline,
+        &state_uri,
+        &entry(&state_uri, "{\"mood\": \"neutral\"}"),
+    );
 
     // 创建 main 分支
     let main = BranchName::new("main");
@@ -79,21 +83,37 @@ async fn m2_acceptance_fork_rewrite_rollback() {
         )
         .await
         .unwrap();
-    store.put_entry_version(&fork_commit, &state_uri, &entry(&state_uri, "{\"mood\": \"happy\"}"));
+    store.put_entry_version(
+        &fork_commit,
+        &state_uri,
+        &entry(&state_uri, "{\"mood\": \"happy\"}"),
+    );
 
     // 4. 验证时间旅行：baseline 时能读到 v1
     let v1 = store
-        .read_at(&state_uri, VersionRef::Commit(baseline.clone()), ContentLevel::L0)
+        .read_at(
+            &state_uri,
+            VersionRef::Commit(baseline.clone()),
+            ContentLevel::L0,
+        )
         .await
         .unwrap();
-    assert!(matches!(&v1, agent_context_db_core::ContentPayload::Abstract(s) if s.contains("neutral")));
+    assert!(
+        matches!(&v1, agent_context_db_core::ContentPayload::Text { sparse, .. } if sparse.contains("neutral"))
+    );
 
     // 5. 验证 fork commit 时能读到 v2
     let v2 = store
-        .read_at(&state_uri, VersionRef::Commit(fork_commit.clone()), ContentLevel::L0)
+        .read_at(
+            &state_uri,
+            VersionRef::Commit(fork_commit.clone()),
+            ContentLevel::L0,
+        )
         .await
         .unwrap();
-    assert!(matches!(&v2, agent_context_db_core::ContentPayload::Abstract(s) if s.contains("happy")));
+    assert!(
+        matches!(&v2, agent_context_db_core::ContentPayload::Text { sparse, .. } if sparse.contains("happy"))
+    );
 
     // 6. FastForward merge fork into main
     let result = store
@@ -104,15 +124,31 @@ async fn m2_acceptance_fork_rewrite_rollback() {
     assert!(result.conflicts.is_empty());
 
     // 7. diff: baseline → fork_commit
-    let diff = store.diff_commits(&s, &baseline, &fork_commit).await.unwrap();
-    assert!(diff.updates.contains(&state_uri), "state_uri should be in diff updates");
+    let diff = store
+        .diff_commits(&s, &baseline, &fork_commit)
+        .await
+        .unwrap();
+    assert!(
+        diff.updates.contains(&state_uri),
+        "state_uri should be in diff updates"
+    );
 
     // 8. log: 历史包含两个 commit
     let log = store
-        .log(&s, &LogOpts { max_count: Some(10), branch: Some(main) })
+        .log(
+            &s,
+            &LogOpts {
+                max_count: Some(10),
+                branch: Some(main),
+            },
+        )
         .await
         .unwrap();
-    assert!(log.len() >= 2, "log should have at least 2 commits, got {}", log.len());
+    assert!(
+        log.len() >= 2,
+        "log should have at least 2 commits, got {}",
+        log.len()
+    );
 }
 
 // ── 时间旅行：按时间戳读取 ──────────────────────────────────────────
@@ -130,10 +166,16 @@ async fn asof_read_by_timestamp_finds_prior_commit() {
     store.put_entry_version(&c1, &uri, &entry(&uri, "event: first deploy"));
 
     let payload = store
-        .asof_read(&uri, AsOfTime::Timestamp(chrono::Utc::now()), ContentLevel::L0)
+        .asof_read(
+            &uri,
+            AsOfTime::Timestamp(chrono::Utc::now()),
+            ContentLevel::L0,
+        )
         .await
         .unwrap();
-    assert!(matches!(payload, agent_context_db_core::ContentPayload::Abstract(s) if s.contains("first deploy")));
+    assert!(
+        matches!(payload, agent_context_db_core::ContentPayload::Text { sparse, .. } if sparse.contains("first deploy"))
+    );
 }
 
 // ── 三路合并（分歧场景）─────────────────────────────────────────────
@@ -154,19 +196,33 @@ async fn three_way_merge_on_divergent_branches() {
 
     let a = BranchName::new("a");
     let b = BranchName::new("b");
-    store.create_branch(&s, a.clone(), c_a, BranchType::Experiment).await.unwrap();
-    store.create_branch(&s, b.clone(), c_b, BranchType::Experiment).await.unwrap();
+    store
+        .create_branch(&s, a.clone(), c_a, BranchType::Experiment)
+        .await
+        .unwrap();
+    store
+        .create_branch(&s, b.clone(), c_b, BranchType::Experiment)
+        .await
+        .unwrap();
 
     // FastForward 应拒绝（分歧）
-    assert!(store.merge(&s, &a, &b, MergeStrategy::FastForward).await.is_err());
+    assert!(
+        store
+            .merge(&s, &a, &b, MergeStrategy::FastForward)
+            .await
+            .is_err()
+    );
 
     // ThreeWay 应创建 merge commit（2 parents，无冲突）
-    let result = store.merge(&s, &a, &b, MergeStrategy::ThreeWay).await.unwrap();
+    let result = store
+        .merge(&s, &a, &b, MergeStrategy::ThreeWay)
+        .await
+        .unwrap();
     assert!(result.conflicts.is_empty());
 
     // 验证 B 的 HEAD 已被 merge commit 取代
     let branches = store.list_branches(&s).await.unwrap();
-    let b_branch = branches.iter().find(|br| br.name.0 == "b").unwrap();
+    let b_branch = branches.iter().find(|br| br.name.as_str() == "b").unwrap();
     assert_eq!(b_branch.head, result.commit);
 }
 
@@ -177,19 +233,32 @@ async fn create_and_list_tags() {
     let store = MemoryVersionStore::new();
     let s = scope();
 
-    let c1 = store.commit(&s, ChangeSet::default(), CommitMeta::default()).await.unwrap();
+    let c1 = store
+        .commit(&s, ChangeSet::default(), CommitMeta::default())
+        .await
+        .unwrap();
 
-    store.create_tag(&s, agent_context_db_version::Tag {
-        name: agent_context_db_version::TagName::new("stable"),
-        target: c1.clone(),
-        tag_type: agent_context_db_version::TagType::Mutable,
-        message: "first stable".into(),
-        created_by: agent_context_db_version::Author { agent_id: None, user_id: None, system: true },
-        created_at: chrono::Utc::now(),
-    }).await.unwrap();
+    store
+        .create_tag(
+            &s,
+            agent_context_db_version::Tag {
+                name: agent_context_db_version::TagName::new("stable"),
+                target: c1.clone(),
+                tag_type: agent_context_db_version::TagType::Mutable,
+                message: "first stable".into(),
+                created_by: agent_context_db_version::Author {
+                    agent_id: None,
+                    user_id: None,
+                    system: true,
+                },
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
     let tags = store.list_tags(&s).await.unwrap();
     assert_eq!(tags.len(), 1);
-    assert_eq!(tags[0].name.0, "stable");
+    assert_eq!(tags[0].name.as_str(), "stable");
     assert_eq!(tags[0].target, c1);
 }

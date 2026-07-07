@@ -38,12 +38,18 @@ pub struct SocialVoter {
 
 impl SocialVoter {
     pub fn new() -> Self {
-        Self { votes: parking_lot::RwLock::new(HashMap::new()) }
+        Self {
+            votes: parking_lot::RwLock::new(HashMap::new()),
+        }
     }
 
     /// 投一票。
     pub fn vote(&self, vote: Vote) {
-        self.votes.write().entry(vote.entry_id).or_default().push(vote);
+        self.votes
+            .write()
+            .entry(vote.entry_id)
+            .or_default()
+            .push(vote);
     }
 
     /// 统计票数。
@@ -75,7 +81,9 @@ impl SocialVoter {
     pub fn consensus_factor(&self, entry_id: &MarketId) -> f32 {
         let tally = self.tally(entry_id);
         let total = tally.upvotes + tally.downvotes;
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         let p = tally.upvotes as f32 / total as f32;
         1.0 - 2.0 * (p - 0.5).abs() // 0=完全有争议, 1=高度共识
     }

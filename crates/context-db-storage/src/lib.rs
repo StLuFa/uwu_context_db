@@ -22,7 +22,9 @@ pub mod vector_index;
 pub use agent_context_db_core::{IndexHit, IndexPoint, VectorIndex};
 
 pub use migrations::context_db_migrations;
-pub use perf::{BatchWriteBuffer, DedupStore, WalEntry, WriteAheadLogger, compress, content_hash, decompress};
+pub use perf::{
+    BatchWriteBuffer, DedupStore, WalEntry, WriteAheadLogger, compress, content_hash, decompress,
+};
 pub use pg::PgContextStore;
 pub use pg_version::PgVersionStore;
 pub use vector_index::UwuVectorIndex;
@@ -94,12 +96,9 @@ pub async fn service_from_uwu_db(
     for m in context_db_migrations() {
         migrator = migrator.add(m);
     }
-    migrator
-        .up(&db.pool)
-        .await
-        .map_err(|e| agent_context_db_core::ContextError::Storage(format!(
-            "migration failed: {e}"
-        )))?;
+    migrator.up(&db.pool).await.map_err(|e| {
+        agent_context_db_core::ContextError::Storage(format!("migration failed: {e}"))
+    })?;
 
     // 2. 构造内容层适配器
     let content = Arc::new(PgContextStore::new(Arc::new(db.pool)));
@@ -121,9 +120,15 @@ struct NoopVectorIndex {
 }
 
 impl NoopVectorIndex {
-    fn new() -> Self { Self { warned: std::sync::OnceLock::new() } }
+    fn new() -> Self {
+        Self {
+            warned: std::sync::OnceLock::new(),
+        }
+    }
     fn warn_once(&self, msg: &str) {
-        self.warned.get_or_init(|| { tracing::warn!("{msg}"); });
+        self.warned.get_or_init(|| {
+            tracing::warn!("{msg}");
+        });
     }
 }
 
@@ -134,12 +139,20 @@ impl VectorIndex for NoopVectorIndex {
         Ok(())
     }
     async fn search(
-        &self, _collection: &str, _query: Vec<f32>, _top_k: usize, _filter: Option<serde_json::Value>,
+        &self,
+        _collection: &str,
+        _query: Vec<f32>,
+        _top_k: usize,
+        _filter: Option<serde_json::Value>,
     ) -> Result<Vec<IndexHit>> {
         self.warn_once("NoopVectorIndex: no vector backend configured — operations are no-ops");
         Ok(vec![])
     }
-    async fn delete(&self, _collection: &str, _uri: &agent_context_db_core::ContextUri) -> Result<()> {
+    async fn delete(
+        &self,
+        _collection: &str,
+        _uri: &agent_context_db_core::ContextUri,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -151,11 +164,11 @@ impl VectorIndex for NoopVectorIndex {
 #[cfg(test)]
 mod pg_tests {
     use super::*;
+    use uwu_database::Database;
     use uwu_database::config::{
         CacheBackend, CacheConfig, DbConfig, DeployConfig, RuntimeConfig, SqlBackend,
         VectorBackend, VectorConfig,
     };
-    use uwu_database::Database;
 
     fn pg_url() -> Option<String> {
         std::env::var("DATABASE_URL").ok()
@@ -226,7 +239,8 @@ mod pg_tests {
 
         // 验证 NoopVectorIndex 也可正常使用
         let idx = svc2.vector_index();
-        idx.delete("nonexistent", "x").await.unwrap();
+        let uri = agent_context_db_core::ContextUri::parse("uwu://memory/test/noop").unwrap();
+        idx.delete("nonexistent", &uri).await.unwrap();
         let results = idx.search("nonexistent", vec![1.0], 5, None).await.unwrap();
         assert!(results.is_empty());
     }

@@ -47,8 +47,12 @@ impl Perspective {
         match self {
             Perspective::Causal => "Analyze the causal relationships: what causes what, and why?",
             Perspective::Temporal => "Trace the temporal evolution: how did this change over time?",
-            Perspective::Comparative => "Compare and contrast: what are the similarities and differences?",
-            Perspective::Counterexample => "Find counterexamples: under what conditions does this NOT hold?",
+            Perspective::Comparative => {
+                "Compare and contrast: what are the similarities and differences?"
+            }
+            Perspective::Counterexample => {
+                "Find counterexamples: under what conditions does this NOT hold?"
+            }
         }
     }
 }
@@ -133,8 +137,8 @@ impl MultiPerspectiveConsolidator {
         let synthesized = self.synthesize(topic, &views, &gaps);
 
         // 4. 计算综合置信度
-        let overall_confidence = views.iter().map(|v| v.confidence).sum::<f32>()
-            / views.len().max(1) as f32;
+        let overall_confidence =
+            views.iter().map(|v| v.confidence).sum::<f32>() / views.len().max(1) as f32;
 
         MultiPerspectiveProduct {
             topic_uri: topic_uri.clone(),
@@ -154,10 +158,8 @@ impl MultiPerspectiveConsolidator {
         topic: &str,
         evidence: &[ContextEntry],
     ) -> PerspectiveView {
-        let content_summaries: Vec<String> = evidence
-            .iter()
-            .map(|e| e.l0_text().to_string())
-            .collect();
+        let content_summaries: Vec<String> =
+            evidence.iter().map(|e| e.l0_text().to_string()).collect();
 
         let summary = format!(
             "[{} perspective on '{}']: analyzed {} evidence items",
@@ -171,7 +173,10 @@ impl MultiPerspectiveConsolidator {
             0.1
         } else {
             (evidence.len() as f32 / 5.0).min(1.0) * 0.7
-                + content_summaries.iter().map(|s| (s.len() as f32 / 500.0).min(1.0)).sum::<f32>()
+                + content_summaries
+                    .iter()
+                    .map(|s| (s.len() as f32 / 500.0).min(1.0))
+                    .sum::<f32>()
                     / evidence.len().max(1) as f32
                     * 0.3
         };
@@ -207,10 +212,7 @@ impl MultiPerspectiveConsolidator {
                     description: gap_text.clone(),
                     severity: 1.0 - view.confidence,
                     source_perspective: view.perspective,
-                    suggested_exploration: format!(
-                        "explore '{}' from additional angles",
-                        gap_text
-                    ),
+                    suggested_exploration: format!("explore '{}' from additional angles", gap_text),
                 });
             }
         }
@@ -245,12 +247,7 @@ impl MultiPerspectiveConsolidator {
     }
 
     /// 多视角合成 — 从多个视角结果生成统一摘要。
-    fn synthesize(
-        &self,
-        topic: &str,
-        views: &[PerspectiveView],
-        gaps: &[KnowledgeGap],
-    ) -> String {
+    fn synthesize(&self, topic: &str, views: &[PerspectiveView], gaps: &[KnowledgeGap]) -> String {
         let mut synthesis = format!("# Multi-Perspective Analysis: {topic}\n\n");
 
         // 各视角摘要
@@ -286,8 +283,7 @@ impl MultiPerspectiveConsolidator {
         }
 
         // 综合判断
-        let avg_conf = views.iter().map(|v| v.confidence).sum::<f32>()
-            / views.len().max(1) as f32;
+        let avg_conf = views.iter().map(|v| v.confidence).sum::<f32>() / views.len().max(1) as f32;
         synthesis.push_str(&format!(
             "## Synthesis\nOverall confidence: {avg_conf:.2} across {} perspectives\n",
             views.len()
@@ -307,13 +303,11 @@ mod tests {
         assert_eq!(all.len(), 4);
     }
 
-    #[test]
-    fn consolidator_basic() {
+    #[tokio::test]
+    async fn consolidator_basic() {
         let consolidator = MultiPerspectiveConsolidator::new();
         let uri = ContextUri::parse("uwu://t/a/x/fact/test").unwrap();
-        let product = futures::executor::block_on(
-            consolidator.consolidate(&uri, "test topic", &[])
-        );
+        let product = consolidator.consolidate(&uri, "test topic", &[]).await;
         assert_eq!(product.views.len(), 4);
         assert!(product.overall_confidence < 0.5); // 无证据 → 低置信度
     }

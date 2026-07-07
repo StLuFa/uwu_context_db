@@ -5,9 +5,7 @@
 use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, LlmClient, LlmOpts};
 use std::sync::Arc;
 
-use crate::{
-    AsOfTime, CommitId, LogOpts, VersionError, VersionStore,
-};
+use crate::{AsOfTime, CommitId, LogOpts, VersionError, VersionStore};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // F24 版本差异推理
@@ -116,9 +114,11 @@ Return a JSON object with:
             ..Default::default()
         };
 
-        let response = self.llm.complete(&prompt, &opts).await.map_err(|e| {
-            VersionError::Storage(format!("diff reasoner llm: {e}"))
-        })?;
+        let response = self
+            .llm
+            .complete(&prompt, &opts)
+            .await
+            .map_err(|e| VersionError::Storage(format!("diff reasoner llm: {e}")))?;
 
         #[derive(serde::Deserialize)]
         struct RawDiff {
@@ -143,10 +143,19 @@ Return a JSON object with:
         }
 
         let raw: RawDiff = serde_json::from_str(&response).unwrap_or_else(|_| RawDiff {
-            summary: format!("{} additions, {} updates, {} deletions",
-                tree_diff.adds.len(), tree_diff.updates.len(), tree_diff.deletes.len()),
+            summary: format!(
+                "{} additions, {} updates, {} deletions",
+                tree_diff.adds.len(),
+                tree_diff.updates.len(),
+                tree_diff.deletes.len()
+            ),
             change_type: "additive".into(),
-            impact: RawImpact { direct: 0, transitive: 0, reindex: false, notify: false },
+            impact: RawImpact {
+                direct: 0,
+                transitive: 0,
+                reindex: false,
+                notify: false,
+            },
             changes: vec![],
         });
 
@@ -165,18 +174,24 @@ Return a JSON object with:
                 reindex_required: raw.impact.reindex,
                 notify_required: raw.impact.notify,
             },
-            details: raw.changes.into_iter().filter_map(|c| Some(SemanticChange {
-                uri: ContextUri::parse(c.uri).ok()?,
-                description: c.description,
-                category: match c.category.as_str() {
-                    "relation" => ChangeCategory::RelationChange,
-                    "state" => ChangeCategory::StateTransition,
-                    "skill" => ChangeCategory::SkillRefinement,
-                    "memory" => ChangeCategory::MemoryConsolidation,
-                    _ => ChangeCategory::FactUpdate,
-                },
-                magnitude: c.magnitude,
-            })).collect(),
+            details: raw
+                .changes
+                .into_iter()
+                .filter_map(|c| {
+                    Some(SemanticChange {
+                        uri: ContextUri::parse(c.uri).ok()?,
+                        description: c.description,
+                        category: match c.category.as_str() {
+                            "relation" => ChangeCategory::RelationChange,
+                            "state" => ChangeCategory::StateTransition,
+                            "skill" => ChangeCategory::SkillRefinement,
+                            "memory" => ChangeCategory::MemoryConsolidation,
+                            _ => ChangeCategory::FactUpdate,
+                        },
+                        magnitude: c.magnitude,
+                    })
+                })
+                .collect(),
         })
     }
 }
@@ -224,7 +239,16 @@ impl<V: VersionStore> TemporalReasoner<V> {
         from: AsOfTime,
         to: AsOfTime,
     ) -> std::result::Result<Vec<TimelineEvent>, VersionError> {
-        let log = self.store.log(scope, &LogOpts { max_count: Some(50), ..Default::default() }).await?;
+        let log = self
+            .store
+            .log(
+                scope,
+                &LogOpts {
+                    max_count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         let mut events = Vec::new();
         for commit in log {
@@ -241,8 +265,15 @@ impl<V: VersionStore> TemporalReasoner<V> {
 
             let entries = vec![
                 commit.metadata.changes.adds.clone(),
-                commit.metadata.changes.updates.iter().map(|u| u.uri.clone()).collect(),
-            ].concat();
+                commit
+                    .metadata
+                    .changes
+                    .updates
+                    .iter()
+                    .map(|u| u.uri.clone())
+                    .collect(),
+            ]
+            .concat();
 
             events.push(TimelineEvent {
                 timestamp: commit.timestamp,
@@ -263,7 +294,16 @@ impl<V: VersionStore> TemporalReasoner<V> {
         scope: &ContextUri,
         min_occurrences: usize,
     ) -> std::result::Result<Vec<(ContextUri, usize)>, VersionError> {
-        let log = self.store.log(scope, &LogOpts { max_count: Some(100), ..Default::default() }).await?;
+        let log = self
+            .store
+            .log(
+                scope,
+                &LogOpts {
+                    max_count: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for commit in log {

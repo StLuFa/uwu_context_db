@@ -30,7 +30,12 @@ pub struct QueryParams {
 
 impl Default for QueryParams {
     fn default() -> Self {
-        Self { as_of: None, level: None, branch: None, limit: None }
+        Self {
+            as_of: None,
+            level: None,
+            branch: None,
+            limit: None,
+        }
     }
 }
 
@@ -71,11 +76,16 @@ mod uri_serde {
     use super::*;
     use serde::{Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(inner: &Arc<UriInner>, s: S) -> std::result::Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        inner: &Arc<UriInner>,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         s.serialize_str(&inner.canonical)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Arc<UriInner>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Arc<UriInner>, D::Error> {
         let s = String::deserialize(d)?;
         let inner = UriInner::from_string(&s).map_err(serde::de::Error::custom)?;
         Ok(Arc::new(inner))
@@ -85,7 +95,9 @@ mod uri_serde {
 impl UriInner {
     fn from_string(s: &str) -> Result<Self> {
         if !s.starts_with(SCHEME) {
-            return Err(ContextError::InvalidUri(format!("missing `{SCHEME}` scheme: {s}")));
+            return Err(ContextError::InvalidUri(format!(
+                "missing `{SCHEME}` scheme: {s}"
+            )));
         }
         let rest = &s[SCHEME.len()..];
         if rest.is_empty() {
@@ -113,7 +125,12 @@ impl UriInner {
         // Parse query parameters
         let query = query_str.and_then(|qs| parse_query_string(qs));
 
-        Ok(Self { tenant, path, query, canonical: s.to_string() })
+        Ok(Self {
+            tenant,
+            path,
+            query,
+            canonical: s.to_string(),
+        })
     }
 }
 
@@ -254,7 +271,12 @@ impl ContextUri {
 
     /// 返回带查询参数的 URI（不可变更新）。
     pub fn with_query(&self, query: QueryParams) -> Self {
-        let base = self.0.canonical.split('?').next().unwrap_or(&self.0.canonical);
+        let base = self
+            .0
+            .canonical
+            .split('?')
+            .next()
+            .unwrap_or(&self.0.canonical);
         let canonical = format!("{}?{}", base, query_to_string(&query));
         let inner = UriInner {
             tenant: self.0.tenant.clone(),
@@ -270,7 +292,12 @@ impl ContextUri {
         if self.0.query.is_none() {
             return self.clone();
         }
-        let base = self.0.canonical.split('?').next().unwrap_or(&self.0.canonical);
+        let base = self
+            .0
+            .canonical
+            .split('?')
+            .next()
+            .unwrap_or(&self.0.canonical);
         ContextUri::parse(base).unwrap_or_else(|_| self.clone())
     }
 

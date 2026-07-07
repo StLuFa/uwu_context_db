@@ -30,7 +30,9 @@ pub trait ContentRepo: Send + Sync {
     /// D.1: 批量写入 — 默认逐条 write，后端可 override 用 UNNEST 优化。
     async fn batch_write(&self, entries: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
         let mut versions = Vec::with_capacity(entries.len());
-        for entry in entries { versions.push(self.write(entry.clone()).await?); }
+        for entry in entries {
+            versions.push(self.write(entry.clone()).await?);
+        }
         Ok(versions)
     }
 }
@@ -81,9 +83,14 @@ pub trait BrowsingOps: Send + Sync {
 /// 图存储（新增）。
 #[async_trait]
 pub trait GraphStore: Send + Sync {
-    async fn add_edge(&self, from: &ContextUri, to: &ContextUri, kind: GraphRelation) -> Result<()>;
+    async fn add_edge(&self, from: &ContextUri, to: &ContextUri, kind: GraphRelation)
+    -> Result<()>;
     async fn remove_edge(&self, from: &ContextUri, to: &ContextUri) -> Result<()>;
-    async fn neighbors(&self, uri: &ContextUri, kind: Option<GraphRelation>) -> Result<Vec<ContextUri>>;
+    async fn neighbors(
+        &self,
+        uri: &ContextUri,
+        kind: Option<GraphRelation>,
+    ) -> Result<Vec<ContextUri>>;
     async fn batch_traverse(
         &self,
         seeds: &[ContextUri],

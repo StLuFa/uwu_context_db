@@ -31,7 +31,10 @@ pub enum Resolution {
     /// 保留 B，让 A 过期。
     KeepB { reason: String },
     /// 两者合并。
-    Fuse { merged_content: String, reason: String },
+    Fuse {
+        merged_content: String,
+        reason: String,
+    },
     /// 交由人工审议。
     DeferToHuman { reason: String },
     /// 两者都保留（不同上下文适用）。
@@ -56,15 +59,23 @@ impl ConflictResolver {
     /// 检测两个条目是否存在冲突。
     pub fn detect(&self, a: &MarketEntry, b: &MarketEntry) -> Option<MarketConflict> {
         // 只检测同领域、同类型的条目
-        if a.domain != b.domain { return None; }
-        if a.entry_type != b.entry_type { return None; }
+        if a.domain != b.domain {
+            return None;
+        }
+        if a.entry_type != b.entry_type {
+            return None;
+        }
 
         // Jaccard 重叠度
         let words_a: std::collections::HashSet<&str> = a.principle.split_whitespace().collect();
         let words_b: std::collections::HashSet<&str> = b.principle.split_whitespace().collect();
         let intersection = words_a.intersection(&words_b).count();
         let union = words_a.union(&words_b).count();
-        let jaccard = if union > 0 { intersection as f32 / union as f32 } else { 0.0 };
+        let jaccard = if union > 0 {
+            intersection as f32 / union as f32
+        } else {
+            0.0
+        };
 
         // 高重叠度 + 低置信度 → 可能是重复
         if jaccard > 0.8 {
@@ -130,12 +141,18 @@ impl ConflictResolver {
         // 2. 如果一方显著优势 → 直接裁决
         if a_corrob > b_corrob * 2 && a_quality > b_quality + 0.2 {
             return Resolution::KeepA {
-                reason: format!("{} corroborators vs {}, quality {:.2} vs {:.2}", a_corrob, b_corrob, a_quality, b_quality),
+                reason: format!(
+                    "{} corroborators vs {}, quality {:.2} vs {:.2}",
+                    a_corrob, b_corrob, a_quality, b_quality
+                ),
             };
         }
         if b_corrob > a_corrob * 2 && b_quality > a_quality + 0.2 {
             return Resolution::KeepB {
-                reason: format!("{} corroborators vs {}, quality {:.2} vs {:.2}", b_corrob, a_corrob, b_quality, a_quality),
+                reason: format!(
+                    "{} corroborators vs {}, quality {:.2} vs {:.2}",
+                    b_corrob, a_corrob, b_quality, a_quality
+                ),
             };
         }
 
@@ -154,19 +171,48 @@ Conflict type: {:?}
 
 Respond with JSON:
 {{"resolution": "keep_a"|"keep_b"|"fuse"|"defer"|"keep_both", "reason": "...", "merged": "..."}}"#,
-                a.publisher, a.principle, a_evidence, a_corrob, a_quality,
-                b.publisher, b.principle, b_evidence, b_corrob, b_quality,
+                a.publisher,
+                a.principle,
+                a_evidence,
+                a_corrob,
+                a_quality,
+                b.publisher,
+                b.principle,
+                b_evidence,
+                b_corrob,
+                b_quality,
                 conflict.conflict_type,
             );
 
-            if let Ok(response) = llm.complete(&prompt, &LlmOpts { max_tokens: Some(512), temperature: Some(0.0), ..Default::default() }).await {
+            if let Ok(response) = llm
+                .complete(
+                    &prompt,
+                    &LlmOpts {
+                        max_tokens: Some(512),
+                        temperature: Some(0.0),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
                     return match json["resolution"].as_str() {
-                        Some("keep_a") => Resolution::KeepA { reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into() },
-                        Some("keep_b") => Resolution::KeepB { reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into() },
-                        Some("fuse") => Resolution::Fuse { merged_content: json["merged"].as_str().unwrap_or("").into(), reason: json["reason"].as_str().unwrap_or("").into() },
-                        Some("keep_both") => Resolution::KeepBoth { reason: json["reason"].as_str().unwrap_or("").into() },
-                        _ => Resolution::DeferToHuman { reason: "LLM response unclear".into() },
+                        Some("keep_a") => Resolution::KeepA {
+                            reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into(),
+                        },
+                        Some("keep_b") => Resolution::KeepB {
+                            reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into(),
+                        },
+                        Some("fuse") => Resolution::Fuse {
+                            merged_content: json["merged"].as_str().unwrap_or("").into(),
+                            reason: json["reason"].as_str().unwrap_or("").into(),
+                        },
+                        Some("keep_both") => Resolution::KeepBoth {
+                            reason: json["reason"].as_str().unwrap_or("").into(),
+                        },
+                        _ => Resolution::DeferToHuman {
+                            reason: "LLM response unclear".into(),
+                        },
                     };
                 }
             }
@@ -174,13 +220,30 @@ Respond with JSON:
 
         // 4. 无法自动裁决 → 人工
         Resolution::DeferToHuman {
-            reason: format!("Evidence tie: A({}ev,{}cor,{:.2}q) vs B({}ev,{}cor,{:.2}q)", a_evidence, a_corrob, a_quality, b_evidence, b_corrob, b_quality),
+            reason: format!(
+                "Evidence tie: A({}ev,{}cor,{:.2}q) vs B({}ev,{}cor,{:.2}q)",
+                a_evidence, a_corrob, a_quality, b_evidence, b_corrob, b_quality
+            ),
         }
     }
 }
 
 fn has_contradiction_marker(a: &str, b: &str) -> bool {
-    let negation_words = ["not", "no", "never", "impossible", "cannot", "can't", "don't", "false", "wrong", "incorrect", "不", "没有", "错误"];
+    let negation_words = [
+        "not",
+        "no",
+        "never",
+        "impossible",
+        "cannot",
+        "can't",
+        "don't",
+        "false",
+        "wrong",
+        "incorrect",
+        "不",
+        "没有",
+        "错误",
+    ];
     let a_neg = negation_words.iter().any(|n| a.to_lowercase().contains(n));
     let b_neg = negation_words.iter().any(|n| b.to_lowercase().contains(n));
     a_neg != b_neg

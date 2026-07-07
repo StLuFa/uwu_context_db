@@ -8,8 +8,8 @@
 //! cargo build --features redis-backend
 //! ```
 
-use crate::read_cache::ReadCache;
 use crate::rate_limiter::RateLimiter;
+use crate::read_cache::ReadCache;
 use crate::{ContentLevel, ContentPayload, ContextUri, Result};
 use async_trait::async_trait;
 use std::time::Duration;
@@ -78,7 +78,10 @@ impl RedisReadCache {
     }
 
     fn cache_key(&self, uri: &ContextUri, level: ContentLevel) -> String {
-        prefixed(&self.prefix, &format!("cache:{}:{}", uri.as_str(), level.as_str()))
+        prefixed(
+            &self.prefix,
+            &format!("cache:{}:{}", uri.as_str(), level.as_str()),
+        )
     }
 
     async fn conn(&self) -> Result<redis::aio::MultiplexedConnection> {

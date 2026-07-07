@@ -1,7 +1,7 @@
 //! RetrieverCompiler — 将查询编译为可执行物理计划，compile 与 execute 两阶段分离。
 //!
 //! 设计来自 agent_context_db_complete.md §9（性能重构）：
-//! > HierarchicalRetriever 拆分为编译器（RetrieverCompiler）+ 执行器（PhysicalPlan::execute）。
+//! > ContextRetriever 拆分为编译器（RetrieverCompiler）+ 执行器（PhysicalPlan::execute）。
 //!
 //! ## 两阶段职责
 //! - **compile**：Query DSL / 自然语言 → LogicalPlan → CBO 优化 → PhysicalPlan（纯计算，无 I/O）

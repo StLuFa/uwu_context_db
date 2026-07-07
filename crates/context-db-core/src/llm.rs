@@ -55,20 +55,30 @@ pub trait LlmClient: Send + Sync {
 
     /// 结构化 JSON 输出 — G.4: 无默认实现，强制后端提供。
     async fn complete_json(
-        &self, prompt: &str, schema: &JsonSchema, opts: &LlmOpts,
+        &self,
+        prompt: &str,
+        schema: &JsonSchema,
+        opts: &LlmOpts,
     ) -> Result<String, LlmError>;
 
     /// 流式生成（默认 fallback 到 complete）。
     async fn stream_complete(
-        &self, prompt: &str, opts: &LlmOpts,
+        &self,
+        prompt: &str,
+        opts: &LlmOpts,
     ) -> Result<Box<dyn LlmStream + Send>, LlmError> {
         let text = self.complete(prompt, opts).await?;
-        Ok(Box::new(BufferedStream { chunks: vec![text], index: 0 }))
+        Ok(Box::new(BufferedStream {
+            chunks: vec![text],
+            index: 0,
+        }))
     }
 
     /// 批量补全（默认逐条调用 complete）。
     async fn batch_complete(
-        &self, prompts: &[String], opts: &LlmOpts,
+        &self,
+        prompts: &[String],
+        opts: &LlmOpts,
     ) -> Result<Vec<String>, LlmError> {
         let mut results = Vec::with_capacity(prompts.len());
         for p in prompts {
@@ -78,9 +88,7 @@ pub trait LlmClient: Send + Sync {
     }
 
     /// 投机执行（默认 fallback 到 complete）。
-    async fn speculative_complete(
-        &self, prompt: &str, opts: &LlmOpts,
-    ) -> Result<String, LlmError> {
+    async fn speculative_complete(&self, prompt: &str, opts: &LlmOpts) -> Result<String, LlmError> {
         self.complete(prompt, opts).await
     }
 }

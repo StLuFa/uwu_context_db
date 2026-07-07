@@ -21,38 +21,55 @@ pub struct QueryCompiler {
 }
 
 impl QueryCompiler {
-    pub fn new(fs: Arc<dyn FsOps>) -> Self { Self { fs } }
+    pub fn new(fs: Arc<dyn FsOps>) -> Self {
+        Self { fs }
+    }
 
     /// 批量读取：一次收集所有 URI 的内容。
     pub async fn batch_read(
-        &self, uris: &[ContextUri], level: agent_context_db_core::ContentLevel,
+        &self,
+        uris: &[ContextUri],
+        level: agent_context_db_core::ContentLevel,
     ) -> Vec<(ContextUri, Result<agent_context_db_core::ContentPayload>)> {
-        let handles: Vec<_> = uris.iter().map(|uri| {
-            let fs = self.fs.clone();
-            let uri = uri.clone();
-            tokio::spawn(async move { (uri.clone(), fs.read(&uri, level).await) })
-        }).collect();
+        let handles: Vec<_> = uris
+            .iter()
+            .map(|uri| {
+                let fs = self.fs.clone();
+                let uri = uri.clone();
+                tokio::spawn(async move { (uri.clone(), fs.read(&uri, level).await) })
+            })
+            .collect();
         let mut results = Vec::new();
         for h in handles {
-            if let Ok(r) = h.await { results.push(r); }
+            if let Ok(r) = h.await {
+                results.push(r);
+            }
         }
         results
     }
 
     /// 并行 grep：对多个 regex 一次搜索。
     pub async fn batch_grep(
-        &self, patterns: &[(&str, &ContextUri)],
+        &self,
+        patterns: &[(&str, &ContextUri)],
     ) -> Vec<(String, Vec<agent_context_db_core::GrepHit>)> {
-        let owned: Vec<(String, ContextUri)> = patterns.iter().map(|(r, s)| (r.to_string(), (*s).clone())).collect();
+        let owned: Vec<(String, ContextUri)> = patterns
+            .iter()
+            .map(|(r, s)| (r.to_string(), (*s).clone()))
+            .collect();
         let mut handles = Vec::new();
         for (regex, scope) in owned {
             let fs = self.fs.clone();
-            handles.push(tokio::spawn(async move { (regex.clone(), fs.grep(&regex, &scope).await) }));
+            handles.push(tokio::spawn(async move {
+                (regex.clone(), fs.grep(&regex, &scope).await)
+            }));
         }
         let mut results = Vec::new();
         for h in handles {
             if let Ok((r, hits)) = h.await {
-                if let Ok(hits) = hits { results.push((r, hits)); }
+                if let Ok(hits) = hits {
+                    results.push((r, hits));
+                }
             }
         }
         results
@@ -85,7 +102,8 @@ impl TieredVectorIndex {
         Self {
             index,
             state: parking_lot::Mutex::new((HashMap::new(), HashMap::new())),
-            hot_threshold: hot, warm_threshold: warm,
+            hot_threshold: hot,
+            warm_threshold: warm,
         }
     }
 
@@ -93,18 +111,30 @@ impl TieredVectorIndex {
         let mut state = self.state.lock();
         let count = state.0.entry(uri.to_string()).or_insert(0);
         *count += 1;
-        let tier = if *count >= self.hot_threshold { CacheTier::Hot }
-                   else if *count >= self.warm_threshold { CacheTier::Warm }
-                   else { CacheTier::Cold };
+        let tier = if *count >= self.hot_threshold {
+            CacheTier::Hot
+        } else if *count >= self.warm_threshold {
+            CacheTier::Warm
+        } else {
+            CacheTier::Cold
+        };
         state.1.insert(uri.to_string(), tier);
     }
 
     pub fn tier(&self, uri: &str) -> CacheTier {
-        self.state.lock().1.get(uri).copied().unwrap_or(CacheTier::Cold)
+        self.state
+            .lock()
+            .1
+            .get(uri)
+            .copied()
+            .unwrap_or(CacheTier::Cold)
     }
 
     pub async fn search(
-        &self, collection: &str, query: Vec<f32>, top_k: usize,
+        &self,
+        collection: &str,
+        query: Vec<f32>,
+        top_k: usize,
     ) -> Result<Vec<agent_context_db_core::IndexHit>> {
         self.index.search(collection, query, top_k, None).await
     }
@@ -123,12 +153,18 @@ pub struct VectorQuantizer {
 
 impl VectorQuantizer {
     pub fn new(subvectors: usize, codebook_size: usize) -> Self {
-        Self { subvectors, codebook_size, codebooks: Vec::new() }
+        Self {
+            subvectors,
+            codebook_size,
+            codebooks: Vec::new(),
+        }
     }
 
     /// 训练码本（简化：k-means 占位，实际可用 faiss/skia）。
     pub fn train(&mut self, vectors: &[Vec<f32>]) {
-        if vectors.is_empty() || self.subvectors == 0 { return; }
+        if vectors.is_empty() || self.subvectors == 0 {
+            return;
+        }
         let dim = vectors[0].len();
         let sub_dim = dim / self.subvectors;
         self.codebooks.clear();
@@ -149,7 +185,9 @@ impl VectorQuantizer {
 
     /// 压缩向量：将 f32 向量转为 u8 码字索引序列。
     pub fn encode(&self, vector: &[f32]) -> Option<Vec<u8>> {
-        if self.codebooks.is_empty() { return None; }
+        if self.codebooks.is_empty() {
+            return None;
+        }
         let sub_dim = vector.len() / self.subvectors;
         let mut codes = Vec::with_capacity(self.subvectors);
         for (s, codebook) in self.codebooks.iter().enumerate() {
@@ -159,7 +197,10 @@ impl VectorQuantizer {
             let mut best_dist = f32::MAX;
             for (i, centroid) in codebook.iter().enumerate() {
                 let dist = euclidean(&sub, centroid);
-                if dist < best_dist { best_dist = dist; best_idx = i as u8; }
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = i as u8;
+                }
             }
             codes.push(best_idx);
         }
@@ -175,7 +216,11 @@ impl VectorQuantizer {
 }
 
 fn euclidean(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -189,27 +234,44 @@ pub struct ParallelGenerator {
 }
 
 impl ParallelGenerator {
-    pub fn new(llm: Arc<dyn LlmClient>, max: usize) -> Self { Self { llm, max_concurrency: max } }
+    pub fn new(llm: Arc<dyn LlmClient>, max: usize) -> Self {
+        Self {
+            llm,
+            max_concurrency: max,
+        }
+    }
 
     /// 并行生成多个摘要。
     pub async fn batch_generate_abstracts(
-        &self, uris: &[ContextUri],
+        &self,
+        uris: &[ContextUri],
     ) -> Vec<(ContextUri, Result<String>)> {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrency));
-        let handles: Vec<_> = uris.iter().map(|uri| {
-            let llm = self.llm.clone();
-            let uri = uri.clone();
-            let sem = semaphore.clone();
-            tokio::spawn(async move {
-                let _permit = sem.acquire().await;
-                let prompt = format!("Write a concise abstract (~100 tokens) for: {uri}");
-                (uri, llm.complete(&prompt, &LlmOpts::default()).await
-                    .map_err(|e| agent_context_db_core::ContextError::Storage(format!("{e}"))))
+        let handles: Vec<_> = uris
+            .iter()
+            .map(|uri| {
+                let llm = self.llm.clone();
+                let uri = uri.clone();
+                let sem = semaphore.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await;
+                    let prompt = format!("Write a concise abstract (~100 tokens) for: {uri}");
+                    (
+                        uri,
+                        llm.complete(&prompt, &LlmOpts::default())
+                            .await
+                            .map_err(|e| {
+                                agent_context_db_core::ContextError::Storage(format!("{e}"))
+                            }),
+                    )
+                })
             })
-        }).collect();
+            .collect();
         let mut results = Vec::new();
         for h in handles {
-            if let Ok(r) = h.await { results.push(r); }
+            if let Ok(r) = h.await {
+                results.push(r);
+            }
         }
         results
     }
@@ -217,18 +279,23 @@ impl ParallelGenerator {
     /// 并行生成多个 embedding。
     pub async fn batch_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrency));
-        let handles: Vec<_> = texts.iter().map(|t| {
-            let llm = self.llm.clone();
-            let text = t.clone();
-            let sem = semaphore.clone();
-            tokio::spawn(async move {
-                let _permit = sem.acquire().await;
-                llm.embed(&text).await
+        let handles: Vec<_> = texts
+            .iter()
+            .map(|t| {
+                let llm = self.llm.clone();
+                let text = t.clone();
+                let sem = semaphore.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await;
+                    llm.embed(&text).await
+                })
             })
-        }).collect();
+            .collect();
         let mut results = Vec::new();
         for h in handles {
-            if let Ok(Ok(v)) = h.await { results.push(v); }
+            if let Ok(Ok(v)) = h.await {
+                results.push(v);
+            }
         }
         Ok(results)
     }
@@ -247,17 +314,27 @@ pub struct MaterializedView {
 
 impl MaterializedView {
     pub fn new(ttl_secs: i64) -> Self {
-        Self { cache: parking_lot::Mutex::new(HashMap::new()), ttl_secs, max_capacity: 500 }
+        Self {
+            cache: parking_lot::Mutex::new(HashMap::new()),
+            ttl_secs,
+            max_capacity: 500,
+        }
     }
 
     pub fn with_capacity(ttl_secs: i64, capacity: usize) -> Self {
-        Self { cache: parking_lot::Mutex::new(HashMap::new()), ttl_secs, max_capacity: capacity }
+        Self {
+            cache: parking_lot::Mutex::new(HashMap::new()),
+            ttl_secs,
+            max_capacity: capacity,
+        }
     }
 
     pub fn get(&self, query: &str) -> Option<Vec<ContextUri>> {
         let cache = self.cache.lock();
         if let Some((uris, expires)) = cache.get(query) {
-            if *expires > chrono::Utc::now() { return Some(uris.clone()); }
+            if *expires > chrono::Utc::now() {
+                return Some(uris.clone());
+            }
         }
         None
     }
@@ -267,10 +344,8 @@ impl MaterializedView {
         let mut cache = self.cache.lock();
         // H.2: 容量超限 → 淘汰最旧的 N 条
         if cache.len() >= self.max_capacity {
-            let mut entries: Vec<(String, chrono::DateTime<chrono::Utc>)> = cache
-                .iter()
-                .map(|(k, (_, e))| (k.clone(), *e))
-                .collect();
+            let mut entries: Vec<(String, chrono::DateTime<chrono::Utc>)> =
+                cache.iter().map(|(k, (_, e))| (k.clone(), *e)).collect();
             entries.sort_by_key(|(_, e)| *e);
             let to_remove = entries.len() - self.max_capacity + 1;
             for (k, _) in entries.iter().take(to_remove) {
@@ -286,7 +361,10 @@ impl MaterializedView {
 
     pub fn hit_rate(&self) -> (usize, usize) {
         let cache = self.cache.lock();
-        let active = cache.values().filter(|(_, e)| *e > chrono::Utc::now()).count();
+        let active = cache
+            .values()
+            .filter(|(_, e)| *e > chrono::Utc::now())
+            .count();
         (active, cache.len())
     }
 }
@@ -302,32 +380,44 @@ pub struct PartitionedRetriever {
 }
 
 impl PartitionedRetriever {
-    pub fn new(fs: Arc<dyn FsOps>) -> Self { Self { fs, partitions: Vec::new() } }
+    pub fn new(fs: Arc<dyn FsOps>) -> Self {
+        Self {
+            fs,
+            partitions: Vec::new(),
+        }
+    }
 
     pub fn with_partitions(mut self, partitions: Vec<String>) -> Self {
-        self.partitions = partitions; self
+        self.partitions = partitions;
+        self
     }
 
     /// 并行在所有分区上执行 find。
     pub async fn parallel_find(
-        &self, pattern_template: &agent_context_db_core::FindPattern,
+        &self,
+        pattern_template: &agent_context_db_core::FindPattern,
     ) -> Vec<(String, Vec<ContextUri>)> {
         let owned_partitions = self.partitions.clone();
         let owned_pattern = pattern_template.clone();
-        let handles: Vec<_> = owned_partitions.into_iter().map(|tenant| {
-            let fs = self.fs.clone();
-            let mut pattern = owned_pattern.clone();
-            pattern.scope = ContextUri::parse(format!("uwu://{tenant}")).ok();
-            tokio::spawn(async move {
-                match fs.find(&pattern).await {
-                    Ok(uris) => Some((tenant, uris)),
-                    Err(_) => None,
-                }
+        let handles: Vec<_> = owned_partitions
+            .into_iter()
+            .map(|tenant| {
+                let fs = self.fs.clone();
+                let mut pattern = owned_pattern.clone();
+                pattern.scope = ContextUri::parse(format!("uwu://{tenant}")).ok();
+                tokio::spawn(async move {
+                    match fs.find(&pattern).await {
+                        Ok(uris) => Some((tenant, uris)),
+                        Err(_) => None,
+                    }
+                })
             })
-        }).collect();
+            .collect();
         let mut results = Vec::new();
         for h in handles {
-            if let Ok(Some(r)) = h.await { results.push(r); }
+            if let Ok(Some(r)) = h.await {
+                results.push(r);
+            }
         }
         results
     }
@@ -363,9 +453,13 @@ mod tests {
             let mut c = counts.lock();
             let count = c.entry(uri.to_string()).or_insert(0);
             *count += 1;
-            let tier = if *count >= 5 { CacheTier::Hot }
-                       else if *count >= 2 { CacheTier::Warm }
-                       else { CacheTier::Cold };
+            let tier = if *count >= 5 {
+                CacheTier::Hot
+            } else if *count >= 2 {
+                CacheTier::Warm
+            } else {
+                CacheTier::Cold
+            };
             tier_map.lock().insert(uri.to_string(), tier);
         }
         assert_eq!(tier_map.lock().get(uri), Some(&CacheTier::Hot));

@@ -80,7 +80,9 @@ impl FsOps for MemoryContextStore {
             if let Some(rest) = uri.strip_prefix(&prefix) {
                 let is_dir = rest.contains('/');
                 let latest = versions.last().unwrap();
-                let Ok(u) = ContextUri::parse(uri.clone()) else { continue };
+                let Ok(u) = ContextUri::parse(uri.clone()) else {
+                    continue;
+                };
                 out.push(DirEntry {
                     uri: u,
                     is_dir,
@@ -126,7 +128,9 @@ impl FsOps for MemoryContextStore {
             if let Some(e) = versions.last() {
                 let l0 = e.l0_text();
                 if l0.to_lowercase().contains(&needle) {
-                    let Ok(u) = ContextUri::parse(uri.clone()) else { continue };
+                    let Ok(u) = ContextUri::parse(uri.clone()) else {
+                        continue;
+                    };
                     hits.push(GrepHit {
                         uri: u,
                         line: l0.to_string(),
@@ -288,7 +292,9 @@ fn build_memory_tree(
 
     let mut children = Vec::new();
     for (name, is_dir) in seen {
-        let Ok(child_uri) = ContextUri::parse(format!("{}{}", prefix, name)) else { continue };
+        let Ok(child_uri) = ContextUri::parse(format!("{}{}", prefix, name)) else {
+            continue;
+        };
         if is_dir {
             let child_prefix = format!("{}{}/", prefix, name);
             let sub_children =
@@ -316,11 +322,7 @@ mod tests {
     use uuid::Uuid;
 
     fn entry(uri: &str, text: &str) -> ContextEntry {
-        ContextEntry::new_text(
-            ContextUri::parse(uri).unwrap(),
-            TenantId(Uuid::nil()),
-            text,
-        )
+        ContextEntry::new_text(ContextUri::parse(uri).unwrap(), TenantId(Uuid::nil()), text)
     }
 
     #[tokio::test]

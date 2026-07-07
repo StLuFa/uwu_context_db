@@ -1,23 +1,21 @@
-//! `ContextRetriever`：计划驱动检索器 + `HierarchicalRetrieverImpl`（向后兼容）。
+//! `ContextRetriever`：计划驱动检索器。
 //!
-//! 新版流程：Query DSL → LogicalPlan → CBO 优化 → PhysicalPlan → 执行。
-//! 旧版流程（保留）：意图分析 → 目录定位 → 目录内搜索 → 递归深入 → Rerank → 按预算加载。
+//! 流程：Query DSL → LogicalPlan → CBO 优化 → PhysicalPlan → 执行。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentType, ContextUri, FsOps, GraphStore, LlmClient, Result,
-    VectorIndex,
+    ContentLevel, ContentPayload, ContentType, ContextUri, FsOps, GraphStore, Result, VectorIndex,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::Instrument;
 
-use crate::intent::{LlmIntentAnalyzer, RuleBasedIntentAnalyzer};
+use crate::intent::RuleBasedIntentAnalyzer;
 use crate::operators::ExecContext;
-use crate::planner::{CboOptimizer, LogicalPlan, PhysicalPlan, StatisticsCollector};
+use crate::planner::{CboOptimizer, IntentPlannerHint, LogicalPlan, PhysicalPlan, StatisticsCollector};
 use crate::query::{Condition, Predicate, Query};
 use crate::{
-    HierarchicalRetriever, IntentAnalyzer, PlanRetriever, QueryPlanner, Reranker, RetrievalHit,
-    RetrievalResult, RetrievalTrace, RetrieveContext, TraceStep, TypedQuery,
+    PlanRetriever, QueryPlanner, Reranker, RetrievalHit, RetrievalResult, RetrievalTrace,
+    RetrieveContext, TraceStep,
 };
 
 // ===========================================================================
@@ -34,6 +32,7 @@ pub struct ContextRetriever {
     associative_enabled: bool,
     planner: Arc<dyn QueryPlanner>,
     reranker: Arc<dyn Reranker>,
+    intent_analyzer: Option<Arc<RuleBasedIntentAnalyzer>>,
     optimizer: CboOptimizer,
     /// 计划缓存（相同 query 不重复优化）。
     plan_cache: parking_lot::Mutex<std::collections::HashMap<Vec<u8>, PhysicalPlan>>,
@@ -54,16 +53,20 @@ impl ContextRetriever {
             associative_enabled: false,
             planner,
             reranker,
+            intent_analyzer: None,
             optimizer: CboOptimizer::new(stats),
             plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
+    /// 注入新版 intent policy engine，让检索 trace 携带可解释执行图。
+    pub fn with_intent_analyzer(mut self, intent_analyzer: Arc<RuleBasedIntentAnalyzer>) -> Self {
+        self.intent_analyzer = Some(intent_analyzer);
+        self
+    }
+
     /// 若配置了图与联想扩展开关，则对已有命中做联想扩展并合并到结果尾部。
-    async fn maybe_expand_associative(
-        &self,
-        hits: Vec<RetrievalHit>,
-    ) -> Vec<RetrievalHit> {
+    async fn maybe_expand_associative(&self, hits: Vec<RetrievalHit>) -> Vec<RetrievalHit> {
         if !self.associative_enabled {
             return hits;
         }
@@ -100,13 +103,20 @@ impl ContextRetriever {
         skip(self, ctx),
         fields(query_len = query.len(), budget = ctx.budget_tokens.unwrap_or(8000)),
     )]
-    pub async fn retrieve(
-        &self,
-        query: &str,
-        ctx: &RetrieveContext,
-    ) -> Result<RetrievalResult> {
+    pub async fn retrieve(&self, query: &str, ctx: &RetrieveContext) -> Result<RetrievalResult> {
         let budget = ctx.budget_tokens.unwrap_or(8000);
         let mut trace = RetrievalTrace::default();
+        let intent_decision = self
+            .intent_analyzer
+            .as_ref()
+            .map(|analyzer| analyzer.decide(query, ctx));
+        if let Some(decision) = &intent_decision {
+            trace.steps.push(TraceStep::IntentAnalysis {
+                raw: query.to_string(),
+                num_queries: decision.candidates.len(),
+                decision: Some(decision.clone()),
+            });
+        }
 
         // 1. 自然语言 → LogicalPlan
         let logical = self
@@ -116,11 +126,17 @@ impl ContextRetriever {
             .await?;
 
         // 2. CBO 优化 → PhysicalPlan
-        let physical = tracing::info_span!("plan.optimize")
-            .in_scope(|| self.optimizer.optimize(&logical));
+        let intent_hint = intent_decision.as_ref().map(IntentPlannerHint::from);
+        let physical = tracing::info_span!("plan.optimize").in_scope(|| {
+            self.optimizer
+                .optimize_with_intent(&logical, intent_hint.as_ref())
+        });
+        let adjusted_cost = self
+            .optimizer
+            .estimate_cost_with_intent(&physical, intent_hint.as_ref());
         trace.steps.push(TraceStep::PlanOptimized {
-            logical: format!("{logical:?}"),
-            physical: format!("{physical:?}"),
+            logical: format!("{:?}", logical),
+            physical: format!("{:?}; intent_cost={adjusted_cost:.3}", physical),
         });
 
         // 3. 执行物理计划
@@ -156,7 +172,10 @@ impl ContextRetriever {
         let expand_input = reranked.len();
         let expanded = self
             .maybe_expand_associative(reranked)
-            .instrument(tracing::info_span!("expand.associative", input = expand_input))
+            .instrument(tracing::info_span!(
+                "expand.associative",
+                input = expand_input
+            ))
             .await;
 
         // 5. Budget loading
@@ -186,8 +205,8 @@ impl ContextRetriever {
         let mut trace = RetrievalTrace::default();
 
         let logical = tracing::info_span!("plan.parse").in_scope(|| query_to_logical(query));
-        let physical = tracing::info_span!("plan.optimize")
-            .in_scope(|| self.optimizer.optimize(&logical));
+        let physical =
+            tracing::info_span!("plan.optimize").in_scope(|| self.optimizer.optimize(&logical));
         trace.steps.push(TraceStep::PlanOptimized {
             logical: format!("{logical:?}"),
             physical: format!("{physical:?}"),
@@ -217,7 +236,10 @@ impl ContextRetriever {
         let expand_input = reranked.len();
         let expanded = self
             .maybe_expand_associative(reranked)
-            .instrument(tracing::info_span!("expand.associative", input = expand_input))
+            .instrument(tracing::info_span!(
+                "expand.associative",
+                input = expand_input
+            ))
             .await;
         let (hits, tokens_used) = tracing::info_span!("budget.load", budget)
             .in_scope(|| load_within_budget(expanded, budget));
@@ -233,19 +255,8 @@ impl ContextRetriever {
 
 #[async_trait]
 impl PlanRetriever for ContextRetriever {
-    async fn retrieve_plan(
-        &self,
-        query: &Query,
-        ctx: &RetrieveContext,
-    ) -> Result<RetrievalResult> {
+    async fn retrieve_plan(&self, query: &Query, ctx: &RetrieveContext) -> Result<RetrievalResult> {
         self.retrieve_query(query, ctx).await
-    }
-}
-
-#[async_trait]
-impl HierarchicalRetriever for ContextRetriever {
-    async fn retrieve(&self, query: &str, ctx: &RetrieveContext) -> Result<RetrievalResult> {
-        self.retrieve(query, ctx).await
     }
 }
 
@@ -340,7 +351,7 @@ fn query_to_logical(query: &Query) -> LogicalPlan {
                 edges: edges.clone(),
                 max_hops: *max_hops,
             }
-        },
+        }
         Query::Composite { queries, merge: _ } => {
             // 组合查询 → 多个 LogicalPlan 并行
             // 简化：合并所有子查询的 scan scopes
@@ -357,10 +368,7 @@ fn query_to_logical(query: &Query) -> LogicalPlan {
 // Budget loading
 // ===========================================================================
 
-fn load_within_budget(
-    mut hits: Vec<RetrievalHit>,
-    budget: usize,
-) -> (Vec<RetrievalHit>, usize) {
+fn load_within_budget(mut hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
     let mut tokens = 0;
     let mut result = Vec::new();
     hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
@@ -392,9 +400,11 @@ fn load_within_budget(
 
 fn estimate_tokens(content: &ContentPayload) -> usize {
     match content {
-        ContentPayload::Text { sparse, dense, full: _ } => {
-            std::cmp::max(sparse.len() / 4, 100)
-        }
+        ContentPayload::Text {
+            sparse,
+            dense,
+            full: _,
+        } => std::cmp::max(sparse.len() / 4, 100),
         _ => 100,
     }
 }
@@ -410,10 +420,7 @@ pub struct RuleBasedPlanner {
 }
 
 impl RuleBasedPlanner {
-    pub fn new(
-        default_tenant: impl Into<String>,
-        default_agent: impl Into<String>,
-    ) -> Self {
+    pub fn new(default_tenant: impl Into<String>, default_agent: impl Into<String>) -> Self {
         Self {
             default_tenant: default_tenant.into(),
             default_agent: default_agent.into(),
@@ -423,11 +430,7 @@ impl RuleBasedPlanner {
 
 #[async_trait]
 impl QueryPlanner for RuleBasedPlanner {
-    async fn parse(
-        &self,
-        query: &str,
-        ctx: &RetrieveContext,
-    ) -> Result<LogicalPlan> {
+    async fn parse(&self, query: &str, ctx: &RetrieveContext) -> Result<LogicalPlan> {
         let lower = query.to_lowercase();
         let scope = ContextUri::parse(&format!(
             "uwu://{}/agent/{}",
@@ -462,80 +465,6 @@ impl QueryPlanner for RuleBasedPlanner {
 }
 
 // ===========================================================================
-// HierarchicalRetrieverImpl（向后兼容的旧版实现，委托给 ContextRetriever）
-// ===========================================================================
-
-#[deprecated(note = "使用 ContextRetriever 替代")]
-pub struct HierarchicalRetrieverImpl {
-    pub fs: Arc<dyn FsOps>,
-    pub index: Option<Arc<dyn VectorIndex>>,
-    pub llm: Option<Arc<dyn LlmClient>>,
-    pub intent: Arc<dyn IntentAnalyzer>,
-    pub reranker: Arc<dyn Reranker>,
-}
-
-#[allow(deprecated)]
-impl HierarchicalRetrieverImpl {
-    pub fn new(
-        fs: Arc<dyn FsOps>,
-        intent: Arc<dyn IntentAnalyzer>,
-        reranker: Arc<dyn Reranker>,
-    ) -> Self {
-        Self {
-            fs,
-            index: None,
-            llm: None,
-            intent,
-            reranker,
-        }
-    }
-
-    pub fn with_index(
-        fs: Arc<dyn FsOps>,
-        index: Arc<dyn VectorIndex>,
-        intent: Arc<dyn IntentAnalyzer>,
-        reranker: Arc<dyn Reranker>,
-    ) -> Self {
-        Self {
-            fs,
-            index: Some(index),
-            llm: None,
-            intent,
-            reranker,
-        }
-    }
-}
-
-#[allow(deprecated)]
-#[async_trait]
-impl HierarchicalRetriever for HierarchicalRetrieverImpl {
-    async fn retrieve(&self, query: &str, _ctx: &RetrieveContext) -> Result<RetrievalResult> {
-        // 委托到新的计划驱动方式
-        let scope = ContextUri::parse("uwu://t/")?;
-        let logical = LogicalPlan::Scan {
-            scope: Some(scope),
-            level: ContentLevel::L0,
-        };
-        let stats = Arc::new(StatisticsCollector::new());
-        let optimizer = CboOptimizer::new(stats);
-        let physical = optimizer.optimize(&logical);
-
-        let exec_ctx = ExecContext {
-            fs: self.fs.clone(),
-            index: self.index.clone(),
-            graph: None,
-        };
-        let batch = physical.execute(&exec_ctx).await?;
-        let (hits, tokens) = load_within_budget(batch.records, 8000);
-        Ok(RetrievalResult {
-            hits,
-            trace: RetrievalTrace::default(),
-            tokens_used: tokens,
-        })
-    }
-}
-
-// ===========================================================================
 // G.1: ContextRetrieverBuilder
 // ===========================================================================
 
@@ -551,7 +480,14 @@ pub struct ContextRetrieverBuilder {
 
 impl ContextRetrieverBuilder {
     pub fn new(fs: Arc<dyn FsOps>) -> Self {
-        Self { fs, index: None, graph: None, associative_enabled: false, planner: None, reranker: None }
+        Self {
+            fs,
+            index: None,
+            graph: None,
+            associative_enabled: false,
+            planner: None,
+            reranker: None,
+        }
     }
 
     pub fn with_vector_index(mut self, index: Arc<dyn VectorIndex>) -> Self {
@@ -582,12 +518,12 @@ impl ContextRetrieverBuilder {
     }
 
     pub fn build(self) -> ContextRetriever {
-        let planner = self.planner.unwrap_or_else(|| {
-            Arc::new(RuleBasedPlanner::new("default", "default"))
-        });
-        let reranker = self.reranker.unwrap_or_else(|| {
-            Arc::new(crate::ScoreReranker { keep: 20 })
-        });
+        let planner = self
+            .planner
+            .unwrap_or_else(|| Arc::new(RuleBasedPlanner::new("default", "default")));
+        let reranker = self
+            .reranker
+            .unwrap_or_else(|| Arc::new(crate::ScoreReranker { keep: 20 }));
         let mut r = ContextRetriever::new(self.fs, self.index, planner, reranker);
         r.graph = self.graph;
         r.associative_enabled = self.associative_enabled;

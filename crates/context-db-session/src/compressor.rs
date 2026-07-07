@@ -3,15 +3,18 @@
 //! - Phase1（同步）：归档消息 → 写入 FS → 返回 task_id
 //! - Phase2（异步）：语义处理（去重 → L0/L1 生成 → 写 .done 标记）
 
-use agent_context_db_core::{ContentPayload, ContentRepo, ContextEntry, ContextMeta, ContextUri, MediaType, MemoryClass, MvccVersion, Result, TenantId};
+use agent_context_db_core::{
+    ContentPayload, ContentRepo, ContextEntry, ContextMeta, ContextUri, MediaType, MemoryClass,
+    MvccVersion, Result, TenantId,
+};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
-    CommitTaskId, DoneMarker, MemoryChange, MemoryDiff, SessionCompressor,
-    SessionHandle, TaskStatus,
+    CommitTaskId, DoneMarker, MemoryChange, MemoryDiff, SessionCompressor, SessionHandle,
+    TaskStatus,
 };
 
 /// 会话压缩器实现。
@@ -105,13 +108,11 @@ impl SessionCompressor for SessionCompressorImpl {
     async fn commit_phase2(&self, task_id: CommitTaskId) -> Result<DoneMarker> {
         // Phase2：上层负责在 Phase1 和 Phase2 之间调用语义管线
         // (MemoryExtractor + SemanticProcessor)，完成后再调用此方法标记完成。
-        let pending = self
-            .take_pending(&task_id)
-            .ok_or_else(|| {
-                agent_context_db_core::ContextError::NotFound(format!(
-                    "no pending session for task {task_id:?}"
-                ))
-            })?;
+        let pending = self.take_pending(&task_id).ok_or_else(|| {
+            agent_context_db_core::ContextError::NotFound(format!(
+                "no pending session for task {task_id:?}"
+            ))
+        })?;
 
         // 写 memory_diff（由上层预先生成）
         let memory_diff_uri = pending
@@ -160,7 +161,9 @@ impl SessionCompressor for SessionCompressorImpl {
     async fn poll_task(&self, task_id: CommitTaskId) -> Result<TaskStatus> {
         match self.pending.lock().get(&task_id) {
             Some(_) => Ok(TaskStatus::Processing),
-            None => Ok(TaskStatus::Failed("task not found or already completed".into())),
+            None => Ok(TaskStatus::Failed(
+                "task not found or already completed".into(),
+            )),
         }
     }
 }
@@ -191,9 +194,7 @@ pub async fn run_full_compression(
 
     let pending = compressor
         .take_pending(&task_id)
-        .ok_or_else(|| {
-            agent_context_db_core::ContextError::NotFound("task disappeared".into())
-        })?;
+        .ok_or_else(|| agent_context_db_core::ContextError::NotFound("task disappeared".into()))?;
 
     // Phase2: 语义处理管线
 
@@ -209,9 +210,7 @@ pub async fn run_full_compression(
         match dec.action {
             ShimAction::Create => {
                 // 为新记忆生成 L0 摘要
-                let _abstract_ = semantic
-                    .generate_abstract(&dec.target_uri)
-                    .await?;
+                let _abstract_ = semantic.generate_abstract(&dec.target_uri).await?;
                 memory_diff.adds.push(MemoryChange {
                     uri: dec.target_uri.clone(),
                     class: dec.class,
@@ -307,10 +306,7 @@ pub trait MemoryExtractorShim: Send + Sync {
     async fn extract(&self, archive: &ContextUri) -> Result<Vec<String>>;
 
     /// 对候选项集合去重，返回每个候选项的决策。
-    async fn deduplicate(
-        &self,
-        candidates: Vec<String>,
-    ) -> Result<Vec<ShimCandidateAction>>;
+    async fn deduplicate(&self, candidates: Vec<String>) -> Result<Vec<ShimCandidateAction>>;
 }
 
 /// Phase2 语义处理 trait shim（G.5: 已弃用，建议直接依赖 parse crate）。

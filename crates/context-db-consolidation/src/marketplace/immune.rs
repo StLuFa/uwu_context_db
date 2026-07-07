@@ -30,8 +30,14 @@ pub enum ThreatType {
 #[derive(Debug, Clone)]
 pub enum ThreatCheck {
     Clean,
-    Suspicious { matched_antibodies: Vec<MarketId>, risk_score: f32 },
-    Blocked { matched_antibodies: Vec<MarketId>, severity: ThreatSeverity },
+    Suspicious {
+        matched_antibodies: Vec<MarketId>,
+        risk_score: f32,
+    },
+    Blocked {
+        matched_antibodies: Vec<MarketId>,
+        severity: ThreatSeverity,
+    },
 }
 
 /// 免疫协议 — 一个 Agent 踩坑，全员免疫。
@@ -127,9 +133,15 @@ impl ImmuneProtocol {
         } else {
             let risk_score = (total_risk / matched.len() as f32).min(1.0);
             if max_severity >= ThreatSeverity::High {
-                ThreatCheck::Blocked { matched_antibodies: matched, severity: max_severity }
+                ThreatCheck::Blocked {
+                    matched_antibodies: matched,
+                    severity: max_severity,
+                }
             } else {
-                ThreatCheck::Suspicious { matched_antibodies: matched, risk_score }
+                ThreatCheck::Suspicious {
+                    matched_antibodies: matched,
+                    risk_score,
+                }
             }
         }
     }
@@ -151,7 +163,9 @@ impl ImmuneProtocol {
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
-    if len == 0 { return 0.0; }
+    if len == 0 {
+        return 0.0;
+    }
     let mut dot = 0.0f64;
     let mut na = 0.0f64;
     let mut nb = 0.0f64;

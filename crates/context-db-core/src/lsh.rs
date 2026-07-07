@@ -65,14 +65,19 @@ pub struct LshHashTable {
 
 impl LshHashTable {
     pub fn new(hash_size: usize) -> Self {
-        Self { random_vectors: vec![] }
+        Self {
+            random_vectors: vec![],
+        }
     }
 
     /// 对 embedding 做 LSH 哈希（简化版：取每个随机投影的正负号）。
     pub fn hash(&self, embedding: &[f32]) -> u64 {
         if self.random_vectors.is_empty() {
             // 无随机向量时用简单 bucket
-            return embedding.iter().map(|x| x.to_bits() as u64).fold(0, |a, b| a.wrapping_mul(31).wrapping_add(b));
+            return embedding
+                .iter()
+                .map(|x| x.to_bits() as u64)
+                .fold(0, |a, b| a.wrapping_mul(31).wrapping_add(b));
         }
         let mut hash: u64 = 0;
         for (i, rv) in self.random_vectors.iter().enumerate() {

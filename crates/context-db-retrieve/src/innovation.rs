@@ -62,11 +62,13 @@ impl PredictivePrefetcher {
     /// 记录一次上下文访问。
     pub fn record_access(&self, uri: &ContextUri, _pattern: AccessPattern) {
         let mut history = self.access_history.lock();
-        let entry = history.entry(uri.to_string().clone()).or_insert_with(|| AccessRecord {
-            uri: uri.clone(),
-            timestamp: Instant::now(),
-            access_count: 0,
-        });
+        let entry = history
+            .entry(uri.to_string().clone())
+            .or_insert_with(|| AccessRecord {
+                uri: uri.clone(),
+                timestamp: Instant::now(),
+                access_count: 0,
+            });
         entry.access_count += 1;
     }
 
@@ -98,7 +100,11 @@ impl PredictivePrefetcher {
                         uri: parsed,
                         probability: *prob,
                         pattern: AccessPattern::Sequential,
-                        prefetch_level: if *prob > 0.7 { ContentLevel::L1 } else { ContentLevel::L0 },
+                        prefetch_level: if *prob > 0.7 {
+                            ContentLevel::L1
+                        } else {
+                            ContentLevel::L0
+                        },
                     });
                 }
             }
@@ -125,7 +131,10 @@ impl PredictivePrefetcher {
     }
 
     /// 执行预取（加载到调用方缓存）。
-    pub async fn prefetch(&self, predictions: &[PrefetchPrediction]) -> Vec<(ContextUri, ContentPayload)> {
+    pub async fn prefetch(
+        &self,
+        predictions: &[PrefetchPrediction],
+    ) -> Vec<(ContextUri, ContentPayload)> {
         let mut loaded = Vec::new();
         for pred in predictions.iter().take(self.prefetch_size) {
             if let Ok(content) = self.fs.read(&pred.uri, pred.prefetch_level).await {
@@ -241,11 +250,29 @@ mod tests {
     struct NoopFs;
     #[async_trait::async_trait]
     impl FsOps for NoopFs {
-        async fn ls(&self, _: &ContextUri) -> CoreResult<Vec<DirEntry>> { Ok(vec![]) }
-        async fn find(&self, _: &FindPattern) -> CoreResult<Vec<ContextUri>> { Ok(vec![]) }
-        async fn grep(&self, _: &str, _: &ContextUri) -> CoreResult<Vec<GrepHit>> { Ok(vec![]) }
-        async fn tree(&self, r: &ContextUri, _: usize) -> CoreResult<TreeNode> { Ok(TreeNode { uri: r.clone(), is_dir: true, children: vec![] }) }
-        async fn read(&self, _: &ContextUri, _: ContentLevel) -> CoreResult<ContentPayload> { Ok(ContentPayload::Abstract(String::new())) }
+        async fn ls(&self, _: &ContextUri) -> CoreResult<Vec<DirEntry>> {
+            Ok(vec![])
+        }
+        async fn find(&self, _: &FindPattern) -> CoreResult<Vec<ContextUri>> {
+            Ok(vec![])
+        }
+        async fn grep(&self, _: &str, _: &ContextUri) -> CoreResult<Vec<GrepHit>> {
+            Ok(vec![])
+        }
+        async fn tree(&self, r: &ContextUri, _: usize) -> CoreResult<TreeNode> {
+            Ok(TreeNode {
+                uri: r.clone(),
+                is_dir: true,
+                children: vec![],
+            })
+        }
+        async fn read(&self, _: &ContextUri, _: ContentLevel) -> CoreResult<ContentPayload> {
+            Ok(ContentPayload::Text {
+                sparse: String::new(),
+                dense: String::new(),
+                full: String::new(),
+            })
+        }
     }
 
     #[test]
@@ -264,9 +291,13 @@ mod tests {
         let learner = IncrementalRetrievalLearner::new(0.1);
         let uri = ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap();
 
-        learner.apply_feedback("bug fix", &[
-            RelevanceFeedback::Relevant { uri: uri.clone(), score: 0.9 },
-        ]);
+        learner.apply_feedback(
+            "bug fix",
+            &[RelevanceFeedback::Relevant {
+                uri: uri.clone(),
+                score: 0.9,
+            }],
+        );
 
         assert!(learner.learned_score(&uri) > 0.5);
     }
@@ -277,15 +308,20 @@ mod tests {
         let uri = ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap();
 
         // 初始：默认分 + 强化
-        learner.apply_feedback("query", &[
-            RelevanceFeedback::Relevant { uri: uri.clone(), score: 0.9 },
-        ]);
+        learner.apply_feedback(
+            "query",
+            &[RelevanceFeedback::Relevant {
+                uri: uri.clone(),
+                score: 0.9,
+            }],
+        );
         let after_relevant = learner.learned_score(&uri);
 
         // 然后：衰减
-        learner.apply_feedback("query", &[
-            RelevanceFeedback::NotRelevant { uri: uri.clone() },
-        ]);
+        learner.apply_feedback(
+            "query",
+            &[RelevanceFeedback::NotRelevant { uri: uri.clone() }],
+        );
         let after_penalty = learner.learned_score(&uri);
 
         assert!(after_penalty < after_relevant);

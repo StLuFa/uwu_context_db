@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{SemanticQueue, SemanticTask, TaskId, TaskOutcome};
 
@@ -76,11 +76,9 @@ impl Default for TokioSemanticQueue {
 impl SemanticQueue for TokioSemanticQueue {
     async fn enqueue(&self, task: SemanticTask) -> Result<TaskId> {
         let id = TaskId::new();
-        self.tx
-            .send((id, task))
-            .map_err(|e| agent_context_db_core::ContextError::Storage(
-                format!("semantic queue closed: {e}")
-            ))?;
+        self.tx.send((id, task)).map_err(|e| {
+            agent_context_db_core::ContextError::Storage(format!("semantic queue closed: {e}"))
+        })?;
         Ok(id)
     }
 
@@ -111,7 +109,10 @@ impl SemanticQueue for TokioSemanticQueue {
 ///     handle_semantic_task(task).await
 /// });
 /// ```
-pub fn spawn_semantic_worker<F, Fut>(queue: &Arc<TokioSemanticQueue>, handler: F) -> tokio::task::JoinHandle<()>
+pub fn spawn_semantic_worker<F, Fut>(
+    queue: &Arc<TokioSemanticQueue>,
+    handler: F,
+) -> tokio::task::JoinHandle<()>
 where
     F: Fn(TaskId, SemanticTask) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = TaskOutcome> + Send + 'static,
@@ -126,9 +127,13 @@ mod tests {
     #[tokio::test]
     async fn enqueue_dequeue_roundtrip() {
         let q = TokioSemanticQueue::new();
-        let uri = agent_context_db_core::ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap();
+        let uri =
+            agent_context_db_core::ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap();
 
-        let id = q.enqueue(SemanticTask::GenerateAbstract(uri.clone())).await.unwrap();
+        let id = q
+            .enqueue(SemanticTask::GenerateAbstract(uri.clone()))
+            .await
+            .unwrap();
         let (got_id, task) = q.dequeue().await.unwrap().unwrap();
 
         assert_eq!(got_id, id);
@@ -140,7 +145,10 @@ mod tests {
         let q = TokioSemanticQueue::new();
         let uri = agent_context_db_core::ContextUri::parse("uwu://t/x").unwrap();
 
-        let id = q.enqueue(SemanticTask::GenerateAbstract(uri)).await.unwrap();
+        let id = q
+            .enqueue(SemanticTask::GenerateAbstract(uri))
+            .await
+            .unwrap();
         q.complete(id, TaskOutcome::Success).await.unwrap();
 
         let outcomes = q.outcomes.lock();
@@ -153,8 +161,12 @@ mod tests {
         let uri = agent_context_db_core::ContextUri::parse("uwu://t/x").unwrap();
 
         // 入队两个任务
-        q.enqueue(SemanticTask::GenerateAbstract(uri.clone())).await.unwrap();
-        q.enqueue(SemanticTask::GenerateOverview(uri.clone())).await.unwrap();
+        q.enqueue(SemanticTask::GenerateAbstract(uri.clone()))
+            .await
+            .unwrap();
+        q.enqueue(SemanticTask::GenerateOverview(uri.clone()))
+            .await
+            .unwrap();
 
         // 启动 worker
         let worker = q.spawn_worker(|_id, task| async move {

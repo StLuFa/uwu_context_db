@@ -100,13 +100,22 @@ impl CrossAgentDedup {
 
                 for (uri_a, emb_a) in map_a {
                     for (uri_b, emb_b) in map_b {
-                        let key = if uri_a < uri_b { (uri_a.clone(), uri_b.clone()) } else { (uri_b.clone(), uri_a.clone()) };
-                        if visited.contains(&key) { continue; }
+                        let key = if uri_a < uri_b {
+                            (uri_a.clone(), uri_b.clone())
+                        } else {
+                            (uri_b.clone(), uri_a.clone())
+                        };
+                        if visited.contains(&key) {
+                            continue;
+                        }
                         visited.insert(key);
 
                         let sim = VectorSimilarity::cosine(emb_a, emb_b);
                         if sim >= self.threshold {
-                            if let (Ok(ua), Ok(ub)) = (ContextUri::parse(uri_a.clone()), ContextUri::parse(uri_b.clone())) {
+                            if let (Ok(ua), Ok(ub)) = (
+                                ContextUri::parse(uri_a.clone()),
+                                ContextUri::parse(uri_b.clone()),
+                            ) {
                                 pairs.push((ua, ub, sim));
                             }
                         }
@@ -139,7 +148,8 @@ impl CrossAgentDedup {
 
         // 收集各组
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-        let all_uris: Vec<String> = pairs.iter()
+        let all_uris: Vec<String> = pairs
+            .iter()
             .flat_map(|(a, b, _)| vec![a.to_string(), b.to_string()])
             .collect();
         for uri in all_uris {
@@ -151,12 +161,21 @@ impl CrossAgentDedup {
             .into_iter()
             .filter(|(_, uris)| uris.len() >= 2)
             .map(|(id, uris)| {
-                let agents: Vec<String> = uris.iter()
-                    .filter_map(|u| embeddings.iter().find(|(_, m)| m.contains_key(u)).map(|(a, _)| a.clone()))
+                let agents: Vec<String> = uris
+                    .iter()
+                    .filter_map(|u| {
+                        embeddings
+                            .iter()
+                            .find(|(_, m)| m.contains_key(u))
+                            .map(|(a, _)| a.clone())
+                    })
                     .collect();
                 Cluster {
                     id: id.chars().take(8).collect(),
-                    uris: uris.into_iter().map(|s| ContextUri::parse(s).unwrap()).collect(),
+                    uris: uris
+                        .into_iter()
+                        .map(|s| ContextUri::parse(s).unwrap())
+                        .collect(),
                     centroid_description: String::new(),
                     agents,
                     recommendation: DedupRecommendation::ManualReview,
@@ -196,7 +215,9 @@ impl LocalKnowledgeNetwork {
 impl KnowledgeNetwork for LocalKnowledgeNetwork {
     fn register(&self, agent_id: &str, uri: &ContextUri, embedding: Vec<f32>) {
         self.lsh.lock().insert(uri, &embedding);
-        self.embeddings.lock().insert(uri.to_string(), (agent_id.to_string(), embedding));
+        self.embeddings
+            .lock()
+            .insert(uri.to_string(), (agent_id.to_string(), embedding));
     }
 
     fn find_similar(&self) -> SimilarityResult {
@@ -248,7 +269,10 @@ pub struct FederatedKnowledgeNetwork {
 
 impl FederatedKnowledgeNetwork {
     pub fn new(local: LocalKnowledgeNetwork) -> Self {
-        Self { local, peers: parking_lot::RwLock::new(Vec::new()) }
+        Self {
+            local,
+            peers: parking_lot::RwLock::new(Vec::new()),
+        }
     }
 
     /// 注册一个联邦节点。
@@ -292,7 +316,10 @@ pub struct DifferentialPrivacyBudget {
 
 impl Default for DifferentialPrivacyBudget {
     fn default() -> Self {
-        Self { epsilon: 1.0, delta: 1e-5 }
+        Self {
+            epsilon: 1.0,
+            delta: 1e-5,
+        }
     }
 }
 
@@ -309,19 +336,28 @@ impl PrivacyPreservingNetwork {
         budget: DifferentialPrivacyBudget,
         threshold: f32,
     ) -> Self {
-        Self { inner, budget, similarity_threshold: threshold }
+        Self {
+            inner,
+            budget,
+            similarity_threshold: threshold,
+        }
     }
 
     /// 共享前对 embedding 加高斯噪声。
     pub fn noisy_embedding(&self, embedding: &[f32]) -> Vec<f32> {
         let sigma = (2.0 * (1.25 / self.budget.epsilon).ln()).sqrt() as f32;
-        embedding.iter().map(|v| {
-            // Box-Muller 法生成高斯噪声
-            let u1: f32 = rand_float();
-            let u2: f32 = rand_float();
-            let noise = sigma * (-2.0 * u1.max(1e-10).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
-            v + noise
-        }).collect()
+        embedding
+            .iter()
+            .map(|v| {
+                // Box-Muller 法生成高斯噪声
+                let u1: f32 = rand_float();
+                let u2: f32 = rand_float();
+                let noise = sigma
+                    * (-2.0 * u1.max(1e-10).ln()).sqrt()
+                    * (2.0 * std::f32::consts::PI * u2).cos();
+                v + noise
+            })
+            .collect()
     }
 
     /// 阈值化相似度 — 只暴露 "相似/不相似"，不暴露具体值。
@@ -350,7 +386,9 @@ impl KnowledgeNetwork for PrivacyPreservingNetwork {
         let raw = self.inner.find_similar();
         // 过滤：只保留阈值以上的结果（差分隐私）
         SimilarityResult {
-            pairs: raw.pairs.into_iter()
+            pairs: raw
+                .pairs
+                .into_iter()
                 .filter(|(_, _, sim)| *sim > self.similarity_threshold)
                 .collect(),
             clusters: raw.clusters,
@@ -374,7 +412,9 @@ fn rand_float() -> f32 {
 fn find_root(parent: &mut HashMap<String, String>, node: &str) -> String {
     let mut current = node.to_string();
     while let Some(p) = parent.get(&current) {
-        if p == &current { break; }
+        if p == &current {
+            break;
+        }
         // 路径压缩
         let grandparent = parent.get(p).cloned().unwrap_or_else(|| p.clone());
         parent.insert(current, grandparent.clone());

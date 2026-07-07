@@ -29,14 +29,11 @@ pub struct QualityScore {
 pub struct QualityScorer;
 
 impl QualityScorer {
-    pub fn score(
-        entry: &ContextEntry,
-        access_count: u64,
-        now: DateTime<Utc>,
-    ) -> QualityScore {
+    pub fn score(entry: &ContextEntry, access_count: u64, now: DateTime<Utc>) -> QualityScore {
         let mut dims = HashMap::new();
 
-        let completeness = if matches!(&entry.payload, ContentPayload::Text { dense, .. } if !dense.is_empty()) {
+        let completeness = if matches!(&entry.payload, ContentPayload::Text { dense, .. } if !dense.is_empty())
+        {
             0.9
         } else {
             0.4
@@ -104,7 +101,9 @@ pub struct ProvenanceGraph {
 
 impl ProvenanceGraph {
     pub fn new() -> Self {
-        Self { nodes: parking_lot::RwLock::new(HashMap::new()) }
+        Self {
+            nodes: parking_lot::RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn add_derivation(
@@ -206,8 +205,10 @@ pub fn record_consolidation(entries: usize, products: usize, duration_ms: u64) {
 /// 记录一次 LLM 调用。
 pub fn record_llm_call(provider: &str, tokens: usize, duration_ms: u64, success: bool) {
     metrics::counter!("uwu.llm.calls", "provider" => provider.to_string()).increment(1);
-    metrics::counter!("uwu.llm.tokens", "provider" => provider.to_string()).increment(tokens as u64);
-    metrics::histogram!("uwu.llm.duration_ms", "provider" => provider.to_string()).record(duration_ms as f64);
+    metrics::counter!("uwu.llm.tokens", "provider" => provider.to_string())
+        .increment(tokens as u64);
+    metrics::histogram!("uwu.llm.duration_ms", "provider" => provider.to_string())
+        .record(duration_ms as f64);
     if !success {
         metrics::counter!("uwu.llm.errors", "provider" => provider.to_string()).increment(1);
     }

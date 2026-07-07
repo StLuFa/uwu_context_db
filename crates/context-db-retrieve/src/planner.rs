@@ -5,6 +5,7 @@
 //! 2. CBO 优化器枚举候选 PhysicalPlan，估算成本，选最优
 //! 3. PhysicalPlan 交由物理算子执行
 
+use crate::intent::{IntentDecision, IntentExecutionNodeKind, IntentRoute};
 use crate::query::{Condition, MergeStrategy, Predicate, RelationExpand, SortKey};
 use agent_context_db_core::{ContentLevel, ContentType, ContextUri};
 use std::collections::HashMap;
@@ -85,10 +86,7 @@ pub enum PhysicalPlan {
         limit: usize,
     },
     /// PG 前缀扫描。
-    PgPrefixScan {
-        uri_prefix: String,
-        limit: usize,
-    },
+    PgPrefixScan { uri_prefix: String, limit: usize },
     /// 向量搜索（带 payload 过滤）。
     VectorSearch {
         embedding: Vec<f32>,
@@ -227,6 +225,46 @@ impl Default for StatisticsCollector {
 // CBO 优化器
 // ===========================================================================
 
+#[derive(Debug, Clone)]
+pub struct IntentPlannerHint {
+    pub route: IntentRoute,
+    pub prefer_exact: bool,
+    pub prefer_vector: bool,
+    pub prefer_graph: bool,
+    pub prefer_temporal: bool,
+    pub max_graph_depth: usize,
+    pub top_k_multiplier: f32,
+}
+
+impl From<&IntentDecision> for IntentPlannerHint {
+    fn from(decision: &IntentDecision) -> Self {
+        let mut hint = Self {
+            route: decision.route,
+            prefer_exact: false,
+            prefer_vector: false,
+            prefer_graph: false,
+            prefer_temporal: false,
+            max_graph_depth: decision.execution_graph.budget.max_graph_depth,
+            top_k_multiplier: decision
+                .candidates
+                .first()
+                .map(|candidate| candidate.breakdown.final_score.max(0.1))
+                .unwrap_or(1.0),
+        };
+        for node in &decision.execution_graph.nodes {
+            match node.kind {
+                IntentExecutionNodeKind::ExactLookup => hint.prefer_exact = true,
+                IntentExecutionNodeKind::VectorRetrieve => hint.prefer_vector = true,
+                IntentExecutionNodeKind::GraphTraversal => hint.prefer_graph = true,
+                IntentExecutionNodeKind::TemporalReplay => hint.prefer_temporal = true,
+                IntentExecutionNodeKind::KnowledgeNetworkProbe
+                | IntentExecutionNodeKind::KnowledgeNetworkFetch => {}
+            }
+        }
+        hint
+    }
+}
+
 /// CBO 优化器 — 基于统计信息选择最优物理计划。
 pub struct CboOptimizer {
     stats: std::sync::Arc<StatisticsCollector>,
@@ -239,6 +277,19 @@ impl CboOptimizer {
 
     /// 逻辑计划 → 物理计划（经 CBO 优化）。
     pub fn optimize(&self, logical: &LogicalPlan) -> PhysicalPlan {
+        self.optimize_inner(logical, None)
+    }
+
+    /// 带 intent execution graph hint 的优化入口。
+    pub fn optimize_with_intent(
+        &self,
+        logical: &LogicalPlan,
+        hint: Option<&IntentPlannerHint>,
+    ) -> PhysicalPlan {
+        self.optimize_inner(logical, hint)
+    }
+
+    fn optimize_inner(&self, logical: &LogicalPlan, hint: Option<&IntentPlannerHint>) -> PhysicalPlan {
         match logical {
             LogicalPlan::Scan { scope, level } => {
                 let limit = 1000;
@@ -249,10 +300,7 @@ impl CboOptimizer {
                         limit,
                     }
                 } else {
-                    PhysicalPlan::FullScan {
-                        scope: None,
-                        limit,
-                    }
+                    PhysicalPlan::FullScan { scope: None, limit }
                 }
             }
 
@@ -260,10 +308,16 @@ impl CboOptimizer {
                 collection: _,
                 query,
                 top_k,
-            } => PhysicalPlan::VectorSearch {
-                embedding: query.clone(),
-                filter: VectorFilter::default(),
-                limit: *top_k,
+            } => {
+                let multiplier = hint
+                    .filter(|hint| hint.prefer_vector || matches!(hint.route, IntentRoute::LocalVector | IntentRoute::LocalHybrid))
+                    .map(|hint| hint.top_k_multiplier.clamp(1.0, 3.0))
+                    .unwrap_or(1.0);
+                PhysicalPlan::VectorSearch {
+                    embedding: query.clone(),
+                    filter: VectorFilter::default(),
+                    limit: ((*top_k as f32) * multiplier).ceil() as usize,
+                }
             },
 
             LogicalPlan::Filter { input, predicate } => {
@@ -277,7 +331,7 @@ impl CboOptimizer {
                     };
                 }
                 // 否则：先执行 input，再 filter
-                let inner = self.optimize(input);
+                let inner = self.optimize_inner(input, hint);
                 PhysicalPlan::Filter {
                     input: Box::new(inner),
                     predicate: predicate.clone(),
@@ -285,7 +339,7 @@ impl CboOptimizer {
             }
 
             LogicalPlan::Sort { input, key, desc } => {
-                let inner = self.optimize(input);
+                let inner = self.optimize_inner(input, hint);
                 PhysicalPlan::Sort {
                     input: Box::new(inner),
                     key: *key,
@@ -293,7 +347,7 @@ impl CboOptimizer {
             }
 
             LogicalPlan::Limit { input, budget } => {
-                let inner = self.optimize(input);
+                let inner = self.optimize_inner(input, hint);
                 PhysicalPlan::Limit {
                     input: Box::new(inner),
                     budget: *budget,
@@ -306,24 +360,36 @@ impl CboOptimizer {
                 max_hops,
             } => {
                 let seeds = extract_uris(input);
+                let max_hops = hint
+                    .filter(|hint| hint.prefer_graph || matches!(hint.route, IntentRoute::GraphTraversal))
+                    .map(|hint| (*max_hops).min(hint.max_graph_depth.max(1)))
+                    .unwrap_or(*max_hops);
                 PhysicalPlan::GraphTraverse {
                     seeds,
                     edges: edges.clone(),
-                    max_hops: *max_hops,
+                    max_hops,
                 }
             }
 
             LogicalPlan::TemporalScan { uri, at } => {
                 // 时态查询 → PgPrefixScan（URI + 版本查询参数）
+                let limit = if hint
+                    .map(|hint| hint.prefer_temporal || matches!(hint.route, IntentRoute::TemporalIndex))
+                    .unwrap_or(false)
+                {
+                    25
+                } else {
+                    10
+                };
                 PhysicalPlan::PgPrefixScan {
                     uri_prefix: uri.to_string(),
-                    limit: 10,
+                    limit,
                 }
             }
 
             LogicalPlan::Join { left, right, on: _ } => {
-                let l = self.optimize(left);
-                let r = self.optimize(right);
+                let l = self.optimize_inner(left, hint);
+                let r = self.optimize_inner(right, hint);
                 PhysicalPlan::HashJoin {
                     left: Box::new(l),
                     right: Box::new(r),
@@ -334,9 +400,20 @@ impl CboOptimizer {
 
     /// 估算物理计划的执行成本。
     pub fn estimate_cost(&self, plan: &PhysicalPlan) -> f64 {
-        match plan {
+        self.estimate_cost_with_intent(plan, None)
+    }
+
+    /// 带 intent hint 的成本估算：execution graph 偏好的算子会降低成本，冲突算子会升高成本。
+    pub fn estimate_cost_with_intent(
+        &self,
+        plan: &PhysicalPlan,
+        hint: Option<&IntentPlannerHint>,
+    ) -> f64 {
+        let base = match plan {
             PhysicalPlan::TypeScan {
-                content_type, limit, ..
+                content_type,
+                limit,
+                ..
             } => {
                 let rows = self.stats.estimate_rows_by_type(content_type);
                 ((*limit).min(rows) as f64) * 0.001 // PG WHERE 前缀扫描，很便宜
@@ -351,20 +428,23 @@ impl CboOptimizer {
                 // 图遍历成本随 hops 指数增长
                 10.0 * (edges.len() as f64) * 2_f64.powi(*max_hops as i32)
             }
-            PhysicalPlan::Filter { input, .. } => self.estimate_cost(input) * 1.1,
-            PhysicalPlan::Sort { input, .. } => self.estimate_cost(input) * 1.5,
-            PhysicalPlan::Limit { input, .. } => self.estimate_cost(input),
+            PhysicalPlan::Filter { input, .. } => self.estimate_cost_with_intent(input, hint) * 1.1,
+            PhysicalPlan::Sort { input, .. } => self.estimate_cost_with_intent(input, hint) * 1.5,
+            PhysicalPlan::Limit { input, .. } => self.estimate_cost_with_intent(input, hint),
             PhysicalPlan::HashJoin { left, right } => {
-                self.estimate_cost(left) + self.estimate_cost(right) + 5.0
+                self.estimate_cost_with_intent(left, hint)
+                    + self.estimate_cost_with_intent(right, hint)
+                    + 5.0
             }
             PhysicalPlan::NestedLoopJoin { left, right } => {
-                self.estimate_cost(left) * self.estimate_cost(right)
+                self.estimate_cost_with_intent(left, hint)
+                    * self.estimate_cost_with_intent(right, hint)
             }
             PhysicalPlan::Parallel { plans, .. } => {
                 // 并行执行：取最大单计划成本
                 plans
                     .iter()
-                    .map(|p| self.estimate_cost(p))
+                    .map(|p| self.estimate_cost_with_intent(p, hint))
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0)
             }
@@ -372,13 +452,48 @@ impl CboOptimizer {
                 let rows = 1000_f64; // 默认估算
                 ((*limit).min(rows as usize) as f64) * 0.05
             }
-        }
+        };
+        base * intent_cost_multiplier(plan, hint)
     }
 }
 
 // ===========================================================================
 // 辅助函数
 // ===========================================================================
+
+fn intent_cost_multiplier(plan: &PhysicalPlan, hint: Option<&IntentPlannerHint>) -> f64 {
+    let Some(hint) = hint else {
+        return 1.0;
+    };
+    match plan {
+        PhysicalPlan::TypeScan { .. } | PhysicalPlan::PgPrefixScan { .. } => {
+            if hint.prefer_exact
+                || matches!(hint.route, IntentRoute::LocalExact | IntentRoute::TemporalIndex)
+            {
+                0.75
+            } else {
+                1.0
+            }
+        }
+        PhysicalPlan::VectorSearch { .. } => {
+            if hint.prefer_vector
+                || matches!(hint.route, IntentRoute::LocalVector | IntentRoute::LocalHybrid)
+            {
+                0.8
+            } else {
+                1.1
+            }
+        }
+        PhysicalPlan::GraphTraverse { .. } => {
+            if hint.prefer_graph || matches!(hint.route, IntentRoute::GraphTraversal) {
+                0.7
+            } else {
+                1.25
+            }
+        }
+        _ => 1.0,
+    }
+}
 
 /// 如果谓词只包含 TypeEquals，返回该类型。
 fn predicate_type_only(predicate: &Predicate) -> Option<ContentType> {
@@ -393,9 +508,9 @@ fn predicate_type_only(predicate: &Predicate) -> Option<ContentType> {
 /// 从逻辑计划中提取 scope。
 fn extract_scope(plan: &LogicalPlan) -> Option<ScopeFilter> {
     match plan {
-        LogicalPlan::Scan { scope, .. } => scope.as_ref().map(|u| {
-            ScopeFilter::UriPrefix(u.to_string())
-        }),
+        LogicalPlan::Scan { scope, .. } => scope
+            .as_ref()
+            .map(|u| ScopeFilter::UriPrefix(u.to_string())),
         _ => None,
     }
 }
@@ -405,5 +520,77 @@ fn extract_uris(plan: &LogicalPlan) -> Vec<ContextUri> {
     match plan {
         LogicalPlan::Scan { scope, .. } => scope.clone().into_iter().collect(),
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intent::{
+        IntentCandidate, IntentDecision, IntentExecutionBudget, IntentExecutionGraph,
+        IntentExecutionNode, IntentExecutionNodeKind, IntentExplanation, IntentKind,
+        IntentPolicyRef, IntentScoreBreakdown,
+    };
+    use crate::query::RelationKind;
+
+    #[test]
+    fn intent_hint_limits_graph_depth() {
+        let optimizer = CboOptimizer::new(std::sync::Arc::new(StatisticsCollector::new()));
+        let logical = LogicalPlan::Traverse {
+            input: Box::new(LogicalPlan::Scan {
+                scope: Some(ContextUri::parse("uwu://u/agent/a/memories").unwrap()),
+                level: ContentLevel::L0,
+            }),
+            edges: vec![RelationKind::DerivedFrom],
+            max_hops: 5,
+        };
+        let decision = IntentDecision {
+            primary: IntentKind::PatternMatch,
+            secondary: Vec::new(),
+            route: IntentRoute::GraphTraversal,
+            confidence: 0.9,
+            ambiguity: 0.0,
+            candidates: vec![IntentCandidate {
+                intent: IntentKind::PatternMatch,
+                route: IntentRoute::GraphTraversal,
+                score: 0.9,
+                priority: 10,
+                matched_terms: vec!["pattern".into()],
+                matched_patterns: Vec::new(),
+                breakdown: IntentScoreBreakdown {
+                    final_score: 0.9,
+                    ..Default::default()
+                },
+            }],
+            execution_graph: IntentExecutionGraph {
+                nodes: vec![IntentExecutionNode {
+                    id: "graph".into(),
+                    kind: IntentExecutionNodeKind::GraphTraversal,
+                    route: IntentRoute::GraphTraversal,
+                }],
+                edges: Vec::new(),
+                budget: IntentExecutionBudget {
+                    max_graph_depth: 2,
+                    ..Default::default()
+                },
+            },
+            explanation: IntentExplanation {
+                policy_pack: "test".into(),
+                policy_version: "1".into(),
+                matched_rule_ids: Vec::new(),
+                notes: Vec::new(),
+            },
+            policy: IntentPolicyRef {
+                id: "test".into(),
+                version: "1".into(),
+                engine_version: 1,
+            },
+        };
+        let hint = IntentPlannerHint::from(&decision);
+        let physical = optimizer.optimize_with_intent(&logical, Some(&hint));
+        match physical {
+            PhysicalPlan::GraphTraverse { max_hops, .. } => assert_eq!(max_hops, 2),
+            other => panic!("unexpected plan: {other:?}"),
+        }
     }
 }

@@ -241,14 +241,16 @@ pub struct CognitiveTrainingPipeline;
 
 #[allow(deprecated)]
 impl CognitiveTrainingPipeline {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// 执行一轮训练（骨架）。
-    pub async fn train(
-        &self,
-        _config: &TrainingConfig,
-    ) -> Result<TrainingReport> {
-        Ok(TrainingReport { epochs: vec![], accuracy_delta: 0.0 })
+    pub async fn train(&self, _config: &TrainingConfig) -> Result<TrainingReport> {
+        Ok(TrainingReport {
+            epochs: vec![],
+            accuracy_delta: 0.0,
+        })
     }
 }
 
@@ -266,10 +268,7 @@ pub fn extract_gradients_from_products(
     let mut gradients = Vec::new();
 
     for product in products {
-        let weight = CognitiveGradient::compute_weight(
-            product.content_type,
-            product.quality_score,
-        );
+        let weight = CognitiveGradient::compute_weight(product.content_type, product.quality_score);
 
         if weight < min_confidence {
             continue;
@@ -363,7 +362,11 @@ pub fn extract_gradients_from_products(
     }
 
     // 按权重降序
-    gradients.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+    gradients.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     gradients
 }
 
@@ -407,7 +410,10 @@ pub enum SkillValidationStatus {
     /// 验证中：正在训练评估。
     Validating { epoch: usize, trials_done: u32 },
     /// 已验证：训练评估通过。
-    Validated { success_rate: f32, benchmark: String },
+    Validated {
+        success_rate: f32,
+        benchmark: String,
+    },
     /// 已证伪：训练评估失败。
     Falsified { reason: String },
     /// 已废弃：被更好的 Skill 取代。
@@ -461,16 +467,17 @@ impl Skill {
         };
         self.last_validated = Utc::now();
 
-        if let SkillValidationStatus::Validating {
-            trials_done, ..
-        } = &mut self.validation_status
-        {
+        if let SkillValidationStatus::Validating { trials_done, .. } = &mut self.validation_status {
             *trials_done = trials_done.saturating_add(1);
         }
     }
 
     /// 评估并推进状态机。
-    pub fn evaluate(&mut self, success_threshold: f32, failure_threshold: f32) -> SkillValidationStatus {
+    pub fn evaluate(
+        &mut self,
+        success_threshold: f32,
+        failure_threshold: f32,
+    ) -> SkillValidationStatus {
         let total = self.success_count + self.failure_count;
         if total < 3 {
             return self.validation_status.clone(); // 需要更多数据
@@ -500,12 +507,18 @@ impl Skill {
 
     /// 是否已经验证。
     pub fn is_validated(&self) -> bool {
-        matches!(self.validation_status, SkillValidationStatus::Validated { .. })
+        matches!(
+            self.validation_status,
+            SkillValidationStatus::Validated { .. }
+        )
     }
 
     /// 是否已证伪。
     pub fn is_falsified(&self) -> bool {
-        matches!(self.validation_status, SkillValidationStatus::Falsified { .. })
+        matches!(
+            self.validation_status,
+            SkillValidationStatus::Falsified { .. }
+        )
     }
 }
 
@@ -544,10 +557,7 @@ pub struct FailureCase {
 ///
 /// - 成功 case → Skill 记忆（可指导下轮训练）
 /// - 失败 case → Error 记忆（避免重复踩坑）
-pub fn feedback_evaluation_to_memories(
-    eval: &EvalResult,
-    agent_scope: &str,
-) -> Vec<ContextEntry> {
+pub fn feedback_evaluation_to_memories(eval: &EvalResult, agent_scope: &str) -> Vec<ContextEntry> {
     let mut entries = Vec::new();
 
     // 成功 case → Skill 记忆
@@ -618,11 +628,15 @@ impl CognitiveMetric {
         } else {
             0.0
         };
-        let composite = consistency * 0.35
-            + confidence * 0.25
-            + completion * 0.25
-            + efficiency * 0.15;
-        Self { consistency, confidence, completion, efficiency, composite }
+        let composite =
+            consistency * 0.35 + confidence * 0.25 + completion * 0.25 + efficiency * 0.15;
+        Self {
+            consistency,
+            confidence,
+            completion,
+            efficiency,
+            composite,
+        }
     }
 }
 
@@ -633,8 +647,15 @@ impl CognitiveMetric {
 /// 策略门控决策。
 #[derive(Debug, Clone)]
 pub enum GateDecision {
-    Replace { win_rate: f32, avg_delta: f32 },
-    Keep { win_rate: f32, avg_delta: f32, reason: String },
+    Replace {
+        win_rate: f32,
+        avg_delta: f32,
+    },
+    Keep {
+        win_rate: f32,
+        avg_delta: f32,
+        reason: String,
+    },
 }
 
 /// 策略门控 — 新策略必须胜率 > 阈值才能替换。
@@ -643,12 +664,21 @@ pub struct PolicyGate {
 }
 
 impl PolicyGate {
-    pub fn new(threshold: f32) -> Self { Self { threshold } }
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
 
     pub fn should_replace(&self, new_wins: usize, total: usize, avg_delta: f32) -> GateDecision {
-        let win_rate = if total > 0 { new_wins as f32 / total as f32 } else { 0.0 };
+        let win_rate = if total > 0 {
+            new_wins as f32 / total as f32
+        } else {
+            0.0
+        };
         if win_rate >= self.threshold && avg_delta > 0.0 {
-            GateDecision::Replace { win_rate, avg_delta }
+            GateDecision::Replace {
+                win_rate,
+                avg_delta,
+            }
         } else {
             GateDecision::Keep {
                 win_rate,

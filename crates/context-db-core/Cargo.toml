@@ -13,7 +13,7 @@ async-trait = "0.1"
 thiserror = "1"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["sync"] }
-lru = "0.12"
+moka = { version = "0.12", features = ["future"] }
 metrics = "0.23"
 arc-swap = { workspace = true }
 redis = { version = "0.25", features = ["aio", "tokio-comp", "streams"], optional = true }

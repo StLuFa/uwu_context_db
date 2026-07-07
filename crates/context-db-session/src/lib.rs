@@ -12,8 +12,8 @@
 pub mod compressor;
 
 pub use compressor::{
-    MemoryExtractorShim, SemanticProcessorShim, SessionCompressorImpl,
-    ShimAction, ShimCandidateAction,
+    MemoryExtractorShim, SemanticProcessorShim, SessionCompressorImpl, ShimAction,
+    ShimCandidateAction,
 };
 
 use agent_context_db_core::{ContextUri, MemoryClass, Result};

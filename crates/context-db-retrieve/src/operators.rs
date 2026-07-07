@@ -49,7 +49,10 @@ pub struct ExecStats {
 impl PhysicalPlan {
     /// 执行物理计划 — 分发到对应算子。
     /// 执行物理计划 — 分发到对应算子。
-    pub fn execute<'a>(&'a self, ctx: &'a ExecContext) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecordBatch>> + Send + 'a>> {
+    pub fn execute<'a>(
+        &'a self,
+        ctx: &'a ExecContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecordBatch>> + Send + 'a>> {
         Box::pin(async move { self.execute_inner(ctx).await })
     }
 
@@ -197,19 +200,24 @@ impl VectorSearchOp {
         limit: usize,
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
-        let index = ctx
-            .index
-            .as_ref()
-            .ok_or_else(|| agent_context_db_core::ContextError::Unsupported("no vector index".into()))?;
+        let index = ctx.index.as_ref().ok_or_else(|| {
+            agent_context_db_core::ContextError::Unsupported("no vector index".into())
+        })?;
 
         // 构建 JSON filter（向量索引原生支持 payload 过滤）
         let filter_json = if filter.uri_prefix.is_some() || filter.content_type.is_some() {
             let mut f = serde_json::Map::new();
             if let Some(prefix) = &filter.uri_prefix {
-                f.insert("uri_prefix".into(), serde_json::Value::String(prefix.clone()));
+                f.insert(
+                    "uri_prefix".into(),
+                    serde_json::Value::String(prefix.clone()),
+                );
             }
             if let Some(ct) = &filter.content_type {
-                f.insert("content_type".into(), serde_json::Value::String(ct.as_path_segment().into()));
+                f.insert(
+                    "content_type".into(),
+                    serde_json::Value::String(ct.as_path_segment().into()),
+                );
             }
             Some(serde_json::Value::Object(f))
         } else {
@@ -217,23 +225,23 @@ impl VectorSearchOp {
         };
 
         let collection = filter.uri_prefix.as_deref().unwrap_or("default");
-        let index_hits = index.search(collection, embedding.to_vec(), limit, filter_json).await?;
+        let index_hits = index
+            .search(collection, embedding.to_vec(), limit, filter_json)
+            .await?;
 
         let hits: Vec<RetrievalHit> = index_hits
             .into_iter()
-            .map(|h| {
-                RetrievalHit {
-                    uri: h.uri,
-                    level: ContentLevel::L0,
-                    content: ContentPayload::Text {
-                        sparse: String::new(),
-                        dense: String::new(),
-                        full: String::new(),
-                    },
-                    relevance: h.score,
-                    parent_chain: vec![],
-                    content_type: None,
-                }
+            .map(|h| RetrievalHit {
+                uri: h.uri,
+                level: ContentLevel::L0,
+                content: ContentPayload::Text {
+                    sparse: String::new(),
+                    dense: String::new(),
+                    full: String::new(),
+                },
+                relevance: h.score,
+                parent_chain: vec![],
+                content_type: None,
             })
             .collect();
 
@@ -315,36 +323,65 @@ impl GraphTraverseOp {
             None => {
                 // 无图存储 → 返回 seeds 本身
                 return Ok(RecordBatch {
-                    records: seeds.iter().map(|s| RetrievalHit {
-                        uri: s.clone(),
-                        level: ContentLevel::L0,
-                        content: ContentPayload::Text { sparse: String::new(), dense: String::new(), full: String::new() },
-                        relevance: 0.5,
-                        parent_chain: vec![],
-                        content_type: None,
-                    }).collect(),
+                    records: seeds
+                        .iter()
+                        .map(|s| RetrievalHit {
+                            uri: s.clone(),
+                            level: ContentLevel::L0,
+                            content: ContentPayload::Text {
+                                sparse: String::new(),
+                                dense: String::new(),
+                                full: String::new(),
+                            },
+                            relevance: 0.5,
+                            parent_chain: vec![],
+                            content_type: None,
+                        })
+                        .collect(),
                     stats: ExecStats::default(),
                 });
             }
         };
 
         // 将 RelationKind 转换为 GraphRelation
-        let kinds: Vec<agent_context_db_core::GraphRelation> = edges.iter().map(|e| match e {
-            crate::query::RelationKind::EvolvedFrom => agent_context_db_core::GraphRelation::EvolvedFrom,
-            crate::query::RelationKind::EvolvedTo => agent_context_db_core::GraphRelation::EvolvedTo,
-            crate::query::RelationKind::EvidenceOf => agent_context_db_core::GraphRelation::EvidenceOf,
-            crate::query::RelationKind::EntangledWith => agent_context_db_core::GraphRelation::EntangledWith,
-            crate::query::RelationKind::Contradicts => agent_context_db_core::GraphRelation::Contradicts,
-            crate::query::RelationKind::Corroborates => agent_context_db_core::GraphRelation::Corroborates,
-            crate::query::RelationKind::DerivedFrom => agent_context_db_core::GraphRelation::DerivedFrom,
-            crate::query::RelationKind::Supersedes => agent_context_db_core::GraphRelation::Supersedes,
-            crate::query::RelationKind::DrivesPolicy => agent_context_db_core::GraphRelation::DrivesPolicy,
-        }).collect();
+        let kinds: Vec<agent_context_db_core::GraphRelation> = edges
+            .iter()
+            .map(|e| match e {
+                crate::query::RelationKind::EvolvedFrom => {
+                    agent_context_db_core::GraphRelation::EvolvedFrom
+                }
+                crate::query::RelationKind::EvolvedTo => {
+                    agent_context_db_core::GraphRelation::EvolvedTo
+                }
+                crate::query::RelationKind::EvidenceOf => {
+                    agent_context_db_core::GraphRelation::EvidenceOf
+                }
+                crate::query::RelationKind::EntangledWith => {
+                    agent_context_db_core::GraphRelation::EntangledWith
+                }
+                crate::query::RelationKind::Contradicts => {
+                    agent_context_db_core::GraphRelation::Contradicts
+                }
+                crate::query::RelationKind::Corroborates => {
+                    agent_context_db_core::GraphRelation::Corroborates
+                }
+                crate::query::RelationKind::DerivedFrom => {
+                    agent_context_db_core::GraphRelation::DerivedFrom
+                }
+                crate::query::RelationKind::Supersedes => {
+                    agent_context_db_core::GraphRelation::Supersedes
+                }
+                crate::query::RelationKind::DrivesPolicy => {
+                    agent_context_db_core::GraphRelation::DrivesPolicy
+                }
+            })
+            .collect();
 
         match graph.batch_traverse(seeds, &kinds, max_hops).await {
             Ok(edges_result) => {
-                let hits: Vec<RetrievalHit> = edges_result.into_iter().map(|(from, to, kind)| {
-                    RetrievalHit {
+                let hits: Vec<RetrievalHit> = edges_result
+                    .into_iter()
+                    .map(|(from, to, kind)| RetrievalHit {
                         uri: to.clone(),
                         level: ContentLevel::L0,
                         content: ContentPayload::Text {
@@ -355,18 +392,24 @@ impl GraphTraverseOp {
                         relevance: 0.6,
                         parent_chain: vec![from],
                         content_type: None,
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 let count = hits.len();
                 Ok(RecordBatch {
                     records: hits,
-                    stats: ExecStats { rows_scanned: count, ..Default::default() },
+                    stats: ExecStats {
+                        rows_scanned: count,
+                        ..Default::default()
+                    },
                 })
             }
             Err(e) => {
                 tracing::warn!(error=%e, "graph traverse failed, returning seeds");
-                Ok(RecordBatch { records: vec![], stats: ExecStats::default() })
+                Ok(RecordBatch {
+                    records: vec![],
+                    stats: ExecStats::default(),
+                })
             }
         }
     }
@@ -432,17 +475,19 @@ impl FullScanOp {
 
         // 用 FsOps::find 执行扫描
         let pattern = agent_context_db_core::FindPattern {
-            scope: Some(ContextUri::parse(&prefix).unwrap_or_else(|_| {
-                ContextUri::parse("uwu://").unwrap()
-            })),
+            scope: Some(
+                ContextUri::parse(&prefix).unwrap_or_else(|_| ContextUri::parse("uwu://").unwrap()),
+            ),
             ..Default::default()
         };
 
         match ctx.fs.find(&pattern).await {
             Ok(uris) => {
                 let count = uris.len().min(limit);
-                let hits: Vec<RetrievalHit> = uris.into_iter().take(limit).map(|uri| {
-                    RetrievalHit {
+                let hits: Vec<RetrievalHit> = uris
+                    .into_iter()
+                    .take(limit)
+                    .map(|uri| RetrievalHit {
                         uri,
                         level: ContentLevel::L0,
                         content: ContentPayload::Text {
@@ -453,17 +498,23 @@ impl FullScanOp {
                         relevance: 0.5,
                         parent_chain: vec![],
                         content_type: None,
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 Ok(RecordBatch {
                     records: hits,
-                    stats: ExecStats { rows_scanned: count, ..Default::default() },
+                    stats: ExecStats {
+                        rows_scanned: count,
+                        ..Default::default()
+                    },
                 })
             }
             Err(e) => {
                 tracing::warn!(error=%e, "full scan failed");
-                Ok(RecordBatch { records: vec![], stats: ExecStats::default() })
+                Ok(RecordBatch {
+                    records: vec![],
+                    stats: ExecStats::default(),
+                })
             }
         }
     }
@@ -488,4 +539,3 @@ impl JoinOp {
         JoinOp::hash_join(l, r).await
     }
 }
-

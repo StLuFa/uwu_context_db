@@ -30,15 +30,19 @@ pub struct ConvergenceReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EstablishmentStatus {
-    Unverified,      // 0 个独立源
-    Single,          // 1 个
-    Corroborated,    // 2 个
-    Established,     // ≥3 个 = Schelling 点
+    Unverified,   // 0 个独立源
+    Single,       // 1 个
+    Corroborated, // 2 个
+    Established,  // ≥3 个 = Schelling 点
 }
 
 impl ConsensusTracker {
     pub fn new(vector_index: Arc<dyn VectorIndex>) -> Self {
-        Self { vector_index, convergence_threshold: 0.9, established_threshold: 3 }
+        Self {
+            vector_index,
+            convergence_threshold: 0.9,
+            established_threshold: 3,
+        }
     }
 
     /// 新条目写入时：检查是否已有独立 Agent 达成相同结论。
@@ -52,8 +56,12 @@ impl ConsensusTracker {
         let mut corroboration = 1; // 自身
 
         for existing_entry in existing {
-            if existing_entry.publisher == new_entry.publisher { continue; }
-            if existing_entry.domain != new_entry.domain { continue; }
+            if existing_entry.publisher == new_entry.publisher {
+                continue;
+            }
+            if existing_entry.domain != new_entry.domain {
+                continue;
+            }
 
             // Jaccard 相似度作为快速筛选
             let sim = jaccard_similarity(&new_entry.principle, &existing_entry.principle);
@@ -87,14 +95,22 @@ impl ConsensusTracker {
     }
 
     /// Schelling 点：返回所有 ≥N 个独立源的"已确立"条目。
-    pub fn find_established<'a>(&self, entries: &'a [MarketEntry], min_sources: usize) -> Vec<&'a MarketEntry> {
+    pub fn find_established<'a>(
+        &self,
+        entries: &'a [MarketEntry],
+        min_sources: usize,
+    ) -> Vec<&'a MarketEntry> {
         let mut established = Vec::new();
         for entry in entries {
             if entry.corroboration.independent_sources >= min_sources {
                 established.push(entry);
             }
         }
-        established.sort_by(|a, b| b.corroboration.independent_sources.cmp(&a.corroboration.independent_sources));
+        established.sort_by(|a, b| {
+            b.corroboration
+                .independent_sources
+                .cmp(&a.corroboration.independent_sources)
+        });
         established
     }
 }
@@ -104,5 +120,9 @@ fn jaccard_similarity(a: &str, b: &str) -> f32 {
     let wb: std::collections::HashSet<&str> = b.split_whitespace().collect();
     let intersection = wa.intersection(&wb).count();
     let union = wa.union(&wb).count();
-    if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
 }

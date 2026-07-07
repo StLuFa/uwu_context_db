@@ -1,4 +1,4 @@
-//! 读取缓存 trait — L0/L1 内容缓存（LRU + 穿透/雪崩防护）。
+//! 读取缓存 trait — L0/L1 内容缓存（moka async cache + 穿透/雪崩防护）。
 //!
 //! - **穿透防护**：`put_negative()` 记录"已知缺失"标记，短 TTL（默认 30s），
 //!   避免重复回源查询同一个不存在的 URI。
@@ -7,7 +7,8 @@
 
 use crate::{ContentLevel, ContentPayload, ContextUri, Result};
 use async_trait::async_trait;
-use std::time::Duration;
+use moka::policy::Expiry;
+use std::time::{Duration, Instant};
 
 /// 读取缓存端口。
 #[async_trait]
@@ -20,16 +21,52 @@ pub trait ReadCache: Send + Sync {
     /// - `None` — 未命中，需回源
     async fn get(&self, uri: &ContextUri, level: ContentLevel) -> Option<Option<ContentPayload>>;
     /// 写入正缓存 —— TTL 会附加 ±10% 抖动。
-    async fn put(&self, uri: &ContextUri, level: ContentLevel, payload: ContentPayload, ttl: Duration);
+    async fn put(
+        &self,
+        uri: &ContextUri,
+        level: ContentLevel,
+        payload: ContentPayload,
+        ttl: Duration,
+    );
     /// 写入负缓存 —— 标记该 URI 当前不存在，短 TTL（默认 30s）。
     async fn put_negative(&self, uri: &ContextUri, level: ContentLevel);
     async fn invalidate(&self, uri: &ContextUri);
 }
 
-/// 内存实现（LRU + jitter TTL + 负缓存）。
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    payload: Option<ContentPayload>,
+    ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct ReadCacheExpiry;
+
+impl Expiry<String, CacheEntry> for ReadCacheExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &CacheEntry,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &CacheEntry,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
+}
+
+/// 内存实现（moka async cache + jitter TTL + 负缓存）。
 pub struct MemoryReadCache {
-    /// LRU：URI → (payload_option, deadline)。None 表示负缓存。
-    l0: parking_lot::Mutex<lru::LruCache<String, (Option<ContentPayload>, std::time::Instant)>>,
+    /// URI → payload option。`None` 表示负缓存；moka 负责容量淘汰与 TTL 过期。
+    l0: moka::future::Cache<String, CacheEntry>,
     /// 默认正缓存 TTL（`put` 传入的 ttl 优先）。
     default_ttl: Duration,
     /// 负缓存 TTL（穿透防护）。
@@ -39,7 +76,10 @@ pub struct MemoryReadCache {
 impl MemoryReadCache {
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
-            l0: parking_lot::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(capacity.max(1)).unwrap())),
+            l0: moka::future::Cache::builder()
+                .max_capacity(capacity.max(1) as u64)
+                .expire_after(ReadCacheExpiry)
+                .build(),
             default_ttl: ttl,
             negative_ttl: Duration::from_secs(30),
         }
@@ -75,29 +115,44 @@ impl MemoryReadCache {
 #[async_trait]
 impl ReadCache for MemoryReadCache {
     async fn get(&self, uri: &ContextUri, _level: ContentLevel) -> Option<Option<ContentPayload>> {
-        let mut cache = self.l0.lock();
-        let key = uri.to_string();
-        if let Some((payload_opt, deadline)) = cache.get(&key) {
-            if *deadline > std::time::Instant::now() {
-                return Some(payload_opt.clone());
-            }
-            cache.pop(&key);
-        }
-        None
+        self.l0
+            .get(&uri.to_string())
+            .await
+            .map(|entry| entry.payload)
     }
 
-    async fn put(&self, uri: &ContextUri, _level: ContentLevel, payload: ContentPayload, ttl: Duration) {
+    async fn put(
+        &self,
+        uri: &ContextUri,
+        _level: ContentLevel,
+        payload: ContentPayload,
+        ttl: Duration,
+    ) {
         let effective_ttl = if ttl.is_zero() { self.default_ttl } else { ttl };
-        let deadline = std::time::Instant::now() + Self::jittered(effective_ttl);
-        self.l0.lock().put(uri.to_string(), (Some(payload), deadline));
+        self.l0
+            .insert(
+                uri.to_string(),
+                CacheEntry {
+                    payload: Some(payload),
+                    ttl: Self::jittered(effective_ttl),
+                },
+            )
+            .await;
     }
 
     async fn put_negative(&self, uri: &ContextUri, _level: ContentLevel) {
-        let deadline = std::time::Instant::now() + Self::jittered(self.negative_ttl);
-        self.l0.lock().put(uri.to_string(), (None, deadline));
+        self.l0
+            .insert(
+                uri.to_string(),
+                CacheEntry {
+                    payload: None,
+                    ttl: Self::jittered(self.negative_ttl),
+                },
+            )
+            .await;
     }
 
     async fn invalidate(&self, uri: &ContextUri) {
-        self.l0.lock().pop(&uri.to_string());
+        self.l0.invalidate(&uri.to_string()).await;
     }
 }

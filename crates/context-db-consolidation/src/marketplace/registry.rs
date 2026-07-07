@@ -59,18 +59,23 @@ impl FederatedRegistry {
 
     pub fn publish(&self, entry: MarketEntry) {
         // 注册到向量索引
-        let uri = agent_context_db_core::ContextUri::parse(
-            format!("uwu://market/{}/{}", entry.publisher, entry.id.0)
-        ).expect("marketplace URI is well-formed");
-        let _ = self.local_index.upsert("market", agent_context_db_core::IndexPoint {
-            uri: uri.clone(),
-            vector: vec![0.0; 128], // actual embedding from product
-            payload: serde_json::json!({
-                "market_id": entry.id.0.to_string(),
-                "domain": entry.domain,
-                "quality": entry.quality_score,
-            }),
-        });
+        let uri = agent_context_db_core::ContextUri::parse(format!(
+            "uwu://market/{}/{}",
+            entry.publisher, entry.id.0
+        ))
+        .expect("marketplace URI is well-formed");
+        let _ = self.local_index.upsert(
+            "market",
+            agent_context_db_core::IndexPoint {
+                uri: uri.clone(),
+                vector: vec![0.0; 128], // actual embedding from product
+                payload: serde_json::json!({
+                    "market_id": entry.id.0.to_string(),
+                    "domain": entry.domain,
+                    "quality": entry.quality_score,
+                }),
+            },
+        );
         self.publications.write().insert(entry.id, entry.clone());
 
         // 广播到 EventMesh
@@ -78,7 +83,9 @@ impl FederatedRegistry {
             let topic_str = format!("market.publish.{}", entry.domain);
             if let Ok(topic) = Topic::new(topic_str) {
                 if let Ok(json) = serde_json::to_value(&entry) {
-                    tokio::spawn(async move { let _ = mesh.emit(&topic, json).await; });
+                    tokio::spawn(async move {
+                        let _ = mesh.emit(&topic, json).await;
+                    });
                 }
             }
         }
@@ -108,7 +115,9 @@ impl FederatedRegistry {
 
     /// 获取某领域已知的同伴。
     pub fn peers_in_domain(&self, domain: &str) -> Vec<PeerInfo> {
-        self.peers.read().values()
+        self.peers
+            .read()
+            .values()
             .filter(|p| p.domains.iter().any(|d| d == domain))
             .cloned()
             .collect()
@@ -122,14 +131,19 @@ impl FederatedRegistry {
     // ── 订阅 ──────────────────────────────
 
     pub fn subscribe(&self, domain: &str, publisher: AgentId) {
-        self.subscriptions.write()
+        self.subscriptions
+            .write()
             .entry(domain.to_string())
             .or_default()
             .push(publisher);
     }
 
     pub fn subscriptions_for(&self, domain: &str) -> Vec<AgentId> {
-        self.subscriptions.read().get(domain).cloned().unwrap_or_default()
+        self.subscriptions
+            .read()
+            .get(domain)
+            .cloned()
+            .unwrap_or_default()
     }
 
     // ── 血统 ──────────────────────────────
@@ -148,7 +162,9 @@ impl FederatedRegistry {
         let mut visited = std::collections::HashSet::new();
         let mut stack = vec![*id];
         while let Some(current) = stack.pop() {
-            if !visited.insert(current) { continue; }
+            if !visited.insert(current) {
+                continue;
+            }
             if let Some(node) = self.get_lineage(&current) {
                 stack.extend(&node.parent_ids);
                 result.push(node);
@@ -161,7 +177,11 @@ impl FederatedRegistry {
 
     /// 本地搜索（向量索引）。
     pub async fn search_local(&self, embedding: &[f32], limit: usize) -> Vec<MarketEntry> {
-        let hits = self.local_index.search("market", embedding.to_vec(), limit, None).await.unwrap_or_default();
+        let hits = self
+            .local_index
+            .search("market", embedding.to_vec(), limit, None)
+            .await
+            .unwrap_or_default();
         let pubs = self.publications.read();
         hits.iter()
             .filter_map(|h| {

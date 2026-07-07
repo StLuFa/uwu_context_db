@@ -34,7 +34,9 @@ pub struct CrossAgentPhylogeny {
 
 impl CrossAgentPhylogeny {
     pub fn new() -> Self {
-        Self { lineages: parking_lot::RwLock::new(HashMap::new()) }
+        Self {
+            lineages: parking_lot::RwLock::new(HashMap::new()),
+        }
     }
 
     /// 注册一个血统节点。
@@ -68,7 +70,11 @@ impl CrossAgentPhylogeny {
         })
     }
 
-    fn find_origin(&self, node: &LineageNode, lineages: &HashMap<MarketId, LineageNode>) -> LineageNode {
+    fn find_origin(
+        &self,
+        node: &LineageNode,
+        lineages: &HashMap<MarketId, LineageNode>,
+    ) -> LineageNode {
         if node.parent_ids.is_empty() {
             return node.clone();
         }
@@ -90,7 +96,8 @@ impl CrossAgentPhylogeny {
         lineages: &HashMap<MarketId, LineageNode>,
         depth: usize,
     ) -> PhylogenyNode {
-        let children: Vec<PhylogenyNode> = lineages.values()
+        let children: Vec<PhylogenyNode> = lineages
+            .values()
             .filter(|n| n.parent_ids.contains(&node.market_id))
             .map(|n| self.build_tree(n, lineages, depth + 1))
             .collect();
@@ -117,7 +124,11 @@ impl CrossAgentPhylogeny {
         if node.children.is_empty() {
             node.depth
         } else {
-            node.children.iter().map(|c| self.max_depth_of(c)).max().unwrap_or(node.depth)
+            node.children
+                .iter()
+                .map(|c| self.max_depth_of(c))
+                .max()
+                .unwrap_or(node.depth)
         }
     }
 }

@@ -1,8 +1,8 @@
 //! PublishGate — 质量门控 + 确认阶梯 + 声誉债券 + C2D 边界。
 
-use crate::marketplace::types::*;
-use crate::marketplace::registry::FederatedRegistry;
 use crate::ConsolidationProduct;
+use crate::marketplace::registry::FederatedRegistry;
+use crate::marketplace::types::*;
 
 /// 发布门控 — 检查 knowledge 是否可以进入市场。
 pub struct PublishGate {
@@ -14,7 +14,10 @@ pub struct PublishGate {
 
 impl PublishGate {
     pub fn new() -> Self {
-        Self { min_quality: 0.80, min_corroboration: CorroborationLevel::CrossSession }
+        Self {
+            min_quality: 0.80,
+            min_corroboration: CorroborationLevel::CrossSession,
+        }
     }
 
     /// 尝试发布一个 ConsolidationProduct。
@@ -55,7 +58,7 @@ impl PublishGate {
 
         let entry = MarketEntry {
             id: MarketId::new(),
-            publisher: publisher.to_string(),
+            publisher: AgentId::new(publisher),
             domain: domain.to_string(),
             entry_type,
             principle: product.content.clone(),
@@ -68,9 +71,10 @@ impl PublishGate {
             content_type: product.content_type,
             half_life_days: product.metadata.half_life_days,
             created_at: chrono::Utc::now(),
-            expires_at: product.metadata.half_life_days.map(|d| {
-                chrono::Utc::now() + chrono::Duration::days(d as i64)
-            }),
+            expires_at: product
+                .metadata
+                .half_life_days
+                .map(|d| chrono::Utc::now() + chrono::Duration::days(d as i64)),
         };
 
         Ok(entry)
@@ -95,7 +99,9 @@ impl std::fmt::Display for PublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PublishError::QualityTooLow(q) => write!(f, "quality {:.2} below threshold", q),
-            PublishError::InsufficientCorroboration(l) => write!(f, "corroboration level {:?} insufficient", l),
+            PublishError::InsufficientCorroboration(l) => {
+                write!(f, "corroboration level {:?} insufficient", l)
+            }
             PublishError::EmptyContent => write!(f, "empty content"),
             PublishError::NotOwner => write!(f, "not the owner"),
         }

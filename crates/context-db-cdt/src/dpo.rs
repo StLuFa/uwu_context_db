@@ -2,13 +2,16 @@
 
 /// 知识约束 DPO 损失计算器。
 pub struct KnowledgeConstrainedDPO {
-    pub beta: f64,                     // KL 约束强度
-    pub contradiction_penalty: f64,     // 矛盾惩罚系数
+    pub beta: f64,                  // KL 约束强度
+    pub contradiction_penalty: f64, // 矛盾惩罚系数
 }
 
 impl KnowledgeConstrainedDPO {
     pub fn new(beta: f64, contradiction_penalty: f64) -> Self {
-        Self { beta, contradiction_penalty }
+        Self {
+            beta,
+            contradiction_penalty,
+        }
     }
 
     /// 偏好loss + 矛盾 penalty。

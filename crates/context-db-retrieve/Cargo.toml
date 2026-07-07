@@ -6,12 +6,17 @@ description = "agent-context-db M1 检索层：HierarchicalRetriever + IntentAna
 
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
+aho-corasick = "1"
+arc-swap = { workspace = true }
+async-trait = "0.1"
+chrono = { version = "0.4" }
+parking_lot = "0.12"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-async-trait = "0.1"
-parking_lot = "0.12"
-chrono = { version = "0.4" }
+smallvec = "1"
 tokio = { version = "1", features = ["sync", "rt"] }
+toml = "0.8"
 tracing = "0.1"
 
 [features]
@@ -19,5 +24,10 @@ default = []
 
 [dev-dependencies]
 agent-context-db-testkit = { path = "../context-db-testkit" }
+criterion = "0.5"
 tokio = { version = "1", features = ["rt", "macros"] }
 uuid = { version = "1", features = ["v4"] }
+
+[[bench]]
+name = "intent_policy"
+harness = false

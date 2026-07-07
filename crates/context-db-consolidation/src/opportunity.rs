@@ -49,7 +49,9 @@ impl OpportunityCostLoader {
         ranked.sort_by(|a, b| {
             let ratio_a = a.relevance / a.token_cost.max(1) as f32;
             let ratio_b = b.relevance / b.token_cost.max(1) as f32;
-            ratio_b.partial_cmp(&ratio_a).unwrap_or(std::cmp::Ordering::Equal)
+            ratio_b
+                .partial_cmp(&ratio_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let mut selected: Vec<(ContextUri, ContentLevel)> = Vec::new();
@@ -88,11 +90,7 @@ impl OpportunityCostLoader {
     }
 
     /// 估算候选与已选条目的重叠度（0.0-1.0）。
-    fn estimate_overlap(
-        &self,
-        cand: &Candidate,
-        selected: &[(ContextUri, ContentLevel)],
-    ) -> f32 {
+    fn estimate_overlap(&self, cand: &Candidate, selected: &[(ContextUri, ContentLevel)]) -> f32 {
         if selected.is_empty() {
             return 0.0;
         }
@@ -109,4 +107,3 @@ impl OpportunityCostLoader {
         matches as f32 / selected.len() as f32
     }
 }
-

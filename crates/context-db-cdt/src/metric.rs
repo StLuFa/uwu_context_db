@@ -16,14 +16,27 @@ pub struct Demo {
 }
 
 impl CognitiveBootstrap {
-    pub fn new(threshold: f32) -> Self { Self { metric_threshold: threshold } }
+    pub fn new(threshold: f32) -> Self {
+        Self {
+            metric_threshold: threshold,
+        }
+    }
 
     pub fn extract_demos(&self, metrics: &[(String, CognitiveMetric)]) -> Vec<Demo> {
-        let mut demos: Vec<_> = metrics.iter()
+        let mut demos: Vec<_> = metrics
+            .iter()
             .filter(|(_, m)| m.composite >= self.metric_threshold)
-            .map(|(input, m)| Demo { input: input.clone(), output: vec![], metric: m.composite })
+            .map(|(input, m)| Demo {
+                input: input.clone(),
+                output: vec![],
+                metric: m.composite,
+            })
             .collect();
-        demos.sort_by(|a, b| b.metric.partial_cmp(&a.metric).unwrap_or(std::cmp::Ordering::Equal));
+        demos.sort_by(|a, b| {
+            b.metric
+                .partial_cmp(&a.metric)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         demos.truncate(5); // top-5
         demos
     }
@@ -41,10 +54,17 @@ pub struct OptimizerPipeline {
 }
 
 impl OptimizerPipeline {
-    pub fn new() -> Self { Self { stages: vec![] } }
-    pub fn with(mut self, stage: Box<dyn TrainingOptimizer>) -> Self { self.stages.push(stage); self }
+    pub fn new() -> Self {
+        Self { stages: vec![] }
+    }
+    pub fn with(mut self, stage: Box<dyn TrainingOptimizer>) -> Self {
+        self.stages.push(stage);
+        self
+    }
     pub async fn run(&self, config: &mut TrainingConfig) -> Result<()> {
-        for stage in &self.stages { stage.optimize(config).await?; }
+        for stage in &self.stages {
+            stage.optimize(config).await?;
+        }
         Ok(())
     }
 }
@@ -78,7 +98,8 @@ impl TrainingOptimizer for BootstrapDemoOptimizer {
             return Ok(());
         }
         // 有优质 demo → 放宽最低置信度，让更多梯度通过
-        let avg_metric: f32 = self.demos.iter().map(|d| d.metric).sum::<f32>() / self.demos.len() as f32;
+        let avg_metric: f32 =
+            self.demos.iter().map(|d| d.metric).sum::<f32>() / self.demos.len() as f32;
         if avg_metric > 0.7 {
             config.min_confidence = (config.min_confidence * 0.8).max(0.15);
         }

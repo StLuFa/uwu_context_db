@@ -31,7 +31,11 @@ impl TrajectoryExtractor for TrajectoryExtractorImpl {
             .fs
             .read(archive, ContentLevel::L1)
             .await
-            .unwrap_or_else(|_| agent_context_db_core::ContentPayload::Text { sparse: "empty".into(), dense: String::new(), full: String::new() });
+            .unwrap_or_else(|_| agent_context_db_core::ContentPayload::Text {
+                sparse: "empty".into(),
+                dense: String::new(),
+                full: String::new(),
+            });
 
         let text = match &content {
             agent_context_db_core::ContentPayload::Text { dense, .. } => dense.clone(),
@@ -57,11 +61,9 @@ Return a JSON object with these fields:
             ..Default::default()
         };
 
-        let response = self
-            .llm
-            .complete(&prompt, &opts)
-            .await
-            .map_err(|e| agent_context_db_core::ContextError::Storage(format!("llm trajectory: {e}")))?;
+        let response = self.llm.complete(&prompt, &opts).await.map_err(|e| {
+            agent_context_db_core::ContextError::Storage(format!("llm trajectory: {e}"))
+        })?;
 
         #[derive(serde::Deserialize)]
         struct RawTrajectory {
@@ -70,13 +72,12 @@ Return a JSON object with these fields:
             result: String,
         }
 
-        let raw: RawTrajectory = serde_json::from_str(&response).unwrap_or_else(|_| {
-            RawTrajectory {
+        let raw: RawTrajectory =
+            serde_json::from_str(&response).unwrap_or_else(|_| RawTrajectory {
                 did_what: "session completed".into(),
                 how: "conversation".into(),
                 result: response.chars().take(200).collect(),
-            }
-        });
+            });
 
         let traj_uri = archive.join("trajectory.json");
 
@@ -97,7 +98,9 @@ Return a JSON object with these fields:
         for uri in &trajectories {
             if let Ok(content) = self.fs.read(uri, ContentLevel::L1).await {
                 match content {
-                    agent_context_db_core::ContentPayload::Text { dense, .. } => traj_texts.push(dense),
+                    agent_context_db_core::ContentPayload::Text { dense, .. } => {
+                        traj_texts.push(dense)
+                    }
                     _ => {}
                 }
             }
@@ -105,10 +108,9 @@ Return a JSON object with these fields:
 
         if traj_texts.is_empty() {
             return Ok(Experience {
-                uri: trajectories
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| ContextUri::parse("uwu://default/experiences/empty").expect("static uri")),
+                uri: trajectories.first().cloned().unwrap_or_else(|| {
+                    ContextUri::parse("uwu://default/experiences/empty").expect("static uri")
+                }),
                 situation: "no data".into(),
                 approach: "none".into(),
                 reflect: "nothing to reflect on".into(),
@@ -137,11 +139,9 @@ Return a JSON object with:
             ..Default::default()
         };
 
-        let response = self
-            .llm
-            .complete(&prompt, &opts)
-            .await
-            .map_err(|e| agent_context_db_core::ContextError::Storage(format!("llm experience: {e}")))?;
+        let response = self.llm.complete(&prompt, &opts).await.map_err(|e| {
+            agent_context_db_core::ContextError::Storage(format!("llm experience: {e}"))
+        })?;
 
         #[derive(serde::Deserialize)]
         struct RawExperience {
@@ -150,13 +150,12 @@ Return a JSON object with:
             reflect: String,
         }
 
-        let raw: RawExperience = serde_json::from_str(&response).unwrap_or_else(|_| {
-            RawExperience {
+        let raw: RawExperience =
+            serde_json::from_str(&response).unwrap_or_else(|_| RawExperience {
                 situation: "general task".into(),
                 approach: "standard approach".into(),
                 reflect: response.chars().take(200).collect(),
-            }
-        });
+            });
 
         let exp_uri = trajectories
             .first()
@@ -189,14 +188,26 @@ mod tests {
         async fn find(&self, _: &agent_context_db_core::FindPattern) -> Result<Vec<ContextUri>> {
             Ok(vec![])
         }
-        async fn grep(&self, _: &str, _: &ContextUri) -> Result<Vec<agent_context_db_core::GrepHit>> {
+        async fn grep(
+            &self,
+            _: &str,
+            _: &ContextUri,
+        ) -> Result<Vec<agent_context_db_core::GrepHit>> {
             Ok(vec![])
         }
         async fn tree(&self, r: &ContextUri, _: usize) -> Result<agent_context_db_core::TreeNode> {
-            Ok(agent_context_db_core::TreeNode { uri: r.clone(), is_dir: true, children: vec![] })
+            Ok(agent_context_db_core::TreeNode {
+                uri: r.clone(),
+                is_dir: true,
+                children: vec![],
+            })
         }
         async fn read(&self, _: &ContextUri, _: ContentLevel) -> Result<ContentPayload> {
-            Ok(ContentPayload::Text { sparse: self.0.clone(), dense: self.0.clone(), full: self.0.clone() })
+            Ok(ContentPayload::Text {
+                sparse: self.0.clone(),
+                dense: self.0.clone(),
+                full: self.0.clone(),
+            })
         }
     }
 
@@ -204,18 +215,35 @@ mod tests {
     struct MockLlm;
     #[async_trait]
     impl LlmClient for MockLlm {
-        async fn complete(&self, _: &str, _: &LlmOpts) -> std::result::Result<String, agent_context_db_core::LlmError> {
+        async fn complete(
+            &self,
+            _: &str,
+            _: &LlmOpts,
+        ) -> std::result::Result<String, agent_context_db_core::LlmError> {
             Ok(r#"{"did_what": "deployed app", "how": "used docker compose", "result": "deployment succeeded"}"#.into())
         }
-        async fn embed(&self, _: &str) -> std::result::Result<Vec<f32>, agent_context_db_core::LlmError> {
+        async fn embed(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Vec<f32>, agent_context_db_core::LlmError> {
             Ok(vec![1.0])
+        }
+        async fn complete_json(
+            &self,
+            _: &str,
+            _: &agent_context_db_core::JsonSchema,
+            _: &LlmOpts,
+        ) -> std::result::Result<String, agent_context_db_core::LlmError> {
+            Ok(r#"{"did_what": "deployed app", "how": "used docker compose", "result": "deployment succeeded"}"#.into())
         }
     }
 
     #[tokio::test]
     async fn extract_trajectory_from_archive() {
         let llm = Arc::new(MockLlm);
-        let fs = Arc::new(MockFs("user: deploy the app\nassistant: running docker compose...".into()));
+        let fs = Arc::new(MockFs(
+            "user: deploy the app\nassistant: running docker compose...".into(),
+        ));
         let extractor = TrajectoryExtractorImpl::new(llm, fs);
 
         let archive = ContextUri::parse("uwu://t1/sessions/s1/archive/0/messages.jsonl").unwrap();

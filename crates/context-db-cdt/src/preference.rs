@@ -7,7 +7,9 @@ use agent_context_db_core::{ContentType, ContextUri, Result};
 pub struct CognitivePreferenceExtractor;
 
 impl CognitivePreferenceExtractor {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// 从成功/失败 trajectory 对比中提取偏好对。
     pub fn extract_pairs(
@@ -20,7 +22,8 @@ impl CognitivePreferenceExtractor {
         for (chosen, _) in &successes {
             for (rejected, _) in &failures {
                 let delta = CognitiveDelta {
-                    contradiction_diff: rejected.contradictions as i32 - chosen.contradictions as i32,
+                    contradiction_diff: rejected.contradictions as i32
+                        - chosen.contradictions as i32,
                     confidence_diff: chosen.avg_confidence - rejected.avg_confidence,
                     evidence_diff: 0,
                     knowledge_graph_growth: 0,

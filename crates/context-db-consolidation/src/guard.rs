@@ -1,7 +1,7 @@
 //! ContextRotGuard — 主动裁剪 + 边际效用检查。
 
-use agent_context_db_core::{ContextEntry, ContextUri, Result};
 use crate::rif::RifSuppressor;
+use agent_context_db_core::{ContextEntry, ContextUri, Result};
 
 /// Context Rot 守卫 — 容量超限时裁剪最低价值条目。
 pub struct ContextRotGuard {
@@ -11,7 +11,10 @@ pub struct ContextRotGuard {
 
 impl ContextRotGuard {
     pub fn new(max_capacity: usize) -> Self {
-        Self { max_capacity, rif: None }
+        Self {
+            max_capacity,
+            rif: None,
+        }
     }
 
     pub fn with_rif(mut self, rif: RifSuppressor) -> Self {
@@ -41,11 +44,19 @@ impl ContextRotGuard {
             .collect();
 
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        scored.iter().take(excess).map(|(e, _)| e.uri.clone()).collect()
+        scored
+            .iter()
+            .take(excess)
+            .map(|(e, _)| e.uri.clone())
+            .collect()
     }
 
     /// 边际效用检查 — 新 entry 的 InfoGain 是否值得写入。
-    pub fn marginal_utility(&self, new_entry: &ContextEntry, existing_similar: &[ContextEntry]) -> bool {
+    pub fn marginal_utility(
+        &self,
+        new_entry: &ContextEntry,
+        existing_similar: &[ContextEntry],
+    ) -> bool {
         if existing_similar.is_empty() {
             return true; // 无相似条目，一定写入
         }

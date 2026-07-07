@@ -43,19 +43,32 @@ impl ContextPack {
         }
     }
 
-    pub fn with_source(mut self, agent: impl Into<String>) -> Self { self.meta.source_agent = Some(agent.into()); self }
-    pub fn with_description(mut self, desc: impl Into<String>) -> Self { self.meta.description = Some(desc.into()); self }
+    pub fn with_source(mut self, agent: impl Into<String>) -> Self {
+        self.meta.source_agent = Some(agent.into());
+        self
+    }
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.meta.description = Some(desc.into());
+        self
+    }
 
     pub fn add_entry(&mut self, entry: ContextEntry) {
         self.entries.push(entry);
         self.meta.entry_count = self.entries.len();
     }
 
-    pub fn to_json(&self) -> String { serde_json::to_string_pretty(self).unwrap_or_default() }
-    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> { serde_json::from_str(json) }
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
 
     pub fn filter_by_scope(&self, prefix: &ContextUri) -> Vec<&ContextEntry> {
-        self.entries.iter().filter(|e| e.uri.to_string().starts_with(&prefix.to_string())).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.uri.to_string().starts_with(&prefix.to_string()))
+            .collect()
     }
 }
 
@@ -74,13 +87,28 @@ pub struct Permissions {
 
 impl Permissions {
     pub const fn full() -> Self {
-        Self { read: true, write: true, delete: true, share: true }
+        Self {
+            read: true,
+            write: true,
+            delete: true,
+            share: true,
+        }
     }
     pub const fn read_only() -> Self {
-        Self { read: true, write: false, delete: false, share: false }
+        Self {
+            read: true,
+            write: false,
+            delete: false,
+            share: false,
+        }
     }
     pub const fn none() -> Self {
-        Self { read: false, write: false, delete: false, share: false }
+        Self {
+            read: false,
+            write: false,
+            delete: false,
+            share: false,
+        }
     }
 }
 
@@ -113,7 +141,9 @@ pub struct PathAcl {
 
 impl PathAcl {
     pub fn new() -> Self {
-        Self { rules: parking_lot::Mutex::new(Vec::new()) }
+        Self {
+            rules: parking_lot::Mutex::new(Vec::new()),
+        }
     }
 
     /// 添加规则。
@@ -150,7 +180,9 @@ impl PathAcl {
 }
 
 impl Default for PathAcl {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -159,10 +191,8 @@ mod tests {
 
     #[test]
     fn context_pack_roundtrip() {
-        let mut pack = ContextPack::new(
-            ContextUri::parse("uwu://t1/agent/a1").unwrap(),
-            "test-pack",
-        );
+        let mut pack =
+            ContextPack::new(ContextUri::parse("uwu://t1/agent/a1").unwrap(), "test-pack");
         let entry = ContextEntry::new_text(
             ContextUri::parse("uwu://t1/agent/a1/memories/cases/c1").unwrap(),
             crate::TenantId(uuid::Uuid::nil()),
@@ -186,7 +216,11 @@ mod tests {
         });
 
         let uri = ContextUri::parse("uwu://t1/agent/a1/memories/cases/c1").unwrap();
-        assert!(acl.check(&uri, &Principal::User("u1".into()), Permissions::read_only()));
+        assert!(acl.check(
+            &uri,
+            &Principal::User("u1".into()),
+            Permissions::read_only()
+        ));
         assert!(!acl.check(&uri, &Principal::User("u1".into()), Permissions::full()));
         assert!(!acl.check(&uri, &Principal::Anonymous, Permissions::read_only()));
     }

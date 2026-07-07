@@ -25,7 +25,9 @@ pub struct PhylogenyTree {
 }
 
 impl LineageTracker {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// 记录一条血统变更。
     pub fn record_lineage(

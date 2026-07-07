@@ -72,7 +72,10 @@ impl CausalDag {
     /// 加入一个 commit —— 建立正向 parents 与反向 children 边。
     pub fn add(&mut self, commit: &Commit) {
         let id = commit.id.clone();
-        self.parents.entry(id.clone()).or_default().extend(commit.parents.iter().cloned());
+        self.parents
+            .entry(id.clone())
+            .or_default()
+            .extend(commit.parents.iter().cloned());
         for p in &commit.parents {
             let entry = self.children.entry(p.clone()).or_default();
             if !entry.contains(&id) {
@@ -85,12 +88,18 @@ impl CausalDag {
 
     /// 直接父 commit。
     pub fn parents_of(&self, commit: &CommitId) -> &[CommitId] {
-        self.parents.get(commit).map(|v| v.as_slice()).unwrap_or(&[])
+        self.parents
+            .get(commit)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 直接子 commit。
     pub fn children_of(&self, commit: &CommitId) -> &[CommitId] {
-        self.children.get(commit).map(|v| v.as_slice()).unwrap_or(&[])
+        self.children
+            .get(commit)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 所有根因（自身或祖先中无 parent 的 commit）。
@@ -157,10 +166,20 @@ pub struct CommitMeta {
 pub enum CommitTrigger {
     #[default]
     AutoConsolidation,
-    SessionCommit { session_id: Uuid, compression_index: u64 },
-    AgentWrite { agent_id: String, action: String },
-    ForkPromotion { fork_name: String },
-    Merge { branches: Vec<BranchName> },
+    SessionCommit {
+        session_id: Uuid,
+        compression_index: u64,
+    },
+    AgentWrite {
+        agent_id: String,
+        action: String,
+    },
+    ForkPromotion {
+        fork_name: String,
+    },
+    Merge {
+        branches: Vec<BranchName>,
+    },
     UserExplicit,
 }
 
@@ -233,19 +252,30 @@ impl BranchName {
 
     /// 宽松构造（推荐调用点已知名称合法时使用）；非法字符会 panic。
     pub fn new(name: impl Into<String>) -> Self {
-        Self::parse(name).expect("BranchName::new called with invalid name — use parse() for fallible")
+        Self::parse(name)
+            .expect("BranchName::new called with invalid name — use parse() for fallible")
     }
 
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 
     fn validate(s: &str) -> crate::Result<()> {
         if s.is_empty() {
-            return Err(crate::VersionError::Storage("BranchName must not be empty".into()));
+            return Err(crate::VersionError::Storage(
+                "BranchName must not be empty".into(),
+            ));
         }
         if s.len() > 255 {
-            return Err(crate::VersionError::Storage(format!("BranchName too long ({} > 255)", s.len())));
+            return Err(crate::VersionError::Storage(format!(
+                "BranchName too long ({} > 255)",
+                s.len()
+            )));
         }
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')) {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        {
             return Err(crate::VersionError::Storage(format!(
                 "BranchName contains illegal chars (allowed: [A-Za-z0-9._/-]): {s}"
             )));
@@ -255,16 +285,22 @@ impl BranchName {
 }
 
 impl std::fmt::Display for BranchName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 impl TryFrom<String> for BranchName {
     type Error = crate::VersionError;
-    fn try_from(s: String) -> crate::Result<Self> { Self::parse(s) }
+    fn try_from(s: String) -> crate::Result<Self> {
+        Self::parse(s)
+    }
 }
 
 impl From<BranchName> for String {
-    fn from(b: BranchName) -> String { b.0 }
+    fn from(b: BranchName) -> String {
+        b.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,16 +350,26 @@ impl TagName {
         Self::parse(name).expect("TagName::new called with invalid name — use parse() for fallible")
     }
 
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 
     fn validate(s: &str) -> crate::Result<()> {
         if s.is_empty() {
-            return Err(crate::VersionError::Storage("TagName must not be empty".into()));
+            return Err(crate::VersionError::Storage(
+                "TagName must not be empty".into(),
+            ));
         }
         if s.len() > 255 {
-            return Err(crate::VersionError::Storage(format!("TagName too long ({} > 255)", s.len())));
+            return Err(crate::VersionError::Storage(format!(
+                "TagName too long ({} > 255)",
+                s.len()
+            )));
         }
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')) {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        {
             return Err(crate::VersionError::Storage(format!(
                 "TagName contains illegal chars (allowed: [A-Za-z0-9._/-]): {s}"
             )));
@@ -333,16 +379,22 @@ impl TagName {
 }
 
 impl std::fmt::Display for TagName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 impl TryFrom<String> for TagName {
     type Error = crate::VersionError;
-    fn try_from(s: String) -> crate::Result<Self> { Self::parse(s) }
+    fn try_from(s: String) -> crate::Result<Self> {
+        Self::parse(s)
+    }
 }
 
 impl From<TagName> for String {
-    fn from(t: TagName) -> String { t.0 }
+    fn from(t: TagName) -> String {
+        t.0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,19 +539,43 @@ pub trait ConflictResolver: Send + Sync {
 /// 语义冲突。
 #[derive(Debug, Clone)]
 pub enum SemanticConflict {
-    ContradictoryFact { uri: ContextUri, a: String, b: String },
-    ConflictingRelation { from: ContextUri, to: ContextUri, a: RelationKind, b: RelationKind },
-    OverlappingEntity { a: ContextUri, b: ContextUri, similarity: f32 },
+    ContradictoryFact {
+        uri: ContextUri,
+        a: String,
+        b: String,
+    },
+    ConflictingRelation {
+        from: ContextUri,
+        to: ContextUri,
+        a: RelationKind,
+        b: RelationKind,
+    },
+    OverlappingEntity {
+        a: ContextUri,
+        b: ContextUri,
+        similarity: f32,
+    },
 }
 
 /// 冲突解决。
 #[derive(Debug, Clone)]
 pub enum Resolution {
-    KeepBoth { reason: String },
-    PreferA { reason: String },
-    PreferB { reason: String },
-    Fuse { merged: serde_json::Value, reason: String },
-    DeferToHuman { reason: String },
+    KeepBoth {
+        reason: String,
+    },
+    PreferA {
+        reason: String,
+    },
+    PreferB {
+        reason: String,
+    },
+    Fuse {
+        merged: serde_json::Value,
+        reason: String,
+    },
+    DeferToHuman {
+        reason: String,
+    },
 }
 
 // ===========================================================================
@@ -524,7 +600,9 @@ pub struct TemporalIndex {
 
 impl TemporalIndex {
     pub fn new() -> Self {
-        Self { timelines: std::collections::HashMap::new() }
+        Self {
+            timelines: std::collections::HashMap::new(),
+        }
     }
 
     /// 注册一个版本。
@@ -532,13 +610,18 @@ impl TemporalIndex {
         let key = uri.to_string();
         let timeline = self.timelines.entry(key).or_default();
         // 有序插入（按 timestamp）
-        let pos = timeline.binary_search_by(|v| v.timestamp.cmp(&version.timestamp))
+        let pos = timeline
+            .binary_search_by(|v| v.timestamp.cmp(&version.timestamp))
             .unwrap_or_else(|e| e);
         timeline.insert(pos, version);
     }
 
     /// AS OF 查询：某时间点的版本。二分查找 O(log n)。
-    pub fn as_of(&self, uri: &ContextUri, at: chrono::DateTime<chrono::Utc>) -> Option<&TemporalVersion> {
+    pub fn as_of(
+        &self,
+        uri: &ContextUri,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<&TemporalVersion> {
         let timeline = self.timelines.get(&uri.to_string())?;
         let pos = timeline
             .binary_search_by(|v| v.timestamp.cmp(&at))

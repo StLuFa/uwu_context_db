@@ -225,8 +225,15 @@ mod tests {
         async fn embed(
             &self,
             _: &str,
-        ) -> std::result::Result<Vec<f32>, agent_context_db_core::LlmError> {
-            Ok(vec![1.0])
+        ) -> std::result::Result<
+            agent_context_db_core::EmbeddingVector,
+            agent_context_db_core::LlmError,
+        > {
+            Ok(agent_context_db_core::EmbeddingVector::new(
+                vec![1.0],
+                "test",
+                1,
+            ))
         }
         async fn complete_json(
             &self,

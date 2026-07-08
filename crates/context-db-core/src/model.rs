@@ -1,6 +1,6 @@
 //! 核心数据模型（M0 → 认知数据库重构）：
 //! - 分层编码 ContentPayload（替代 L0/L1/L2 三独立字段）
-//! - 13 种 ContentType（替代 MemoryClass 8 种枚举）
+//! - 13 种 ContentType 内容分类
 //! - 强类型 ContextMeta（epistemic / validity / consolidation）
 //! - 结构化 ContextUri（Arc<UriInner>）
 
@@ -48,11 +48,6 @@ impl SchemaRef {
         }
     }
 }
-
-/// AGFS 内容 blob 引用（L2 原始内容指针） — 已废弃，使用 BlobRef。
-#[deprecated(note = "使用 BlobRef 替代")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContentRef(pub Uuid);
 
 // ===========================================================================
 // 媒体格式（payload 的物理格式）
@@ -208,13 +203,14 @@ pub enum DecodedContent {
 }
 
 // ===========================================================================
-// 记忆分类（13 种 — 替代 MemoryClass 8 种枚举）
+// 记忆分类（13 种内容类型）
 // ===========================================================================
 
 /// 13 种内容类型 — URI 路径段原生的记忆分类。
 ///
 /// 类型进 URI：`uwu://t/{agent}/x/{type}/{semantic_path}/{id}`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContentType {
     // === 认识论类型 ===
     /// 可验证事实，需证据支撑
@@ -301,53 +297,6 @@ impl ContentType {
                 | Self::Procedure
                 | Self::Heuristic
         )
-    }
-}
-
-// ===========================================================================
-// 旧 MemoryClass（保留 + deprecated）
-// ===========================================================================
-
-/// 8 种记忆分类 — 已废弃，使用 ContentType 替代。
-#[deprecated(note = "使用 ContentType（13 种）替代")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MemoryClass {
-    Profile,
-    Preferences,
-    Entities,
-    Events,
-    Cases,
-    Patterns,
-    Tools,
-    Skills,
-}
-
-#[allow(deprecated)]
-impl MemoryClass {
-    pub fn mergeable(&self) -> bool {
-        matches!(
-            self,
-            Self::Profile
-                | Self::Preferences
-                | Self::Entities
-                | Self::Patterns
-                | Self::Tools
-                | Self::Skills
-        )
-    }
-
-    /// 迁移到新 ContentType。
-    pub fn to_content_type(&self) -> ContentType {
-        match self {
-            MemoryClass::Profile => ContentType::Profile,
-            MemoryClass::Preferences => ContentType::Preference,
-            MemoryClass::Entities => ContentType::Fact,
-            MemoryClass::Events => ContentType::Fact,
-            MemoryClass::Cases => ContentType::Error,
-            MemoryClass::Patterns => ContentType::Heuristic,
-            MemoryClass::Tools => ContentType::Skill,
-            MemoryClass::Skills => ContentType::Skill,
-        }
     }
 }
 
@@ -439,7 +388,7 @@ pub enum DerivationRule {
 }
 
 // ===========================================================================
-// F.4 MetaKind — 替代互斥 Option<MemoryClass> + Option<StateScope>
+// F.4 MetaKind — 统一内容类型、状态作用域与系统元数据
 // ===========================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,10 +417,6 @@ pub enum StateScope {
 pub struct ContextMeta {
     /// 内容类型（URI 路径段原生分类）。
     pub content_type: Option<ContentType>,
-    /// 旧 memory_class — 已废弃。
-    #[deprecated(note = "使用 content_type 替代")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_class: Option<MemoryClass>,
     pub state_scope: Option<StateScope>,
     pub tags: Vec<String>,
 
@@ -507,6 +452,59 @@ impl ContextMeta {
                 _ => None,
             })
         })
+    }
+
+    /// 把 `custom` 反序列化为具体类型 `T`。
+    ///
+    /// 存储层始终保留 `serde_json::Value`，此方法只在应用层提供强类型访问，
+    /// 避免因引入泛型污染 `ContextMeta` / `ContextEntry` 和所有窄端口 trait。
+    pub fn custom_as<T>(&self) -> serde_json::Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        serde_json::from_value(self.custom.clone())
+    }
+
+    /// 用具体类型 `T` 覆写 `custom`。
+    ///
+    /// 如果序列化失败会返回错误并保持 `custom` 不变。
+    pub fn set_custom<T>(&mut self, value: &T) -> serde_json::Result<()>
+    where
+        T: serde::Serialize,
+    {
+        let v = serde_json::to_value(value)?;
+        self.custom = v;
+        Ok(())
+    }
+
+    /// 便捷方法：读取 `custom` 对象的某个字段并反序列化为 `T`。
+    ///
+    /// 当 `custom` 不是 JSON 对象或缺少该字段时返回 `None`。
+    pub fn custom_field<T>(&self, key: &str) -> Option<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.custom
+            .as_object()
+            .and_then(|obj| obj.get(key))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// 便捷方法：在 `custom` 对象中写入/覆盖一个字段。
+    ///
+    /// 若 `custom` 目前不是 JSON 对象，会先将其重置为空对象再写入。
+    pub fn set_custom_field<T>(&mut self, key: &str, value: &T) -> serde_json::Result<()>
+    where
+        T: serde::Serialize,
+    {
+        let v = serde_json::to_value(value)?;
+        if !self.custom.is_object() {
+            self.custom = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(obj) = self.custom.as_object_mut() {
+            obj.insert(key.to_string(), v);
+        }
+        Ok(())
     }
 }
 
@@ -568,6 +566,62 @@ impl ContextEntry {
     }
 }
 
+#[cfg(test)]
+mod context_meta_custom_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Priority {
+        level: String,
+        score: u32,
+    }
+
+    #[test]
+    fn set_and_get_typed_custom() {
+        let mut meta = ContextMeta::default();
+        let p = Priority {
+            level: "high".into(),
+            score: 9,
+        };
+        meta.set_custom(&p).unwrap();
+        let back: Priority = meta.custom_as().unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn custom_as_fails_on_shape_mismatch() {
+        let mut meta = ContextMeta::default();
+        meta.custom = serde_json::json!("not an object");
+        let r: serde_json::Result<Priority> = meta.custom_as();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn set_and_get_custom_field() {
+        let mut meta = ContextMeta::default();
+        meta.set_custom_field("priority", &"high".to_string())
+            .unwrap();
+        meta.set_custom_field("score", &9u32).unwrap();
+
+        let level: Option<String> = meta.custom_field("priority");
+        let score: Option<u32> = meta.custom_field("score");
+        let missing: Option<String> = meta.custom_field("nope");
+
+        assert_eq!(level.as_deref(), Some("high"));
+        assert_eq!(score, Some(9));
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn set_custom_field_replaces_non_object() {
+        let mut meta = ContextMeta::default();
+        meta.custom = serde_json::json!("was string");
+        meta.set_custom_field("k", &1u32).unwrap();
+        assert_eq!(meta.custom_field::<u32>("k"), Some(1));
+    }
+}
+
 // ===========================================================================
 // FS 寻址返回类型
 // ===========================================================================
@@ -590,9 +644,6 @@ pub struct FindPattern {
     pub name_glob: Option<String>,
     /// 按 ContentType 过滤。
     pub content_type: Option<ContentType>,
-    #[deprecated(note = "使用 content_type 替代")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub class: Option<MemoryClass>,
     pub max_depth: Option<usize>,
 }
 

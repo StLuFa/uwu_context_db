@@ -19,9 +19,12 @@
 
 use crate::operators::ExecContext;
 use crate::planner::{CboOptimizer, LogicalPlan, PhysicalPlan, StatisticsCollector};
-use crate::query::{Condition, Predicate, Query};
-use crate::{operators::RecordBatch, QueryPlanner, RetrievalHit, RetrievalResult, RetrievalTrace, RetrieveContext, TraceStep};
-use agent_context_db_core::{ContentLevel, ContentType, ContextUri, Result};
+use crate::query::Query;
+use crate::{
+    QueryPlanner, RetrievalHit, RetrievalResult, RetrievalTrace, RetrieveContext, TraceStep,
+    operators::RecordBatch,
+};
+use agent_context_db_core::{ContentLevel, Result};
 use std::sync::Arc;
 
 // ===========================================================================
@@ -80,11 +83,7 @@ impl RetrieverCompiler {
     }
 
     /// 编译自然语言查询 → CompiledPlan（异步，需 LLM/规则解析）。
-    pub async fn compile_text(
-        &self,
-        query: &str,
-        ctx: &RetrieveContext,
-    ) -> Result<CompiledPlan> {
+    pub async fn compile_text(&self, query: &str, ctx: &RetrieveContext) -> Result<CompiledPlan> {
         let logical = self.planner.parse(query, ctx).await?;
         Ok(self.compile_logical(logical))
     }
@@ -99,7 +98,11 @@ impl RetrieverCompiler {
     pub fn compile_logical(&self, logical: LogicalPlan) -> CompiledPlan {
         let physical = self.optimizer.optimize(&logical);
         let estimated_cost = self.optimizer.estimate_cost(&physical);
-        CompiledPlan { logical, physical, estimated_cost }
+        CompiledPlan {
+            logical,
+            physical,
+            estimated_cost,
+        }
     }
 }
 
@@ -119,7 +122,10 @@ pub struct PlanExecutor {
 
 impl PlanExecutor {
     pub fn new(exec_ctx: ExecContext) -> Self {
-        Self { exec_ctx, budget_tokens: 8000 }
+        Self {
+            exec_ctx,
+            budget_tokens: 8000,
+        }
     }
 
     pub fn with_budget(mut self, budget: usize) -> Self {
@@ -156,7 +162,11 @@ impl PlanExecutor {
 
         let (hits, tokens_used) = load_within_budget(reranked, self.budget_tokens);
 
-        Ok(RetrievalResult { hits, trace, tokens_used })
+        Ok(RetrievalResult {
+            hits,
+            trace,
+            tokens_used,
+        })
     }
 }
 
@@ -188,11 +198,7 @@ impl CompiledRetriever {
     }
 
     /// 自然语言查询（带计划缓存）。
-    pub async fn retrieve(
-        &self,
-        query: &str,
-        ctx: &RetrieveContext,
-    ) -> Result<RetrievalResult> {
+    pub async fn retrieve(&self, query: &str, ctx: &RetrieveContext) -> Result<RetrievalResult> {
         let cache_key = simple_hash(query);
 
         // 尝试从缓存读取已编译计划
@@ -210,7 +216,9 @@ impl CompiledRetriever {
             }
         };
 
-        self.executor.execute(&compiled, query, self.reranker.as_ref()).await
+        self.executor
+            .execute(&compiled, query, self.reranker.as_ref())
+            .await
     }
 
     /// 结构化 Query 查询（同步 compile，无缓存）。
@@ -221,7 +229,9 @@ impl CompiledRetriever {
     ) -> Result<RetrievalResult> {
         let compiled = self.compiler.compile_query(query, ctx);
         let hint = query_text_hint(query);
-        self.executor.execute(&compiled, &hint, self.reranker.as_ref()).await
+        self.executor
+            .execute(&compiled, &hint, self.reranker.as_ref())
+            .await
     }
 }
 
@@ -231,14 +241,38 @@ impl CompiledRetriever {
 
 pub fn query_to_logical(query: &Query) -> LogicalPlan {
     match query {
-        Query::Find { scope, predicate, budget, expand, .. } => {
-            let scan = LogicalPlan::Scan { scope: scope.clone(), level: ContentLevel::L0 };
+        Query::Find {
+            scope,
+            predicate,
+            budget,
+            order,
+            expand,
+        } => {
+            let scan = LogicalPlan::Scan {
+                scope: scope.clone(),
+                level: ContentLevel::L0,
+            };
             let plan = if predicate.is_empty() {
                 scan
             } else {
-                LogicalPlan::Filter { input: Box::new(scan), predicate: predicate.clone() }
+                LogicalPlan::Filter {
+                    input: Box::new(scan),
+                    predicate: predicate.clone(),
+                }
             };
-            let plan = LogicalPlan::Limit { input: Box::new(plan), budget: *budget };
+            let plan = if *order == crate::query::SortKey::Natural {
+                plan
+            } else {
+                LogicalPlan::Sort {
+                    input: Box::new(plan),
+                    key: *order,
+                    desc: true,
+                }
+            };
+            let plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                budget: *budget,
+            };
             if let Some(exp) = expand {
                 LogicalPlan::Traverse {
                     input: Box::new(plan),
@@ -249,7 +283,12 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
                 plan
             }
         }
-        Query::Similar { query_embedding, predicate, budget, expand } => {
+        Query::Similar {
+            query_embedding,
+            predicate,
+            budget,
+            expand,
+        } => {
             let vs = LogicalPlan::VectorSearch {
                 collection: "memories".into(),
                 query: query_embedding.clone(),
@@ -258,9 +297,15 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
             let plan = if predicate.is_empty() {
                 vs
             } else {
-                LogicalPlan::Filter { input: Box::new(vs), predicate: predicate.clone() }
+                LogicalPlan::Filter {
+                    input: Box::new(vs),
+                    predicate: predicate.clone(),
+                }
             };
-            let plan = LogicalPlan::Limit { input: Box::new(plan), budget: *budget };
+            let plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                budget: *budget,
+            };
             if let Some(exp) = expand {
                 LogicalPlan::Traverse {
                     input: Box::new(plan),
@@ -271,17 +316,38 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
                 plan
             }
         }
-        Query::AsOf { uri, at, .. } => LogicalPlan::TemporalScan { uri: uri.clone(), at: at.clone() },
-        Query::Traverse { start, edges, max_hops, .. } => {
-            let scan = LogicalPlan::Scan { scope: Some(start.clone()), level: ContentLevel::L0 };
-            LogicalPlan::Traverse { input: Box::new(scan), edges: edges.clone(), max_hops: *max_hops }
-        }
-        Query::Composite { queries, .. } => {
-            queries.first().map(query_to_logical).unwrap_or(LogicalPlan::Scan {
-                scope: None,
+        Query::AsOf { uri, at, .. } => LogicalPlan::TemporalScan {
+            uri: uri.clone(),
+            at: at.clone(),
+        },
+        Query::Traverse {
+            start,
+            edges,
+            max_hops,
+            predicate,
+        } => {
+            let scan = LogicalPlan::Scan {
+                scope: Some(start.clone()),
                 level: ContentLevel::L0,
-            })
+            };
+            let input = if predicate.is_empty() {
+                scan
+            } else {
+                LogicalPlan::Filter {
+                    input: Box::new(scan),
+                    predicate: predicate.clone(),
+                }
+            };
+            LogicalPlan::Traverse {
+                input: Box::new(input),
+                edges: edges.clone(),
+                max_hops: *max_hops,
+            }
         }
+        Query::Composite { queries, merge } => LogicalPlan::Parallel {
+            plans: queries.iter().map(query_to_logical).collect(),
+            merge: *merge,
+        },
     }
 }
 
@@ -289,14 +355,15 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
 // 工具函数
 // ===========================================================================
 
-fn load_within_budget(
-    mut hits: Vec<RetrievalHit>,
-    budget: usize,
-) -> (Vec<RetrievalHit>, usize) {
+fn load_within_budget(mut hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
     use agent_context_db_core::ContentPayload;
     let mut tokens = 0usize;
     let mut result = Vec::new();
-    hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for hit in hits {
         let cost = match &hit.content {
             ContentPayload::Text { sparse, .. } => (sparse.len() / 4).max(50),
@@ -319,7 +386,10 @@ fn simple_hash(s: &str) -> u64 {
 
 fn query_text_hint(query: &Query) -> String {
     match query {
-        Query::Find { scope, .. } => format!("find:{}", scope.as_ref().map(|u| u.to_string()).unwrap_or_default()),
+        Query::Find { scope, .. } => format!(
+            "find:{}",
+            scope.as_ref().map(|u| u.to_string()).unwrap_or_default()
+        ),
         Query::Similar { .. } => "similar".into(),
         Query::AsOf { uri, .. } => format!("asof:{uri}"),
         Query::Traverse { start, .. } => format!("traverse:{start}"),
@@ -334,7 +404,9 @@ fn query_text_hint(query: &Query) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::{Condition, Predicate};
     use crate::retriever::RuleBasedPlanner;
+    use agent_context_db_core::ContentType;
 
     #[test]
     fn compile_query_produces_physical_plan() {
@@ -349,9 +421,25 @@ mod tests {
             expand: None,
         };
         let plan = compiler.compile_query(&query, &ctx);
-        // 谓词下推：应该产出 TypeScan
-        assert!(matches!(plan.physical, PhysicalPlan::TypeScan { .. }));
+        // 谓词下推：执行树内部应该包含 TypeScan。
+        assert!(contains_type_scan(&plan.physical));
         assert!(plan.estimated_cost > 0.0);
+    }
+
+    fn contains_type_scan(plan: &PhysicalPlan) -> bool {
+        match plan {
+            PhysicalPlan::TypeScan { .. } => true,
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::GraphTraverse { input, .. } => contains_type_scan(input),
+            PhysicalPlan::HashJoin { left, right }
+            | PhysicalPlan::NestedLoopJoin { left, right } => {
+                contains_type_scan(left) || contains_type_scan(right)
+            }
+            PhysicalPlan::Parallel { plans, .. } => plans.iter().any(contains_type_scan),
+            _ => false,
+        }
     }
 
     #[test]

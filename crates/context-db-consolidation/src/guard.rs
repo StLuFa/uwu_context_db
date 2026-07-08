@@ -1,7 +1,7 @@
 //! ContextRotGuard — 主动裁剪 + 边际效用检查。
 
 use crate::rif::RifSuppressor;
-use agent_context_db_core::{ContextEntry, ContextUri, Result};
+use agent_context_db_core::{ContextEntry, ContextUri};
 
 /// Context Rot 守卫 — 容量超限时裁剪最低价值条目。
 pub struct ContextRotGuard {

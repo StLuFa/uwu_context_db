@@ -24,6 +24,26 @@ pub struct LlmOpts {
     pub temperature: Option<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingVector {
+    pub vector: Vec<f32>,
+    pub model_id: String,
+    pub dim: usize,
+    pub version: u64,
+}
+
+impl EmbeddingVector {
+    pub fn new(vector: Vec<f32>, model_id: impl Into<String>, version: u64) -> Self {
+        let dim = vector.len();
+        Self {
+            vector,
+            model_id: model_id.into(),
+            dim,
+            version,
+        }
+    }
+}
+
 impl Default for LlmOpts {
     fn default() -> Self {
         Self {
@@ -50,8 +70,8 @@ impl JsonSchema {
 pub trait LlmClient: Send + Sync {
     /// 文本补全。
     async fn complete(&self, prompt: &str, opts: &LlmOpts) -> Result<String, LlmError>;
-    /// 生成 embedding。
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError>;
+    /// 生成带模型元数据的 embedding。
+    async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError>;
 
     /// 结构化 JSON 输出 — G.4: 无默认实现，强制后端提供。
     async fn complete_json(

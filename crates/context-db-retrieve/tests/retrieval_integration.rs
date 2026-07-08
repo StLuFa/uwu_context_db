@@ -2,7 +2,7 @@
 //! 无 PG / Qdrant 依赖，满足 ARCHITECTURE.md M1 验收标准。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentRepo, ContextEntry, ContextUri, FsOps, MemoryClass,
+    ContentLevel, ContentPayload, ContentRepo, ContentType, ContextEntry, ContextUri, FsOps,
     TenantId,
 };
 use agent_context_db_retrieve::{
@@ -20,9 +20,9 @@ fn uri(s: &str) -> ContextUri {
     ContextUri::parse(s).unwrap()
 }
 
-fn entry(uri_str: &str, abstract_: &str, class: MemoryClass) -> ContextEntry {
+fn entry(uri_str: &str, abstract_: &str, content_type: ContentType) -> ContextEntry {
     let mut e = ContextEntry::new_text(uri(uri_str), tenant(), abstract_);
-    e.metadata.memory_class = Some(class);
+    e.metadata.content_type = Some(content_type);
     e
 }
 
@@ -46,7 +46,7 @@ async fn seed_store() -> MemoryContextStore {
         .write(entry(
             "uwu://t1/agent/a1/memories/preferences/p1",
             "prefers dark mode and monospace fonts",
-            MemoryClass::Preferences,
+            ContentType::Preference,
         ))
         .await
         .unwrap();
@@ -56,7 +56,7 @@ async fn seed_store() -> MemoryContextStore {
         .write(entry(
             "uwu://t1/agent/a1/memories/cases/c1",
             "solved null pointer bug by adding null check in parse_input",
-            MemoryClass::Cases,
+            ContentType::Error,
         ))
         .await
         .unwrap();
@@ -65,7 +65,7 @@ async fn seed_store() -> MemoryContextStore {
         .write(entry(
             "uwu://t1/agent/a1/memories/cases/c2",
             "fixed memory leak in websocket handler by using Weak refs",
-            MemoryClass::Cases,
+            ContentType::Error,
         ))
         .await
         .unwrap();
@@ -75,7 +75,7 @@ async fn seed_store() -> MemoryContextStore {
         .write(entry(
             "uwu://t1/agent/a1/memories/skills/s1",
             "deploy using: docker build -t app . && docker push",
-            MemoryClass::Skills,
+            ContentType::Skill,
         ))
         .await
         .unwrap();
@@ -85,7 +85,7 @@ async fn seed_store() -> MemoryContextStore {
         .write(entry(
             "uwu://t1/agent/a1/memories/events/e1",
             "production outage on 2025-03-15 caused by expired TLS cert",
-            MemoryClass::Events,
+            ContentType::Evidence,
         ))
         .await
         .unwrap();
@@ -95,7 +95,7 @@ async fn seed_store() -> MemoryContextStore {
         .write(entry(
             "uwu://t1/agent/a1/memories/tools/t1",
             "kubectl get pods -n production --sort-by=.metadata.creationTimestamp",
-            MemoryClass::Tools,
+            ContentType::Procedure,
         ))
         .await
         .unwrap();
@@ -136,10 +136,9 @@ async fn retrieve_event_recall_returns_events() {
     )));
 
     // 命中应包含 event 条目
-    let has_event = result
-        .hits
-        .iter()
-        .any(|h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("TLS")));
+    let has_event = result.hits.iter().any(
+        |h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("TLS")),
+    );
     assert!(has_event, "should find the TLS cert outage event");
 }
 
@@ -153,10 +152,9 @@ async fn retrieve_howto_targets_skills() {
         .await
         .unwrap();
 
-    let has_skill = result
-        .hits
-        .iter()
-        .any(|h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("docker")));
+    let has_skill = result.hits.iter().any(
+        |h| matches!(&h.content, ContentPayload::Text { sparse, .. } if sparse.contains("docker")),
+    );
     assert!(has_skill, "should find the docker deploy skill");
 }
 

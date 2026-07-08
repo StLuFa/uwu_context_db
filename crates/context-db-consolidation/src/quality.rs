@@ -6,7 +6,11 @@
 
 use std::collections::HashMap;
 
-use agent_context_db_core::{ContentPayload, ContextEntry, StateScope};
+use agent_context_db_core::{ContentPayload, ContentType, ContextEntry, StateScope};
+use agent_context_db_knowledge_network::types::{
+    FederatedQueryIntent, FederationReturnMode, MeshDiscoveryOpts,
+};
+use agent_context_db_marketplace_types::{CorroborationLevel, DiscoveryQuery, MarketEntryType};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +158,74 @@ pub struct QualityBeliefState {
     pub last_scored_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QualityBeliefDimension {
+    Intrinsic,
+    Relevance,
+    Utility,
+    Factuality,
+    Consistency,
+    Freshness,
+    Stability,
+    Evidence,
+    Trainability,
+}
+
+impl QualityBeliefDimension {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intrinsic => "intrinsic",
+            Self::Relevance => "relevance",
+            Self::Utility => "utility",
+            Self::Factuality => "factuality",
+            Self::Consistency => "consistency",
+            Self::Freshness => "freshness",
+            Self::Stability => "stability",
+            Self::Evidence => "evidence",
+            Self::Trainability => "trainability",
+        }
+    }
+}
+
+impl QualityBeliefState {
+    pub fn dimension(&self, dim: QualityBeliefDimension) -> DimensionBelief {
+        match dim {
+            QualityBeliefDimension::Intrinsic => self.intrinsic,
+            QualityBeliefDimension::Relevance => self.relevance,
+            QualityBeliefDimension::Utility => self.utility,
+            QualityBeliefDimension::Factuality => self.factuality,
+            QualityBeliefDimension::Consistency => self.consistency,
+            QualityBeliefDimension::Freshness => self.freshness,
+            QualityBeliefDimension::Stability => self.stability,
+            QualityBeliefDimension::Evidence => self.evidence,
+            QualityBeliefDimension::Trainability => self.trainability,
+        }
+    }
+
+    pub fn ranked_uncertainties(&self) -> Vec<(QualityBeliefDimension, DimensionBelief)> {
+        let mut values = [
+            QualityBeliefDimension::Intrinsic,
+            QualityBeliefDimension::Relevance,
+            QualityBeliefDimension::Utility,
+            QualityBeliefDimension::Factuality,
+            QualityBeliefDimension::Consistency,
+            QualityBeliefDimension::Freshness,
+            QualityBeliefDimension::Stability,
+            QualityBeliefDimension::Evidence,
+            QualityBeliefDimension::Trainability,
+        ]
+        .into_iter()
+        .map(|dim| (dim, self.dimension(dim)))
+        .collect::<Vec<_>>();
+        values.sort_by(|(a_dim, a), (b_dim, b)| {
+            active_learning_score(*b_dim, *b)
+                .partial_cmp(&active_learning_score(*a_dim, *a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        values
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HorizonQualitySignals {
     pub adoption_rate: f32,
@@ -214,6 +286,111 @@ pub struct QualityReassessmentOutcome {
     pub should_writeback: bool,
 }
 
+impl QualityReassessmentOutcome {
+    pub fn active_learning_tasks(
+        &self,
+        entry: &ContextEntry,
+        planner: &ActiveLearningPlanner,
+    ) -> Vec<ActiveLearningTask> {
+        planner.plan(entry, &self.posterior)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActiveLearningAction {
+    LocalQuery,
+    FederatedDiscovery,
+    UserVerification,
+    RehearsalProbe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveLearningTask {
+    pub target_uri: agent_context_db_core::ContextUri,
+    pub dimension: QualityBeliefDimension,
+    pub action: ActiveLearningAction,
+    pub priority: f32,
+    pub question: String,
+    pub discovery_query: Option<DiscoveryQuery>,
+    pub mesh_opts: Option<MeshDiscoveryOpts>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveLearningPlanner {
+    pub uncertainty_threshold: f32,
+    pub max_tasks: usize,
+    pub min_priority: f32,
+}
+
+impl Default for ActiveLearningPlanner {
+    fn default() -> Self {
+        Self {
+            uncertainty_threshold: 0.42,
+            max_tasks: 3,
+            min_priority: 0.25,
+        }
+    }
+}
+
+impl ActiveLearningPlanner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn plan(
+        &self,
+        entry: &ContextEntry,
+        state: &QualityBeliefState,
+    ) -> Vec<ActiveLearningTask> {
+        let text = entry.payload.sparse_text();
+        let mut tasks = state
+            .ranked_uncertainties()
+            .into_iter()
+            .filter(|(_, belief)| belief.uncertainty >= self.uncertainty_threshold)
+            .filter_map(|(dimension, belief)| {
+                let priority = active_learning_score(dimension, belief);
+                if priority < self.min_priority {
+                    return None;
+                }
+
+                Some(self.task_for_dimension(entry, state, dimension, belief, text, priority))
+            })
+            .collect::<Vec<_>>();
+
+        tasks.sort_by(|a, b| {
+            b.priority
+                .partial_cmp(&a.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        tasks.dedup_by(|a, b| a.dimension == b.dimension && a.action == b.action);
+        tasks.truncate(self.max_tasks);
+        tasks
+    }
+
+    fn task_for_dimension(
+        &self,
+        entry: &ContextEntry,
+        state: &QualityBeliefState,
+        dimension: QualityBeliefDimension,
+        belief: DimensionBelief,
+        text: &str,
+        priority: f32,
+    ) -> ActiveLearningTask {
+        let action = action_for_dimension(dimension, state);
+        let question = active_learning_question(dimension, entry, belief, text);
+        let needs_federation = matches!(action, ActiveLearningAction::FederatedDiscovery);
+        ActiveLearningTask {
+            target_uri: entry.uri.clone(),
+            dimension,
+            action,
+            priority,
+            question: question.clone(),
+            discovery_query: needs_federation.then(|| discovery_query_for(entry, dimension, text)),
+            mesh_opts: needs_federation.then(|| mesh_opts_for(dimension, priority)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HorizonAwareQualityScorer {
     pub writeback_threshold: f32,
@@ -227,6 +404,205 @@ impl Default for HorizonAwareQualityScorer {
             max_delta_per_run: 0.15,
         }
     }
+}
+
+fn active_learning_score(dim: QualityBeliefDimension, belief: DimensionBelief) -> f32 {
+    let epistemic_weight = match dim {
+        QualityBeliefDimension::Factuality => 1.15,
+        QualityBeliefDimension::Consistency => 1.10,
+        QualityBeliefDimension::Evidence => 1.12,
+        QualityBeliefDimension::Stability => 0.92,
+        QualityBeliefDimension::Trainability => 0.88,
+        QualityBeliefDimension::Utility => 0.82,
+        QualityBeliefDimension::Relevance => 0.74,
+        QualityBeliefDimension::Freshness => 0.68,
+        QualityBeliefDimension::Intrinsic => 0.55,
+    };
+    let low_confidence_bonus = (1.0 - belief.mean).max(0.0) * 0.20;
+    (belief.uncertainty * epistemic_weight + low_confidence_bonus).clamp(0.0, 1.0)
+}
+
+fn action_for_dimension(
+    dimension: QualityBeliefDimension,
+    state: &QualityBeliefState,
+) -> ActiveLearningAction {
+    match dimension {
+        QualityBeliefDimension::Factuality
+        | QualityBeliefDimension::Evidence
+        | QualityBeliefDimension::Consistency => ActiveLearningAction::FederatedDiscovery,
+        QualityBeliefDimension::Utility | QualityBeliefDimension::Relevance => {
+            ActiveLearningAction::LocalQuery
+        }
+        QualityBeliefDimension::Trainability if state.contamination_risk > 0.35 => {
+            ActiveLearningAction::FederatedDiscovery
+        }
+        QualityBeliefDimension::Trainability => ActiveLearningAction::RehearsalProbe,
+        QualityBeliefDimension::Freshness | QualityBeliefDimension::Stability => {
+            ActiveLearningAction::RehearsalProbe
+        }
+        QualityBeliefDimension::Intrinsic => ActiveLearningAction::UserVerification,
+    }
+}
+
+fn active_learning_question(
+    dimension: QualityBeliefDimension,
+    entry: &ContextEntry,
+    belief: DimensionBelief,
+    text: &str,
+) -> String {
+    let claim = summarize_claim(text);
+    match dimension {
+        QualityBeliefDimension::Factuality => format!(
+            "Find independent evidence that confirms or contradicts `{claim}` (mean {:.2}, uncertainty {:.2}).",
+            belief.mean, belief.uncertainty
+        ),
+        QualityBeliefDimension::Evidence => format!(
+            "Find stronger corroborating sources or provenance for `{claim}` (uncertainty {:.2}).",
+            belief.uncertainty
+        ),
+        QualityBeliefDimension::Consistency => format!(
+            "Search for knowledge that conflicts with or resolves contradictions around `{claim}`."
+        ),
+        QualityBeliefDimension::Utility => format!(
+            "Probe whether `{claim}` improves downstream task outcomes for {}.",
+            entry.uri
+        ),
+        QualityBeliefDimension::Relevance => format!(
+            "Check whether `{claim}` is still relevant to current retrieval and task contexts."
+        ),
+        QualityBeliefDimension::Freshness => {
+            format!("Refresh stale evidence around `{claim}` and compare with newer knowledge.")
+        }
+        QualityBeliefDimension::Stability => {
+            format!("Rehearse `{claim}` across repeated contexts to measure stability and recall.")
+        }
+        QualityBeliefDimension::Trainability => {
+            format!("Validate whether `{claim}` is safe and useful as a training candidate.")
+        }
+        QualityBeliefDimension::Intrinsic => format!(
+            "Ask for clarification or richer source content for underspecified memory `{}`.",
+            entry.uri
+        ),
+    }
+}
+
+fn discovery_query_for(
+    entry: &ContextEntry,
+    dimension: QualityBeliefDimension,
+    text: &str,
+) -> DiscoveryQuery {
+    DiscoveryQuery {
+        query_embedding: lightweight_query_embedding(&format!(
+            "{} {} {}",
+            dimension.as_str(),
+            entry
+                .content_type()
+                .map(|ty| ty.as_path_segment())
+                .unwrap_or("memory"),
+            text
+        )),
+        domains: discovery_domains(entry, text),
+        entry_types: market_entry_types_for(entry.content_type()),
+        min_quality: match dimension {
+            QualityBeliefDimension::Factuality | QualityBeliefDimension::Evidence => 0.62,
+            QualityBeliefDimension::Consistency => 0.55,
+            _ => 0.45,
+        },
+        min_corroboration_level: match dimension {
+            QualityBeliefDimension::Factuality | QualityBeliefDimension::Evidence => {
+                CorroborationLevel::CrossAgent
+            }
+            QualityBeliefDimension::Consistency | QualityBeliefDimension::Trainability => {
+                CorroborationLevel::CrossSession
+            }
+            _ => CorroborationLevel::SingleSession,
+        },
+        license_compatible: true,
+    }
+}
+
+fn mesh_opts_for(dimension: QualityBeliefDimension, priority: f32) -> MeshDiscoveryOpts {
+    let intent = match dimension {
+        QualityBeliefDimension::Factuality | QualityBeliefDimension::Evidence => {
+            FederatedQueryIntent::CorroborationCheck
+        }
+        QualityBeliefDimension::Consistency => FederatedQueryIntent::HighPrecision,
+        QualityBeliefDimension::Trainability => FederatedQueryIntent::TrainingCandidate,
+        _ => FederatedQueryIntent::HighRecall,
+    };
+    MeshDiscoveryOpts {
+        intent,
+        return_mode: if priority > 0.68 {
+            FederationReturnMode::Exhaustive
+        } else {
+            FederationReturnMode::Balanced
+        },
+        max_peers: if priority > 0.68 { 32 } else { 16 },
+        probe_peers: if priority > 0.68 { 24 } else { 12 },
+        fetch_peers: if priority > 0.68 { 10 } else { 6 },
+        final_top_k: if priority > 0.68 { 32 } else { 16 },
+        deadline_ms: if priority > 0.68 { 1800 } else { 1000 },
+    }
+}
+
+fn discovery_domains(entry: &ContextEntry, text: &str) -> Vec<String> {
+    let mut domains = Vec::new();
+    if let Some(content_type) = entry.content_type() {
+        domains.push(content_type.as_path_segment().to_string());
+    }
+    for token in text
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|token| token.len() >= 4)
+        .take(4)
+    {
+        domains.push(token.to_ascii_lowercase());
+    }
+    domains.sort();
+    domains.dedup();
+    domains.truncate(6);
+    domains
+}
+
+fn market_entry_types_for(content_type: Option<ContentType>) -> Vec<MarketEntryType> {
+    match content_type {
+        Some(ContentType::Fact) | Some(ContentType::Belief) | Some(ContentType::Hypothesis) => {
+            vec![MarketEntryType::Fact]
+        }
+        Some(ContentType::Skill) => vec![MarketEntryType::Skill],
+        Some(ContentType::Procedure) => vec![MarketEntryType::Procedure],
+        Some(ContentType::Error) => vec![MarketEntryType::ErrorPattern],
+        Some(ContentType::Heuristic) => vec![MarketEntryType::Procedure, MarketEntryType::Skill],
+        _ => vec![MarketEntryType::Fact, MarketEntryType::Procedure],
+    }
+}
+
+fn lightweight_query_embedding(text: &str) -> Vec<f32> {
+    let mut values = vec![0.0; 16];
+    for token in text
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|token| !token.is_empty())
+    {
+        let hash = blake3::hash(token.to_ascii_lowercase().as_bytes());
+        let bytes = hash.as_bytes();
+        let idx = bytes[0] as usize % values.len();
+        let sign = if bytes[1] & 1 == 0 { 1.0 } else { -1.0 };
+        values[idx] += sign * (1.0 + (token.len().min(12) as f32 / 12.0));
+    }
+    let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > f32::EPSILON {
+        for v in &mut values {
+            *v /= norm;
+        }
+    }
+    values
+}
+
+fn summarize_claim(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= 96 {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(96).collect::<String>()
 }
 
 impl HorizonAwareQualityScorer {
@@ -568,5 +944,117 @@ impl HorizonAwareQualityScorer {
     fn clamped_delta(&self, prior: f32, raw: f32) -> f32 {
         let delta = (raw - prior).clamp(-self.max_delta_per_run, self.max_delta_per_run);
         (prior + delta).clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_context_db_core::{ContextEntry, ContextMeta, ContextUri, TenantId};
+    use uuid::Uuid;
+
+    fn entry(content_type: ContentType, text: &str) -> ContextEntry {
+        let mut e = ContextEntry::new_text(
+            ContextUri::parse("uwu://t/agent/a/memories/fact/high-uncertainty").unwrap(),
+            TenantId(Uuid::nil()),
+            text,
+        );
+        e.metadata = ContextMeta {
+            content_type: Some(content_type),
+            quality_score: Some(0.5),
+            ..Default::default()
+        };
+        e
+    }
+
+    fn belief(mean: f32, uncertainty: f32) -> DimensionBelief {
+        DimensionBelief {
+            mean,
+            uncertainty,
+            alpha: 1.0,
+            beta: 1.0,
+        }
+    }
+
+    fn state_with_uncertainty(dim: QualityBeliefDimension, uncertainty: f32) -> QualityBeliefState {
+        let base = belief(0.65, 0.15);
+        let high = belief(0.42, uncertainty);
+        let mut state = QualityBeliefState {
+            horizon: MemoryHorizon::MidTerm,
+            overall: 0.5,
+            confidence: 0.5,
+            uncertainty,
+            intrinsic: base,
+            relevance: base,
+            utility: base,
+            factuality: base,
+            consistency: base,
+            freshness: base,
+            stability: base,
+            evidence: base,
+            trainability: base,
+            promotion_readiness: 0.0,
+            decay_pressure: 0.0,
+            contamination_risk: 0.2,
+            last_scored_at: Utc::now(),
+        };
+        match dim {
+            QualityBeliefDimension::Intrinsic => state.intrinsic = high,
+            QualityBeliefDimension::Relevance => state.relevance = high,
+            QualityBeliefDimension::Utility => state.utility = high,
+            QualityBeliefDimension::Factuality => state.factuality = high,
+            QualityBeliefDimension::Consistency => state.consistency = high,
+            QualityBeliefDimension::Freshness => state.freshness = high,
+            QualityBeliefDimension::Stability => state.stability = high,
+            QualityBeliefDimension::Evidence => state.evidence = high,
+            QualityBeliefDimension::Trainability => state.trainability = high,
+        }
+        state
+    }
+
+    #[test]
+    fn active_learning_routes_epistemic_uncertainty_to_federated_discovery() {
+        let entry = entry(
+            ContentType::Fact,
+            "redis embedding cache prevents duplicate API calls",
+        );
+        let state = state_with_uncertainty(QualityBeliefDimension::Evidence, 0.82);
+        let planner = ActiveLearningPlanner::default();
+
+        let tasks = planner.plan(&entry, &state);
+        assert!(!tasks.is_empty());
+        let task = &tasks[0];
+        assert_eq!(task.dimension, QualityBeliefDimension::Evidence);
+        assert_eq!(task.action, ActiveLearningAction::FederatedDiscovery);
+        assert!(task.question.contains("corroborating"));
+
+        let query = task.discovery_query.as_ref().unwrap();
+        assert!(!query.query_embedding.is_empty());
+        assert!(query.domains.contains(&"fact".to_string()));
+        assert_eq!(
+            query.min_corroboration_level,
+            CorroborationLevel::CrossAgent
+        );
+
+        let opts = task.mesh_opts.as_ref().unwrap();
+        assert_eq!(opts.intent, FederatedQueryIntent::CorroborationCheck);
+        assert_eq!(opts.return_mode, FederationReturnMode::Exhaustive);
+    }
+
+    #[test]
+    fn active_learning_uses_local_query_for_utility_uncertainty() {
+        let entry = entry(
+            ContentType::Procedure,
+            "run cargo check before promoting memory",
+        );
+        let state = state_with_uncertainty(QualityBeliefDimension::Utility, 0.70);
+        let planner = ActiveLearningPlanner::default();
+
+        let tasks = planner.plan(&entry, &state);
+        assert!(!tasks.is_empty());
+        assert_eq!(tasks[0].dimension, QualityBeliefDimension::Utility);
+        assert_eq!(tasks[0].action, ActiveLearningAction::LocalQuery);
+        assert!(tasks[0].discovery_query.is_none());
+        assert!(tasks[0].mesh_opts.is_none());
     }
 }

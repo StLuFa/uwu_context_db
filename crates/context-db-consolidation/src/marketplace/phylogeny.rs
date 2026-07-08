@@ -1,7 +1,7 @@
 //! Cross-Agent Phylogeny — 追溯"这个知识最初是哪个 Agent 在哪个 session 学到的"。
 
 use crate::marketplace::types::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// 系统发生树节点。
 #[derive(Debug, Clone)]

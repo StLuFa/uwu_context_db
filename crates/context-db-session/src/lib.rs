@@ -16,7 +16,7 @@ pub use compressor::{
     ShimCandidateAction,
 };
 
-use agent_context_db_core::{ContextUri, MemoryClass, Result};
+use agent_context_db_core::{ContentType, ContextUri, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -102,7 +102,7 @@ pub struct MemoryDiff {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryChange {
     pub uri: ContextUri,
-    pub class: MemoryClass,
+    pub content_type: ContentType,
     pub before: Option<serde_json::Value>,
     pub after: Option<serde_json::Value>,
     pub reason: String,

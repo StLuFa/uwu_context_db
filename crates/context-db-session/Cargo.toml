@@ -12,9 +12,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 parking_lot = "0.12"
+zstd = "0.13"
+base64 = "0.22"
 
 [features]
 default = []
 
 [dev-dependencies]
+agent-context-db-testkit = { path = "../context-db-testkit" }
 tokio = { version = "1", features = ["rt", "macros"] }

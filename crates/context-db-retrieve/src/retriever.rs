@@ -3,15 +3,19 @@
 //! 流程：Query DSL → LogicalPlan → CBO 优化 → PhysicalPlan → 执行。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentType, ContextUri, FsOps, GraphStore, Result, VectorIndex,
+    ContentLevel, ContentPayload, ContentStore, ContentType, ContextError, ContextUri, FsOps,
+    GraphStore, LlmClient, Result, VectorIndex,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::Instrument;
 
+use crate::compiler::query_to_logical;
 use crate::intent::RuleBasedIntentAnalyzer;
 use crate::operators::ExecContext;
-use crate::planner::{CboOptimizer, IntentPlannerHint, LogicalPlan, PhysicalPlan, StatisticsCollector};
+use crate::planner::{
+    CboOptimizer, IntentPlannerHint, LogicalPlan, PhysicalPlan, StatisticsCollector,
+};
 use crate::query::{Condition, Predicate, Query};
 use crate::{
     PlanRetriever, QueryPlanner, Reranker, RetrievalHit, RetrievalResult, RetrievalTrace,
@@ -25,11 +29,14 @@ use crate::{
 /// 计划驱动检索器：Query DSL → Plan → Execute。
 pub struct ContextRetriever {
     fs: Arc<dyn FsOps>,
+    content: Option<Arc<dyn ContentStore>>,
     index: Option<Arc<dyn VectorIndex>>,
     /// 关系图存储 — 若注入，`LogicalPlan::Traverse` 会走 `GraphTraverse` 算子；否则退化。
     graph: Option<Arc<dyn GraphStore>>,
     /// 联想扩展开关 —— 若为 true 且 `graph` 存在，主计划输出后自动沿联想图扩展。
     associative_enabled: bool,
+    graph_rag_llm: Option<Arc<dyn LlmClient>>,
+    graph_rag_index: Option<Arc<crate::GraphRagIndex>>,
     planner: Arc<dyn QueryPlanner>,
     reranker: Arc<dyn Reranker>,
     intent_analyzer: Option<Arc<RuleBasedIntentAnalyzer>>,
@@ -48,15 +55,24 @@ impl ContextRetriever {
         let stats = Arc::new(StatisticsCollector::new());
         Self {
             fs,
+            content: None,
             index,
             graph: None,
             associative_enabled: false,
+            graph_rag_llm: None,
+            graph_rag_index: None,
             planner,
             reranker,
             intent_analyzer: None,
             optimizer: CboOptimizer::new(stats),
             plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 注入完整内容端口，让 WQL 条件、排序和 prefix scan 使用真实条目元数据。
+    pub fn with_content_store(mut self, content: Arc<dyn ContentStore>) -> Self {
+        self.content = Some(content);
+        self
     }
 
     /// 注入新版 intent policy engine，让检索 trace 携带可解释执行图。
@@ -88,6 +104,24 @@ impl ContextRetriever {
     /// G.1: Builder 入口。
     pub fn builder(fs: Arc<dyn FsOps>) -> ContextRetrieverBuilder {
         ContextRetrieverBuilder::new(fs)
+    }
+
+    pub async fn retrieve_graph_rag(
+        &self,
+        request: &crate::GraphRagRequest,
+        ctx: &RetrieveContext,
+    ) -> Result<RetrievalResult> {
+        if let Some(index) = &self.graph_rag_index {
+            return index.retrieve(self.fs.clone(), request, ctx).await;
+        }
+        let graph = self.graph.clone().ok_or_else(|| {
+            ContextError::Unsupported("GraphRAG retrieval requires a GraphStore".into())
+        })?;
+        let mut engine = crate::GraphRagEngine::new(self.fs.clone(), graph);
+        if let Some(llm) = &self.graph_rag_llm {
+            engine = engine.with_llm(llm.clone());
+        }
+        engine.retrieve(request, ctx).await
     }
 
     /// 自然语言查询 → 检索结果。
@@ -127,10 +161,24 @@ impl ContextRetriever {
 
         // 2. CBO 优化 → PhysicalPlan
         let intent_hint = intent_decision.as_ref().map(IntentPlannerHint::from);
-        let physical = tracing::info_span!("plan.optimize").in_scope(|| {
-            self.optimizer
-                .optimize_with_intent(&logical, intent_hint.as_ref())
-        });
+        let cache_key = plan_cache_key(
+            "nl",
+            format!(
+                "query={query}\nuser={:?}\nagent={:?}\nbudget={:?}",
+                ctx.user_id, ctx.agent_id, ctx.budget_tokens
+            )
+            .as_bytes(),
+        );
+        let physical = if let Some(cached) = self.plan_cache.lock().get(&cache_key).cloned() {
+            cached
+        } else {
+            let optimized = tracing::info_span!("plan.optimize").in_scope(|| {
+                self.optimizer
+                    .optimize_with_intent(&logical, intent_hint.as_ref())
+            });
+            self.plan_cache.lock().insert(cache_key, optimized.clone());
+            optimized
+        };
         let adjusted_cost = self
             .optimizer
             .estimate_cost_with_intent(&physical, intent_hint.as_ref());
@@ -142,6 +190,7 @@ impl ContextRetriever {
         // 3. 执行物理计划
         let exec_ctx = ExecContext {
             fs: self.fs.clone(),
+            content: self.content.clone(),
             index: self.index.clone(),
             graph: self.graph.clone(),
         };
@@ -205,8 +254,15 @@ impl ContextRetriever {
         let mut trace = RetrievalTrace::default();
 
         let logical = tracing::info_span!("plan.parse").in_scope(|| query_to_logical(query));
-        let physical =
-            tracing::info_span!("plan.optimize").in_scope(|| self.optimizer.optimize(&logical));
+        let cache_key = plan_cache_key("query", format!("{query:?}").as_bytes());
+        let physical = if let Some(cached) = self.plan_cache.lock().get(&cache_key).cloned() {
+            cached
+        } else {
+            let optimized =
+                tracing::info_span!("plan.optimize").in_scope(|| self.optimizer.optimize(&logical));
+            self.plan_cache.lock().insert(cache_key, optimized.clone());
+            optimized
+        };
         trace.steps.push(TraceStep::PlanOptimized {
             logical: format!("{logical:?}"),
             physical: format!("{physical:?}"),
@@ -214,6 +270,7 @@ impl ContextRetriever {
 
         let exec_ctx = ExecContext {
             fs: self.fs.clone(),
+            content: self.content.clone(),
             index: self.index.clone(),
             graph: self.graph.clone(),
         };
@@ -260,108 +317,12 @@ impl PlanRetriever for ContextRetriever {
     }
 }
 
-// ===========================================================================
-// Query → LogicalPlan 转换
-// ===========================================================================
-
-fn query_to_logical(query: &Query) -> LogicalPlan {
-    match query {
-        Query::Find {
-            scope,
-            predicate,
-            budget,
-            expand,
-            ..
-        } => {
-            let scan = LogicalPlan::Scan {
-                scope: scope.clone(),
-                level: ContentLevel::L0,
-            };
-            let plan = if predicate.is_empty() {
-                scan
-            } else {
-                LogicalPlan::Filter {
-                    input: Box::new(scan),
-                    predicate: predicate.clone(),
-                }
-            };
-            let plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                budget: *budget,
-            };
-            if let Some(exp) = expand {
-                LogicalPlan::Traverse {
-                    input: Box::new(plan),
-                    edges: exp.kinds.clone(),
-                    max_hops: exp.max_hops,
-                }
-            } else {
-                plan
-            }
-        }
-        Query::Similar {
-            query_embedding,
-            predicate,
-            budget,
-            expand,
-        } => {
-            let vs = LogicalPlan::VectorSearch {
-                collection: "memories".into(),
-                query: query_embedding.clone(),
-                top_k: 50,
-            };
-            let plan = if predicate.is_empty() {
-                vs
-            } else {
-                LogicalPlan::Filter {
-                    input: Box::new(vs),
-                    predicate: predicate.clone(),
-                }
-            };
-            let plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                budget: *budget,
-            };
-            if let Some(exp) = expand {
-                LogicalPlan::Traverse {
-                    input: Box::new(plan),
-                    edges: exp.kinds.clone(),
-                    max_hops: exp.max_hops,
-                }
-            } else {
-                plan
-            }
-        }
-        Query::AsOf { uri, at, level } => LogicalPlan::TemporalScan {
-            uri: uri.clone(),
-            at: at.clone(),
-        },
-        Query::Traverse {
-            start,
-            edges,
-            max_hops,
-            predicate,
-        } => {
-            let scan = LogicalPlan::Scan {
-                scope: Some(start.clone()),
-                level: ContentLevel::L0,
-            };
-            LogicalPlan::Traverse {
-                input: Box::new(scan),
-                edges: edges.clone(),
-                max_hops: *max_hops,
-            }
-        }
-        Query::Composite { queries, merge: _ } => {
-            // 组合查询 → 多个 LogicalPlan 并行
-            // 简化：合并所有子查询的 scan scopes
-            let first = queries.first().map(|q| query_to_logical(q));
-            first.unwrap_or(LogicalPlan::Scan {
-                scope: None,
-                level: ContentLevel::L0,
-            })
-        }
-    }
+fn plan_cache_key(kind: &str, payload: &[u8]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(payload);
+    hasher.finalize().as_bytes().to_vec()
 }
 
 // ===========================================================================
@@ -402,7 +363,7 @@ fn estimate_tokens(content: &ContentPayload) -> usize {
     match content {
         ContentPayload::Text {
             sparse,
-            dense,
+            dense: _,
             full: _,
         } => std::cmp::max(sparse.len() / 4, 100),
         _ => 100,
@@ -471,9 +432,12 @@ impl QueryPlanner for RuleBasedPlanner {
 /// Builder for ContextRetriever — 替代多构造器模式。
 pub struct ContextRetrieverBuilder {
     fs: Arc<dyn FsOps>,
+    content: Option<Arc<dyn ContentStore>>,
     index: Option<Arc<dyn VectorIndex>>,
     graph: Option<Arc<dyn GraphStore>>,
     associative_enabled: bool,
+    graph_rag_llm: Option<Arc<dyn LlmClient>>,
+    graph_rag_index: Option<Arc<crate::GraphRagIndex>>,
     planner: Option<Arc<dyn QueryPlanner>>,
     reranker: Option<Arc<dyn Reranker>>,
 }
@@ -482,12 +446,20 @@ impl ContextRetrieverBuilder {
     pub fn new(fs: Arc<dyn FsOps>) -> Self {
         Self {
             fs,
+            content: None,
             index: None,
             graph: None,
             associative_enabled: false,
+            graph_rag_llm: None,
+            graph_rag_index: None,
             planner: None,
             reranker: None,
         }
+    }
+
+    pub fn with_content_store(mut self, content: Arc<dyn ContentStore>) -> Self {
+        self.content = Some(content);
+        self
     }
 
     pub fn with_vector_index(mut self, index: Arc<dyn VectorIndex>) -> Self {
@@ -504,6 +476,18 @@ impl ContextRetrieverBuilder {
     /// 启用主计划输出后的联想扩展（需先注入 graph，否则无效）。
     pub fn enable_associative(mut self) -> Self {
         self.associative_enabled = true;
+        self
+    }
+
+    /// 注入 GraphRAG 社区摘要 LLM；未注入时使用抽取式摘要 fallback。
+    pub fn with_graph_rag_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
+        self.graph_rag_llm = Some(llm);
+        self
+    }
+
+    /// 注入预构建 GraphRAG 索引，让查询热路径跳过扩图与摘要生成。
+    pub fn with_graph_rag_index(mut self, index: Arc<crate::GraphRagIndex>) -> Self {
+        self.graph_rag_index = Some(index);
         self
     }
 
@@ -525,8 +509,11 @@ impl ContextRetrieverBuilder {
             .reranker
             .unwrap_or_else(|| Arc::new(crate::ScoreReranker { keep: 20 }));
         let mut r = ContextRetriever::new(self.fs, self.index, planner, reranker);
+        r.content = self.content;
         r.graph = self.graph;
         r.associative_enabled = self.associative_enabled;
+        r.graph_rag_llm = self.graph_rag_llm;
+        r.graph_rag_index = self.graph_rag_index;
         r
     }
 }

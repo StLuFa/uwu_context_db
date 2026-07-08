@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use agent_context_db_retrieve::{
-    BuiltinIntentPolicyProvider, CompiledIntentPolicy, IntentPolicyPack, IntentPolicyProvider,
+    BuiltinIntentPolicyProvider, CompiledIntentPolicy, IntentPolicyPack,
     LayeredIntentPolicyProvider, RetrieveContext, RuleBasedIntentAnalyzer,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench_compile_default_policy(c: &mut Criterion) {
     let pack = IntentPolicyPack::default_builtin().expect("default policy parses");
@@ -21,7 +21,12 @@ fn bench_decide_default_policy(c: &mut Criterion) {
         ..Default::default()
     };
     c.bench_function("intent_decide_default_policy", |b| {
-        b.iter(|| analyzer.decide(black_box("when did that migration happen?"), black_box(&ctx)));
+        b.iter(|| {
+            analyzer.decide(
+                black_box("when did that migration happen?"),
+                black_box(&ctx),
+            )
+        });
     });
 }
 

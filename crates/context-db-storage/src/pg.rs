@@ -6,10 +6,11 @@
 //! - 版本历史通过 `context_versions` 表存储完整快照。
 
 use agent_context_db_core::{
-    BlobRef, BlobStore, BrowsingOps, ContentHash, ContentLevel, ContentPayload, ContentRepo,
-    ContentStore, ContentType, ContextDiff, ContextEntry, ContextError, ContextUri, DirEntry,
-    FindPattern, FsOps, GraphRelation, GraphStore, GrepHit, MediaType, MemoryClass, MvccVersion,
-    Result, StateScope, StorageEngine, TenantId, TenantOps, TreeNode, VersionEntry, VersionOps,
+    AclProtectedStore, BlobRef, BlobStore, BrowsingOps, ContentHash, ContentLevel, ContentPayload,
+    ContentRepo, ContentStore, ContentType, ContextDiff, ContextEntry, ContextError, ContextUri,
+    DirEntry, FindPattern, FsOps, GraphRelation, GraphStore, GrepHit, MvccVersion, PathAcl,
+    Principal, Result, StateScope, StorageEngine, TenantId, TenantOps, TreeNode, VersionEntry,
+    VersionOps, sanitize_entry_for_write,
 };
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -100,23 +101,20 @@ fn payload_from_levels(l0: &str, l1: Option<&str>, _l2_ref: Option<Uuid>) -> Con
 impl ContentRepo for PgContextStore {
     #[tracing::instrument(skip(self, entry), fields(uri = %entry.uri))]
     async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
+        let entry = sanitize_entry_for_write(&entry);
         let mut tx = self.pg_pool().begin().await.map_err(|e| {
             tracing::error!(error = %e, "begin transaction failed");
             ContextError::Storage(format!("begin transaction failed: {e}"))
         })?;
         let uri_str = entry.uri.to_string();
         let tenant_str = entry.tenant.0.to_string();
-        let (l0_text, l1_text, l2_text) = extract_payload_levels(&entry.payload);
+        let (l0_text, l1_text, _l2_text) = extract_payload_levels(&entry.payload);
         let l2_ref: Option<Uuid> = None; // L2 stored in l2_full_text, blob ref not used
-        let content_type = match entry.media_type {
-            MediaType::Text => "text",
-            MediaType::Image => "image",
-            MediaType::Audio => "audio",
-            MediaType::Video => "video",
-            MediaType::Binary => "binary",
-        };
-        let memory_class: Option<String> =
-            entry.metadata.memory_class.map(|c| memory_class_name(c));
+        let content_type = entry
+            .metadata
+            .content_type
+            .unwrap_or(ContentType::Evidence)
+            .as_path_segment();
         let state_scope: Option<String> = entry.metadata.state_scope.map(|s| match s {
             StateScope::Short => "short".to_string(),
             StateScope::Mid => "mid".to_string(),
@@ -131,17 +129,16 @@ impl ContentRepo for PgContextStore {
             r#"
             INSERT INTO context_entries
                 (uri, tenant_id, l0_abstract, l1_overview, l2_detail_ref,
-                 content_type, memory_class, state_scope, tags, custom,
+                 content_type, state_scope, tags, custom,
                  mvcc_version, created_at, updated_at)
             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (uri) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 l0_abstract = EXCLUDED.l0_abstract,
                 l1_overview = EXCLUDED.l1_overview,
                 l2_detail_ref = EXCLUDED.l2_detail_ref,
                 content_type = EXCLUDED.content_type,
-                memory_class = EXCLUDED.memory_class,
                 state_scope = EXCLUDED.state_scope,
                 tags = EXCLUDED.tags,
                 custom = EXCLUDED.custom,
@@ -155,7 +152,6 @@ impl ContentRepo for PgContextStore {
         .bind(&l1_text)
         .bind(&l2_ref)
         .bind(content_type)
-        .bind(&memory_class)
         .bind(&state_scope)
         .bind(&tags)
         .bind(custom)
@@ -172,10 +168,10 @@ impl ContentRepo for PgContextStore {
             r#"
             INSERT INTO context_versions
                 (uri, mvcc_version, tenant_id, l0_abstract, l1_overview,
-                 l2_detail_ref, content_type, memory_class, state_scope,
+                 l2_detail_ref, content_type, state_scope,
                  tags, custom, entry_json)
             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(&uri_str)
@@ -185,7 +181,6 @@ impl ContentRepo for PgContextStore {
         .bind(&l1_text)
         .bind(&l2_ref)
         .bind(content_type)
-        .bind(&memory_class)
         .bind(&state_scope)
         .bind(&tags)
         .bind(custom)
@@ -284,14 +279,14 @@ impl ContentRepo for PgContextStore {
             let (l0, l1, _l2) = extract_payload_levels(&entry.payload);
             let mvcc = entry.mvcc_version.0 as i64 + 1;
             sqlx::query(
-                "INSERT INTO context_entries (uri, tenant_id, l0_abstract, l1_overview, l2_detail_ref, content_type, memory_class, state_scope, tags, custom, mvcc_version, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (uri) DO UPDATE SET l0_abstract=EXCLUDED.l0_abstract, l1_overview=EXCLUDED.l1_overview, mvcc_version=EXCLUDED.mvcc_version, updated_at=EXCLUDED.updated_at"
+                "INSERT INTO context_entries (uri, tenant_id, l0_abstract, l1_overview, l2_detail_ref, content_type, state_scope, tags, custom, mvcc_version, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (uri) DO UPDATE SET l0_abstract=EXCLUDED.l0_abstract, l1_overview=EXCLUDED.l1_overview, content_type=EXCLUDED.content_type, state_scope=EXCLUDED.state_scope, tags=EXCLUDED.tags, custom=EXCLUDED.custom, mvcc_version=EXCLUDED.mvcc_version, updated_at=EXCLUDED.updated_at"
             )
             .bind(&entry.uri.to_string())
             .bind(&entry.tenant.0.to_string())
             .bind(&l0).bind(&l1).bind::<Option<Uuid>>(None)
-            .bind(match entry.media_type { MediaType::Text => "text", MediaType::Image => "image", MediaType::Audio => "audio", MediaType::Video => "video", MediaType::Binary => "binary" })
-            .bind::<Option<String>>(None).bind::<Option<String>>(None)
-            .bind(&serde_json::Value::Null).bind(&serde_json::Value::Null)
+            .bind(entry.metadata.content_type.unwrap_or(ContentType::Evidence).as_path_segment())
+            .bind(entry.metadata.state_scope.map(|s| match s { StateScope::Short => "short".to_string(), StateScope::Mid => "mid".to_string(), StateScope::Long => "long".to_string() }))
+            .bind(&serde_json::to_value(&entry.metadata.tags).unwrap_or(serde_json::json!([]))).bind(&entry.metadata.custom)
             .bind(mvcc).bind(&entry.created_at).bind(&entry.updated_at)
             .execute(&mut *tx).await
             .map_err(|e| Self::storage_err("batch write entry", e))?;
@@ -344,7 +339,7 @@ impl FsOps for PgContextStore {
         // 获取所有以 dir/ 开头的条目
         let rows = sqlx::query_as::<_, (String, String, Option<String>)>(
             r#"
-            SELECT uri, l0_abstract, memory_class FROM context_entries
+            SELECT uri, l0_abstract, content_type FROM context_entries
             WHERE uri LIKE $1
             ORDER BY uri
             "#,
@@ -355,13 +350,11 @@ impl FsOps for PgContextStore {
         .map_err(|e| Self::storage_err("ls", e))?;
 
         let mut seen = std::collections::BTreeMap::new();
-        for (uri_str, abstract_, memory_class_str) in rows {
+        for (uri_str, abstract_, content_type_str) in rows {
             let rest = uri_str.strip_prefix(&prefix).unwrap_or(&uri_str);
-            #[allow(deprecated)]
-            let mc = memory_class_str
+            let ct = content_type_str
                 .as_deref()
-                .and_then(|s| parse_memory_class(s));
-            let ct = mc.map(|m| m.to_content_type());
+                .and_then(ContentType::from_path_segment);
             let slash_pos = rest.find('/');
             if let Some(pos) = slash_pos {
                 let dir_name = &rest[..pos];
@@ -401,18 +394,17 @@ impl FsOps for PgContextStore {
             .map(|u| u.to_string())
             .unwrap_or_default();
 
-        // 构建查询：有 class 过滤时加 WHERE 条件
-        let results: Vec<String> = if let Some(mc) = pattern.class {
-            let mc_name = memory_class_name(mc);
+        // 构建查询：有 content_type 过滤时加 WHERE 条件
+        let results: Vec<String> = if let Some(content_type) = pattern.content_type {
             sqlx::query_scalar::<_, String>(
                 r#"
                 SELECT uri FROM context_entries
-                WHERE uri LIKE $1 AND memory_class = $2
+                WHERE uri LIKE $1 AND content_type = $2
                 ORDER BY uri
                 "#,
             )
             .bind(format!("{}%", &scope))
-            .bind(mc_name)
+            .bind(content_type.as_path_segment())
             .fetch_all(pg)
             .await
             .map_err(|e| Self::storage_err("find", e))?
@@ -534,7 +526,7 @@ impl FsOps for PgContextStore {
                         r#"
                         SELECT row_to_json(t) FROM (
                             SELECT uri, tenant_id, l0_abstract, l1_overview, l2_detail_ref,
-                                   content_type, memory_class, state_scope, tags, custom,
+                                   content_type, state_scope, tags, custom,
                                    mvcc_version, created_at, updated_at
                             FROM context_entries WHERE uri = $1
                         ) t
@@ -954,24 +946,24 @@ impl BlobStore for PgContextStore {
 // PgEngine — 6域存储引擎装配
 // ===========================================================================
 
-/// PG 存储引擎 — 组合 PgContextStore（实现全部 6 域）为 StorageEngine。
-pub struct PgEngine {
-    store: Arc<PgContextStore>,
+pub struct AclPgEngine {
+    store: Arc<AclProtectedStore<PgContextStore>>,
+    raw_store: Arc<PgContextStore>,
 }
 
-impl PgEngine {
-    pub fn new(store: Arc<PgContextStore>) -> Self {
-        Self { store }
-    }
-
-    pub fn from_pool(pool: Arc<DbPool>) -> Self {
-        Self {
-            store: Arc::new(PgContextStore::new(pool)),
-        }
+impl AclPgEngine {
+    pub fn from_pool(pool: Arc<DbPool>, acl: Arc<PathAcl>, principal: Principal) -> Self {
+        let raw_store = Arc::new(PgContextStore::new(pool));
+        let store = Arc::new(AclProtectedStore::new(
+            raw_store.as_ref().clone(),
+            acl,
+            principal,
+        ));
+        Self { store, raw_store }
     }
 }
 
-impl StorageEngine for PgEngine {
+impl StorageEngine for AclPgEngine {
     fn content(&self) -> &dyn ContentStore {
         self.store.as_ref()
     }
@@ -981,54 +973,25 @@ impl StorageEngine for PgEngine {
     }
 
     fn version(&self) -> &dyn VersionOps {
-        self.store.as_ref()
+        self.raw_store.as_ref()
     }
 
     fn tenant(&self) -> &dyn TenantOps {
-        self.store.as_ref()
+        self.raw_store.as_ref()
     }
 
     fn graph(&self) -> Option<&dyn GraphStore> {
-        Some(self.store.as_ref())
+        Some(self.raw_store.as_ref())
     }
 
     fn blob(&self) -> &dyn BlobStore {
-        self.store.as_ref()
+        self.raw_store.as_ref()
     }
 }
 
 // ===========================================================================
 // 辅助函数
 // ===========================================================================
-
-fn memory_class_name(c: MemoryClass) -> String {
-    match c {
-        MemoryClass::Profile => "profile",
-        MemoryClass::Preferences => "preferences",
-        MemoryClass::Entities => "entities",
-        MemoryClass::Events => "events",
-        MemoryClass::Cases => "cases",
-        MemoryClass::Patterns => "patterns",
-        MemoryClass::Tools => "tools",
-        MemoryClass::Skills => "skills",
-    }
-    .to_string()
-}
-
-#[allow(dead_code)]
-fn parse_memory_class(s: &str) -> Option<MemoryClass> {
-    match s {
-        "profile" => Some(MemoryClass::Profile),
-        "preferences" => Some(MemoryClass::Preferences),
-        "entities" => Some(MemoryClass::Entities),
-        "events" => Some(MemoryClass::Events),
-        "cases" => Some(MemoryClass::Cases),
-        "patterns" => Some(MemoryClass::Patterns),
-        "tools" => Some(MemoryClass::Tools),
-        "skills" => Some(MemoryClass::Skills),
-        _ => None,
-    }
-}
 
 #[allow(dead_code)]
 fn parse_state_scope(s: &str) -> Option<StateScope> {
@@ -1102,23 +1065,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_class_roundtrips() {
-        for c in &[
-            MemoryClass::Profile,
-            MemoryClass::Preferences,
-            MemoryClass::Entities,
-            MemoryClass::Events,
-            MemoryClass::Cases,
-            MemoryClass::Patterns,
-            MemoryClass::Tools,
-            MemoryClass::Skills,
-        ] {
-            let name = memory_class_name(*c);
-            assert_eq!(parse_memory_class(&name), Some(*c));
-        }
-    }
-
-    #[test]
     fn dir_prefix_ends_with_slash() {
         let dir = ContextUri::parse("uwu://t/agent/a").unwrap();
         assert_eq!(PgContextStore::dir_prefix(&dir), "uwu://t/agent/a/");
@@ -1132,7 +1078,7 @@ mod tests {
 #[cfg(test)]
 mod pg_tests {
     use super::*;
-    use agent_context_db_core::{ContentRef, ContextMeta, ContextStore, StateScope};
+    use agent_context_db_core::{ContentType, ContextMeta, MediaType, StateScope};
     use std::sync::Arc;
     use uuid::Uuid;
     use uwu_database::config::{
@@ -1193,8 +1139,7 @@ mod pg_tests {
                 l0_abstract     TEXT NOT NULL,\
                 l1_overview     TEXT,\
                 l2_detail_ref   UUID,\
-                content_type    TEXT NOT NULL DEFAULT 'text',\
-                memory_class    TEXT,\
+                content_type    TEXT NOT NULL DEFAULT 'evidence',\
                 state_scope     TEXT,\
                 tags            JSONB NOT NULL DEFAULT '[]',\
                 custom          JSONB NOT NULL DEFAULT '{{}}',\
@@ -1214,8 +1159,7 @@ mod pg_tests {
                 l0_abstract     TEXT NOT NULL,\
                 l1_overview     TEXT,\
                 l2_detail_ref   UUID,\
-                content_type    TEXT NOT NULL DEFAULT 'text',\
-                memory_class    TEXT,\
+                content_type    TEXT NOT NULL DEFAULT 'evidence',\
                 state_scope     TEXT,\
                 tags            JSONB NOT NULL DEFAULT '[]',\
                 custom          JSONB NOT NULL DEFAULT '{{}}',\
@@ -1313,15 +1257,15 @@ mod pg_tests {
 
         // 通过数据库直接验证
         let pool = store.pg_pool();
-        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT l0_abstract, memory_class, state_scope FROM context_entries WHERE uri = $1",
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT l0_abstract, content_type, state_scope FROM context_entries WHERE uri = $1",
         )
         .bind(&uri.to_string())
         .fetch_one(pool)
         .await
         .unwrap();
         assert_eq!(row.0, "L0 summary");
-        assert_eq!(row.1, Some("cases".into()));
+        assert_eq!(row.1, "error");
         assert_eq!(row.2, Some("long".into()));
     }
 

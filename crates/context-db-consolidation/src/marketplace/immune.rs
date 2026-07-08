@@ -1,8 +1,7 @@
 //! Immune Memory Protocol — 只共享攻击签名，不共享原始数据。
 
 use crate::marketplace::types::*;
-use agent_context_db_core::{ContextUri, EventMesh, LlmClient, LlmOpts, Result, Topic};
-use std::sync::Arc;
+use agent_context_db_core::{EventMesh, Topic};
 
 /// 抗体 — 攻击模式的特征签名（不是原始 prompt）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

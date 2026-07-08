@@ -1,6 +1,6 @@
 //! Redis 后端实现 — 可选（feature gate `redis-backend`）。
 //!
-//! 提供 ReadCache、RateLimiter 的 Redis 实现（跨进程共享缓存/限流）。
+//! 提供 ReadCache、EmbeddingCache、RateLimiter 的 Redis 实现（跨进程共享缓存/限流）。
 //! 事件总线已迁移到 `uwu_event_mesh` + `uwu_nats_bridge`。
 //!
 //! 编译条件：
@@ -8,6 +8,7 @@
 //! cargo build --features redis-backend
 //! ```
 
+use crate::embedding_cache::EmbeddingCache;
 use crate::rate_limiter::RateLimiter;
 use crate::read_cache::ReadCache;
 use crate::{ContentLevel, ContentPayload, ContextUri, Result};
@@ -24,6 +25,7 @@ pub struct RedisConfig {
     pub url: String,
     pub key_prefix: String,
     pub default_ttl_secs: u64,
+    pub embedding_ttl_secs: u64,
     pub pool_size: usize,
 }
 
@@ -33,6 +35,7 @@ impl Default for RedisConfig {
             url: "redis://127.0.0.1:6379".into(),
             key_prefix: "uwu".into(),
             default_ttl_secs: 300,
+            embedding_ttl_secs: 86_400,
             pool_size: 10,
         }
     }
@@ -157,6 +160,82 @@ impl ReadCache for RedisReadCache {
                     .await
                     .unwrap_or(());
             }
+        }
+    }
+}
+
+// ===========================================================================
+// RedisEmbeddingCache — Redis embedding 缓存
+// ===========================================================================
+
+/// Redis embedding 缓存 — 按 blake3(content) 跨进程共享向量结果。
+pub struct RedisEmbeddingCache {
+    client: redis::Client,
+    prefix: String,
+    default_ttl: Duration,
+}
+
+impl RedisEmbeddingCache {
+    pub fn connect(config: &RedisConfig) -> Result<Self> {
+        let client = redis::Client::open(config.url.as_str())
+            .map_err(|e| crate::ContextError::Storage(format!("redis connect: {e}")))?;
+        Ok(Self {
+            client,
+            prefix: config.key_prefix.clone(),
+            default_ttl: Duration::from_secs(config.embedding_ttl_secs),
+        })
+    }
+
+    fn cache_key(&self, content_hash: &str) -> String {
+        prefixed(&self.prefix, &format!("embedding:{content_hash}"))
+    }
+
+    async fn conn(&self) -> Result<redis::aio::MultiplexedConnection> {
+        self.client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| crate::ContextError::Storage(format!("redis conn: {e}")))
+    }
+}
+
+#[async_trait]
+impl EmbeddingCache for RedisEmbeddingCache {
+    async fn get(&self, content_hash: &str) -> Option<Vec<f32>> {
+        let key = self.cache_key(content_hash);
+        let mut conn = self.conn().await.ok()?;
+        let data: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .ok()?;
+        serde_json::from_slice(&data?).ok()
+    }
+
+    async fn put(&self, content_hash: &str, embedding: Vec<f32>, ttl: Duration) {
+        let effective = if ttl.is_zero() { self.default_ttl } else { ttl };
+        if let Ok(data) = serde_json::to_vec(&embedding) {
+            if let Ok(mut conn) = self.conn().await {
+                let key = self.cache_key(content_hash);
+                let ttl_secs = effective.as_secs().max(1);
+                let _: () = redis::cmd("SETEX")
+                    .arg(&key)
+                    .arg(ttl_secs)
+                    .arg(&data)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(());
+            }
+        }
+    }
+
+    async fn invalidate(&self, content_hash: &str) {
+        if let Ok(mut conn) = self.conn().await {
+            let key = self.cache_key(content_hash);
+            let _: () = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(());
         }
     }
 }

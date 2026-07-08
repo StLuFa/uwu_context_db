@@ -4,7 +4,7 @@
 //! 联邦查询通过 EventMesh broadcast + 各 shard 返回匹配结果。
 
 use crate::marketplace::types::*;
-use agent_context_db_core::{ContentType, ContextUri, EventMesh, Result, Topic, VectorIndex};
+use agent_context_db_core::{EventMesh, Topic, VectorIndex};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -69,6 +69,9 @@ impl FederatedRegistry {
             agent_context_db_core::IndexPoint {
                 uri: uri.clone(),
                 vector: vec![0.0; 128], // actual embedding from product
+                embedding_model_id: None,
+                embedding_dim: None,
+                embedding_version: None,
                 payload: serde_json::json!({
                     "market_id": entry.id.0.to_string(),
                     "domain": entry.domain,

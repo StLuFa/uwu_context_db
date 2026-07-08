@@ -5,13 +5,12 @@
 use agent_context_db_core::{ContextUri, Envelope, EventMesh, EventTypeId, Result, Topic};
 use aho_corasick::AhoCorasick;
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use parking_lot::RwLock;
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -593,9 +592,9 @@ impl IntentPolicySignatureVerifier {
     pub fn sign(&self, signer: &str, pack: &IntentPolicyPack) -> Result<SignedIntentPolicyPack> {
         let keys = self.shared_keys.read();
         let Some(key) = keys.get(signer) else {
-            return Err(agent_context_db_core::ContextError::PermissionDenied(format!(
-                "unknown intent policy signer `{signer}`"
-            )));
+            return Err(agent_context_db_core::ContextError::PermissionDenied(
+                format!("unknown intent policy signer `{signer}`"),
+            ));
         };
         Ok(SignedIntentPolicyPack {
             pack: pack.clone(),
@@ -607,26 +606,26 @@ impl IntentPolicySignatureVerifier {
     pub fn verify_layer(&self, layer: &IntentPolicyLayer) -> Result<()> {
         let Some(signature) = &layer.signature else {
             if self.require_signatures {
-                return Err(agent_context_db_core::ContextError::PermissionDenied(format!(
-                    "intent policy layer `{}` is unsigned",
-                    layer.source
-                )));
+                return Err(agent_context_db_core::ContextError::PermissionDenied(
+                    format!("intent policy layer `{}` is unsigned", layer.source),
+                ));
             }
             return Ok(());
         };
         let keys = self.shared_keys.read();
         let Some(key) = keys.get(&signature.signer) else {
-            return Err(agent_context_db_core::ContextError::PermissionDenied(format!(
-                "unknown intent policy signer `{}`",
-                signature.signer
-            )));
+            return Err(agent_context_db_core::ContextError::PermissionDenied(
+                format!("unknown intent policy signer `{}`", signature.signer),
+            ));
         };
         let expected = compute_policy_signature(&layer.pack, &signature.signer, key)?;
         if expected != signature.signature {
-            return Err(agent_context_db_core::ContextError::PermissionDenied(format!(
-                "invalid signature for intent policy layer `{}`",
-                layer.source
-            )));
+            return Err(agent_context_db_core::ContextError::PermissionDenied(
+                format!(
+                    "invalid signature for intent policy layer `{}`",
+                    layer.source
+                ),
+            ));
         }
         Ok(())
     }
@@ -734,11 +733,22 @@ pub struct IntentPolicyReloadReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IntentTraceEvent {
-    AnalysisStarted { query_len: usize },
-    AnalysisCompleted { decision: IntentDecision },
-    PolicyReloaded { report: IntentPolicyReloadReport },
-    PolicyRejected { report: IntentPolicyReloadReport },
-    FeedbackRecorded { event: IntentFeedbackEvent, bias: HashMap<IntentKind, f32> },
+    AnalysisStarted {
+        query_len: usize,
+    },
+    AnalysisCompleted {
+        decision: IntentDecision,
+    },
+    PolicyReloaded {
+        report: IntentPolicyReloadReport,
+    },
+    PolicyRejected {
+        report: IntentPolicyReloadReport,
+    },
+    FeedbackRecorded {
+        event: IntentFeedbackEvent,
+        bias: HashMap<IntentKind, f32>,
+    },
 }
 
 pub trait IntentTraceSink: Send + Sync {
@@ -1310,7 +1320,6 @@ impl RuleBasedIntentAnalyzer {
     fn emit_trace(&self, topic: &'static str, event: IntentTraceEvent) {
         self.trace_sink.read().emit(topic, &event);
     }
-
 }
 
 // ==========================================================================
@@ -1361,7 +1370,10 @@ fn intent_event_type_name(topic: &str) -> &'static str {
 fn explanation_reasons(candidate: &IntentCandidate) -> Vec<String> {
     let mut notes = Vec::new();
     if !candidate.matched_terms.is_empty() {
-        notes.push(format!("matched terms: {}", candidate.matched_terms.join(", ")));
+        notes.push(format!(
+            "matched terms: {}",
+            candidate.matched_terms.join(", ")
+        ));
     }
     if !candidate.matched_patterns.is_empty() {
         notes.push(format!(
@@ -1370,7 +1382,10 @@ fn explanation_reasons(candidate: &IntentCandidate) -> Vec<String> {
         ));
     }
     if candidate.breakdown.feedback.abs() > f32::EPSILON {
-        notes.push(format!("feedback bias: {:.3}", candidate.breakdown.feedback));
+        notes.push(format!(
+            "feedback bias: {:.3}",
+            candidate.breakdown.feedback
+        ));
     }
     notes.push(format!(
         "route {:?} selected with score {:.3}",
@@ -1520,10 +1535,12 @@ mod tests {
     async fn pattern_query_gets_pattern_match() {
         let ia = RuleBasedIntentAnalyzer::new("u1", "a1");
         let decision = ia.decide("rust async patterns", &ctx());
-        assert!(decision
-            .candidates
-            .iter()
-            .any(|candidate| candidate.intent == IntentKind::PatternMatch));
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.intent == IntentKind::PatternMatch)
+        );
     }
 
     #[tokio::test]
@@ -1606,7 +1623,11 @@ mod tests {
         let snapshot = provider.load().unwrap();
         let pack = snapshot.merged_pack().unwrap();
         assert_eq!(pack.pack.id, "context-db.default.intent");
-        assert!(pack.intent.iter().any(|rule| rule.id == "retrieve.event_recall"));
+        assert!(
+            pack.intent
+                .iter()
+                .any(|rule| rule.id == "retrieve.event_recall")
+        );
     }
 
     #[test]
@@ -1615,15 +1636,20 @@ mod tests {
         struct BadProvider;
         impl IntentPolicyProvider for BadProvider {
             fn load(&self) -> Result<IntentPolicySnapshot> {
-                Err(agent_context_db_core::ContextError::Unsupported("bad policy".into()))
+                Err(agent_context_db_core::ContextError::Unsupported(
+                    "bad policy".into(),
+                ))
             }
         }
 
-        let ia = RuleBasedIntentAnalyzer::new("u1", "a1")
-            .with_policy_provider(Arc::new(BadProvider));
+        let ia =
+            RuleBasedIntentAnalyzer::new("u1", "a1").with_policy_provider(Arc::new(BadProvider));
         let before = ia.active_policy();
         let report = ia.reload_from_provider();
-        assert!(matches!(report.status, IntentPolicyReloadStatus::Rejected { .. }));
+        assert!(matches!(
+            report.status,
+            IntentPolicyReloadStatus::Rejected { .. }
+        ));
         assert_eq!(ia.active_policy().id, before.id);
     }
 
@@ -1676,7 +1702,10 @@ mod tests {
             .with_policy_provider(Arc::new(SignedProvider(layer)))
             .with_signature_verifier(verifier);
         let report = ia.reload_from_provider();
-        assert!(matches!(report.status, IntentPolicyReloadStatus::Rejected { .. }));
+        assert!(matches!(
+            report.status,
+            IntentPolicyReloadStatus::Rejected { .. }
+        ));
         assert_eq!(ia.active_policy().id, "context-db.default.intent");
     }
 }

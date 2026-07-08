@@ -6,7 +6,7 @@
 //! 3. PhysicalPlan 交由物理算子执行
 
 use crate::intent::{IntentDecision, IntentExecutionNodeKind, IntentRoute};
-use crate::query::{Condition, MergeStrategy, Predicate, RelationExpand, SortKey};
+use crate::query::{Condition, MergeStrategy, Predicate, SortKey};
 use agent_context_db_core::{ContentLevel, ContentType, ContextUri};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -22,6 +22,11 @@ pub enum LogicalPlan {
     Scan {
         scope: Option<ContextUri>,
         level: ContentLevel,
+    },
+    /// 并行组合查询。
+    Parallel {
+        plans: Vec<LogicalPlan>,
+        merge: MergeStrategy,
     },
     /// 向量语义搜索。
     VectorSearch {
@@ -120,7 +125,7 @@ pub enum PhysicalPlan {
     },
     /// 图遍历。
     GraphTraverse {
-        seeds: Vec<ContextUri>,
+        input: Box<PhysicalPlan>,
         edges: Vec<crate::query::RelationKind>,
         max_hops: usize,
     },
@@ -289,9 +294,13 @@ impl CboOptimizer {
         self.optimize_inner(logical, hint)
     }
 
-    fn optimize_inner(&self, logical: &LogicalPlan, hint: Option<&IntentPlannerHint>) -> PhysicalPlan {
+    fn optimize_inner(
+        &self,
+        logical: &LogicalPlan,
+        hint: Option<&IntentPlannerHint>,
+    ) -> PhysicalPlan {
         match logical {
-            LogicalPlan::Scan { scope, level } => {
+            LogicalPlan::Scan { scope, level: _ } => {
                 let limit = 1000;
                 // 快路径：如果有 scope，用前缀扫描
                 if let Some(uri) = scope {
@@ -304,13 +313,27 @@ impl CboOptimizer {
                 }
             }
 
+            LogicalPlan::Parallel { plans, merge } => PhysicalPlan::Parallel {
+                plans: plans
+                    .iter()
+                    .map(|plan| self.optimize_inner(plan, hint))
+                    .collect(),
+                merge: *merge,
+            },
+
             LogicalPlan::VectorSearch {
                 collection: _,
                 query,
                 top_k,
             } => {
                 let multiplier = hint
-                    .filter(|hint| hint.prefer_vector || matches!(hint.route, IntentRoute::LocalVector | IntentRoute::LocalHybrid))
+                    .filter(|hint| {
+                        hint.prefer_vector
+                            || matches!(
+                                hint.route,
+                                IntentRoute::LocalVector | IntentRoute::LocalHybrid
+                            )
+                    })
                     .map(|hint| hint.top_k_multiplier.clamp(1.0, 3.0))
                     .unwrap_or(1.0);
                 PhysicalPlan::VectorSearch {
@@ -318,7 +341,7 @@ impl CboOptimizer {
                     filter: VectorFilter::default(),
                     limit: ((*top_k as f32) * multiplier).ceil() as usize,
                 }
-            },
+            }
 
             LogicalPlan::Filter { input, predicate } => {
                 // 优化：如果谓词只含 TypeEquals，下推到 TypeScan
@@ -338,7 +361,11 @@ impl CboOptimizer {
                 }
             }
 
-            LogicalPlan::Sort { input, key, desc } => {
+            LogicalPlan::Sort {
+                input,
+                key,
+                desc: _,
+            } => {
                 let inner = self.optimize_inner(input, hint);
                 PhysicalPlan::Sort {
                     input: Box::new(inner),
@@ -359,22 +386,26 @@ impl CboOptimizer {
                 edges,
                 max_hops,
             } => {
-                let seeds = extract_uris(input);
+                let input = self.optimize_inner(input, hint);
                 let max_hops = hint
-                    .filter(|hint| hint.prefer_graph || matches!(hint.route, IntentRoute::GraphTraversal))
+                    .filter(|hint| {
+                        hint.prefer_graph || matches!(hint.route, IntentRoute::GraphTraversal)
+                    })
                     .map(|hint| (*max_hops).min(hint.max_graph_depth.max(1)))
                     .unwrap_or(*max_hops);
                 PhysicalPlan::GraphTraverse {
-                    seeds,
+                    input: Box::new(input),
                     edges: edges.clone(),
                     max_hops,
                 }
             }
 
-            LogicalPlan::TemporalScan { uri, at } => {
+            LogicalPlan::TemporalScan { uri, at: _ } => {
                 // 时态查询 → PgPrefixScan（URI + 版本查询参数）
                 let limit = if hint
-                    .map(|hint| hint.prefer_temporal || matches!(hint.route, IntentRoute::TemporalIndex))
+                    .map(|hint| {
+                        hint.prefer_temporal || matches!(hint.route, IntentRoute::TemporalIndex)
+                    })
                     .unwrap_or(false)
                 {
                     25
@@ -423,10 +454,13 @@ impl CboOptimizer {
                 (*limit as f64) * 0.01 // 向量搜索，中等成本
             }
             PhysicalPlan::GraphTraverse {
-                max_hops, edges, ..
+                input,
+                max_hops,
+                edges,
             } => {
-                // 图遍历成本随 hops 指数增长
-                10.0 * (edges.len() as f64) * 2_f64.powi(*max_hops as i32)
+                // 图遍历成本随 hops 指数增长，并包含种子计划成本。
+                self.estimate_cost_with_intent(input, hint)
+                    + 10.0 * (edges.len() as f64) * 2_f64.powi(*max_hops as i32)
             }
             PhysicalPlan::Filter { input, .. } => self.estimate_cost_with_intent(input, hint) * 1.1,
             PhysicalPlan::Sort { input, .. } => self.estimate_cost_with_intent(input, hint) * 1.5,
@@ -468,7 +502,10 @@ fn intent_cost_multiplier(plan: &PhysicalPlan, hint: Option<&IntentPlannerHint>)
     match plan {
         PhysicalPlan::TypeScan { .. } | PhysicalPlan::PgPrefixScan { .. } => {
             if hint.prefer_exact
-                || matches!(hint.route, IntentRoute::LocalExact | IntentRoute::TemporalIndex)
+                || matches!(
+                    hint.route,
+                    IntentRoute::LocalExact | IntentRoute::TemporalIndex
+                )
             {
                 0.75
             } else {
@@ -477,7 +514,10 @@ fn intent_cost_multiplier(plan: &PhysicalPlan, hint: Option<&IntentPlannerHint>)
         }
         PhysicalPlan::VectorSearch { .. } => {
             if hint.prefer_vector
-                || matches!(hint.route, IntentRoute::LocalVector | IntentRoute::LocalHybrid)
+                || matches!(
+                    hint.route,
+                    IntentRoute::LocalVector | IntentRoute::LocalHybrid
+                )
             {
                 0.8
             } else {
@@ -512,14 +552,6 @@ fn extract_scope(plan: &LogicalPlan) -> Option<ScopeFilter> {
             .as_ref()
             .map(|u| ScopeFilter::UriPrefix(u.to_string())),
         _ => None,
-    }
-}
-
-/// 从逻辑计划中提取 URI 列表（用于图遍历的 seeds）。
-fn extract_uris(plan: &LogicalPlan) -> Vec<ContextUri> {
-    match plan {
-        LogicalPlan::Scan { scope, .. } => scope.clone().into_iter().collect(),
-        _ => vec![],
     }
 }
 
@@ -589,7 +621,12 @@ mod tests {
         let hint = IntentPlannerHint::from(&decision);
         let physical = optimizer.optimize_with_intent(&logical, Some(&hint));
         match physical {
-            PhysicalPlan::GraphTraverse { max_hops, .. } => assert_eq!(max_hops, 2),
+            PhysicalPlan::GraphTraverse {
+                max_hops, input, ..
+            } => {
+                assert_eq!(max_hops, 2);
+                assert!(matches!(*input, PhysicalPlan::PgPrefixScan { .. }));
+            }
             other => panic!("unexpected plan: {other:?}"),
         }
     }

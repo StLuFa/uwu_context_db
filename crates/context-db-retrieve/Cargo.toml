@@ -9,6 +9,7 @@ agent-context-db-core = { path = "../context-db-core" }
 aho-corasick = "1"
 arc-swap = { workspace = true }
 async-trait = "0.1"
+blake3 = "1"
 chrono = { version = "0.4" }
 parking_lot = "0.12"
 regex = "1"

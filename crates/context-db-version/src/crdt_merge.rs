@@ -1,9 +1,9 @@
 //! CRDT 加速合并（U4 集成）—— 多 Agent 并发写入的无冲突自动合并。
 //!
-//! 使用 `uwu-crdt` 的 LwwMap / ORSet 等原语，为 `mergeable()` 的 MemoryClass
+//! 使用 `uwu-crdt` 的 LwwMap / ORSet 等原语，为 `mergeable()` 的 ContentType
 //! 提供零冲突合并策略，替代 ThreeWay 合并中的人工仲裁。
 
-use agent_context_db_core::{ContextEntry, ContextUri, MemoryClass};
+use agent_context_db_core::{ContentType, ContextEntry, ContextUri};
 use std::collections::HashMap;
 use uwu_crdt::LwwMap;
 
@@ -39,23 +39,23 @@ impl CrdtMerger {
     }
 
     /// 判断两个条目是否可以 CRDT 合并（仅 mergeable 类型）。
-    pub fn can_merge(class: MemoryClass) -> bool {
-        class.mergeable()
+    pub fn can_merge(content_type: ContentType) -> bool {
+        content_type.mergeable()
     }
 
     /// 对两个条目做 CRDT 合并。
     pub fn merge(
         &self,
         uri: &ContextUri,
-        class: MemoryClass,
+        content_type: ContentType,
         entry_a: &ContextEntry,
         entry_b: &ContextEntry,
     ) -> CrdtMergeResult {
         let clock_a = entry_a.mvcc_version.0;
         let clock_b = entry_b.mvcc_version.0;
 
-        let (merged, strategy) = match class {
-            MemoryClass::Profile | MemoryClass::Preferences => {
+        let (merged, strategy) = match content_type {
+            ContentType::Profile | ContentType::Preference => {
                 self.merge_lww(uri, entry_a, clock_a, entry_b, clock_b)
             }
             _ => self.merge_set_union(uri, entry_a, entry_b),
@@ -197,7 +197,7 @@ mod tests {
         a.mvcc_version = agent_context_db_core::MvccVersion(1);
         b.mvcc_version = agent_context_db_core::MvccVersion(5); // b wins
 
-        let result = merger.merge(&uri, MemoryClass::Preferences, &a, &b);
+        let result = merger.merge(&uri, ContentType::Preference, &a, &b);
         assert!(matches!(
             &result.merged.payload,
             agent_context_db_core::ContentPayload::Text { sparse, .. } if sparse.contains("theme: light")
@@ -213,7 +213,7 @@ mod tests {
         let a = entry("uwu://t1/agent/a/memories/skills/s1", "docker; git");
         let b = entry("uwu://t1/agent/a/memories/skills/s1", "git; kubernetes");
 
-        let result = merger.merge(&uri, MemoryClass::Skills, &a, &b);
+        let result = merger.merge(&uri, ContentType::Skill, &a, &b);
         // docker; git; kubernetes — git 去重
         assert!(matches!(
             &result.merged.payload,
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn non_mergeable_class_cannot_merge() {
-        assert!(CrdtMerger::can_merge(MemoryClass::Preferences));
-        assert!(!CrdtMerger::can_merge(MemoryClass::Events));
+        assert!(CrdtMerger::can_merge(ContentType::Preference));
+        assert!(!CrdtMerger::can_merge(ContentType::Evidence));
     }
 }

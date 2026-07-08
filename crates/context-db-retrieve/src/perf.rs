@@ -1,8 +1,12 @@
 //! 性能优化层：P1 查询编译器 + P2 向量分层 + P3 量化压缩 + P4 流水线并行 + P6 物化视图 + P9 分区并行。
 
-use agent_context_db_core::{ContextUri, FsOps, LlmClient, LlmOpts, Result, VectorIndex};
+use agent_context_db_core::{
+    ContextUri, EmbeddingCache, FsOps, LlmClient, LlmOpts, MemoryEmbeddingCache, Result,
+    VectorIndex, embedding_content_hash,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // P1 检索查询编译器 — 将多个 FsOps 调用合并为单次批量查询
@@ -160,43 +164,54 @@ impl VectorQuantizer {
         }
     }
 
-    /// 训练码本（简化：k-means 占位，实际可用 faiss/skia）。
+    /// 训练码本：每个子空间独立跑确定性 k-means。
     pub fn train(&mut self, vectors: &[Vec<f32>]) {
-        if vectors.is_empty() || self.subvectors == 0 {
+        self.codebooks.clear();
+        if vectors.is_empty() || self.subvectors == 0 || self.codebook_size == 0 {
             return;
         }
         let dim = vectors[0].len();
-        let sub_dim = dim / self.subvectors;
-        self.codebooks.clear();
+        if dim == 0 || vectors.iter().any(|v| v.len() != dim) {
+            return;
+        }
+        let ranges = subvector_ranges(dim, self.subvectors);
+        if ranges.len() != self.subvectors || ranges.iter().any(|(start, end)| start == end) {
+            return;
+        }
+        let k = self
+            .codebook_size
+            .min(vectors.len())
+            .min(u8::MAX as usize + 1);
 
-        for s in 0..self.subvectors {
-            let start = s * sub_dim;
-            let end = start + sub_dim;
-            let mut codebook = Vec::new();
-            for i in 0..self.codebook_size.min(vectors.len()) {
-                let v: Vec<f32> = vectors[i][start..end].to_vec();
-                if !codebook.iter().any(|c: &Vec<f32>| c == &v) {
-                    codebook.push(v);
-                }
-            }
-            self.codebooks.push(codebook);
+        for (start, end) in ranges {
+            let samples = vectors
+                .iter()
+                .map(|v| v[start..end].to_vec())
+                .collect::<Vec<_>>();
+            self.codebooks.push(kmeans_codebook(&samples, k, 24));
         }
     }
 
     /// 压缩向量：将 f32 向量转为 u8 码字索引序列。
     pub fn encode(&self, vector: &[f32]) -> Option<Vec<u8>> {
-        if self.codebooks.is_empty() {
+        if self.codebooks.len() != self.subvectors || self.subvectors == 0 {
             return None;
         }
-        let sub_dim = vector.len() / self.subvectors;
+        let ranges = subvector_ranges(vector.len(), self.subvectors);
+        if ranges.len() != self.subvectors {
+            return None;
+        }
         let mut codes = Vec::with_capacity(self.subvectors);
         for (s, codebook) in self.codebooks.iter().enumerate() {
-            let start = s * sub_dim;
-            let sub: Vec<f32> = vector[start..start + sub_dim].to_vec();
+            if codebook.is_empty() {
+                return None;
+            }
+            let (start, end) = ranges[s];
+            let sub = &vector[start..end];
             let mut best_idx = 0u8;
             let mut best_dist = f32::MAX;
             for (i, centroid) in codebook.iter().enumerate() {
-                let dist = euclidean(&sub, centroid);
+                let dist = squared_euclidean(sub, centroid);
                 if dist < best_dist {
                     best_dist = dist;
                     best_idx = i as u8;
@@ -215,12 +230,105 @@ impl VectorQuantizer {
     }
 }
 
-fn euclidean(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
+fn subvector_ranges(dim: usize, subvectors: usize) -> Vec<(usize, usize)> {
+    if subvectors == 0 || dim < subvectors {
+        return vec![];
+    }
+    (0..subvectors)
+        .map(|i| {
+            let start = i * dim / subvectors;
+            let end = (i + 1) * dim / subvectors;
+            (start, end)
+        })
+        .collect()
+}
+
+fn kmeans_codebook(samples: &[Vec<f32>], k: usize, iterations: usize) -> Vec<Vec<f32>> {
+    if samples.is_empty() || k == 0 {
+        return vec![];
+    }
+    let dim = samples[0].len();
+    let mut centroids = initialize_centroids(samples, k);
+    let mut assignments = vec![0usize; samples.len()];
+
+    for _ in 0..iterations.max(1) {
+        let mut changed = false;
+        for (idx, sample) in samples.iter().enumerate() {
+            let nearest = nearest_centroid(sample, &centroids);
+            if assignments[idx] != nearest {
+                assignments[idx] = nearest;
+                changed = true;
+            }
+        }
+
+        let mut sums = vec![vec![0.0f32; dim]; centroids.len()];
+        let mut counts = vec![0usize; centroids.len()];
+        for (sample, cluster) in samples.iter().zip(assignments.iter().copied()) {
+            counts[cluster] += 1;
+            for (sum, value) in sums[cluster].iter_mut().zip(sample) {
+                *sum += *value;
+            }
+        }
+
+        for (idx, centroid) in centroids.iter_mut().enumerate() {
+            if counts[idx] == 0 {
+                *centroid = samples[idx % samples.len()].clone();
+            } else {
+                for value in &mut sums[idx] {
+                    *value /= counts[idx] as f32;
+                }
+                *centroid = sums[idx].clone();
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    centroids
+}
+
+fn initialize_centroids(samples: &[Vec<f32>], k: usize) -> Vec<Vec<f32>> {
+    let mut centroids = Vec::with_capacity(k);
+    centroids.push(samples[0].clone());
+    while centroids.len() < k {
+        let next = samples
+            .iter()
+            .max_by(|a, b| {
+                distance_to_nearest(a, &centroids)
+                    .partial_cmp(&distance_to_nearest(b, &centroids))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned()
+            .unwrap_or_else(|| samples[centroids.len() % samples.len()].clone());
+        centroids.push(next);
+    }
+    centroids
+}
+
+fn nearest_centroid(sample: &[f32], centroids: &[Vec<f32>]) -> usize {
+    centroids
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            squared_euclidean(sample, a)
+                .partial_cmp(&squared_euclidean(sample, b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+fn distance_to_nearest(sample: &[f32], centroids: &[Vec<f32>]) -> f32 {
+    centroids
+        .iter()
+        .map(|centroid| squared_euclidean(sample, centroid))
+        .fold(f32::MAX, f32::min)
+}
+
+fn squared_euclidean(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -231,6 +339,8 @@ fn euclidean(a: &[f32], b: &[f32]) -> f32 {
 pub struct ParallelGenerator {
     llm: Arc<dyn LlmClient>,
     max_concurrency: usize,
+    embed_cache: Arc<dyn EmbeddingCache>,
+    embed_cache_ttl: Duration,
 }
 
 impl ParallelGenerator {
@@ -238,7 +348,22 @@ impl ParallelGenerator {
         Self {
             llm,
             max_concurrency: max,
+            embed_cache: Arc::new(MemoryEmbeddingCache::new(
+                10_000,
+                Duration::from_secs(86_400),
+            )),
+            embed_cache_ttl: Duration::from_secs(86_400),
         }
+    }
+
+    pub fn with_embedding_cache(mut self, cache: Arc<dyn EmbeddingCache>) -> Self {
+        self.embed_cache = cache;
+        self
+    }
+
+    pub fn with_embedding_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.embed_cache_ttl = ttl;
+        self
     }
 
     /// 并行生成多个摘要。
@@ -276,28 +401,64 @@ impl ParallelGenerator {
         results
     }
 
-    /// 并行生成多个 embedding。
+    /// 并行生成多个 embedding，并按 blake3(content) 缓存去重。
     pub async fn batch_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrency));
-        let handles: Vec<_> = texts
-            .iter()
-            .map(|t| {
-                let llm = self.llm.clone();
-                let text = t.clone();
-                let sem = semaphore.clone();
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await;
-                    llm.embed(&text).await
-                })
-            })
-            .collect();
-        let mut results = Vec::new();
-        for h in handles {
-            if let Ok(Ok(v)) = h.await {
-                results.push(v);
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut misses: HashMap<String, String> = HashMap::new();
+
+        for (idx, text) in texts.iter().enumerate() {
+            let hash = embedding_content_hash(text);
+            if let Some(embedding) = self.embed_cache.get(&hash).await {
+                results[idx] = Some(embedding);
+            } else {
+                misses.entry(hash).or_insert_with(|| text.clone());
             }
         }
-        Ok(results)
+
+        if !misses.is_empty() {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrency));
+            let handles: Vec<_> = misses
+                .into_iter()
+                .map(|(hash, text)| {
+                    let llm = self.llm.clone();
+                    let cache = self.embed_cache.clone();
+                    let sem = semaphore.clone();
+                    let ttl = self.embed_cache_ttl;
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await;
+                        let embedding = llm.embed(&text).await?.vector;
+                        cache.put(&hash, embedding.clone(), ttl).await;
+                        Ok::<_, agent_context_db_core::LlmError>((hash, embedding))
+                    })
+                })
+                .collect();
+
+            let mut loaded = HashMap::new();
+            for h in handles {
+                match h.await {
+                    Ok(Ok((hash, embedding))) => {
+                        loaded.insert(hash, embedding);
+                    }
+                    Ok(Err(err)) => return Err(err.into()),
+                    Err(err) => {
+                        return Err(agent_context_db_core::ContextError::Storage(format!(
+                            "embedding task join: {err}"
+                        )));
+                    }
+                }
+            }
+
+            for (idx, text) in texts.iter().enumerate() {
+                if results[idx].is_none() {
+                    let hash = embedding_content_hash(text);
+                    if let Some(embedding) = loaded.get(&hash) {
+                        results[idx] = Some(embedding.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(results.into_iter().flatten().collect())
     }
 }
 
@@ -426,12 +587,104 @@ impl PartitionedRetriever {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_context_db_core::{JsonSchema, LlmError};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingLlm {
+        calls: AtomicUsize,
+    }
+
+    impl CountingLlm {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for CountingLlm {
+        async fn complete(
+            &self,
+            _prompt: &str,
+            _opts: &LlmOpts,
+        ) -> std::result::Result<String, LlmError> {
+            Ok(String::new())
+        }
+
+        async fn embed(
+            &self,
+            text: &str,
+        ) -> std::result::Result<agent_context_db_core::EmbeddingVector, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(agent_context_db_core::EmbeddingVector::new(
+                vec![text.len() as f32],
+                "test",
+                1,
+            ))
+        }
+
+        async fn complete_json(
+            &self,
+            _prompt: &str,
+            _schema: &JsonSchema,
+            _opts: &LlmOpts,
+        ) -> std::result::Result<String, LlmError> {
+            Ok("{}".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_embed_deduplicates_same_batch_by_content_hash() {
+        let llm = Arc::new(CountingLlm::new());
+        let generator = ParallelGenerator::new(llm.clone(), 4);
+        let texts = vec!["alpha".to_string(), "alpha".to_string(), "beta".to_string()];
+
+        let embeddings = generator.batch_embed(&texts).await.unwrap();
+
+        assert_eq!(embeddings, vec![vec![5.0], vec![5.0], vec![4.0]]);
+        assert_eq!(llm.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_embed_reuses_cached_embedding_across_batches() {
+        let llm = Arc::new(CountingLlm::new());
+        let generator = ParallelGenerator::new(llm.clone(), 4);
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        let first = generator.batch_embed(&texts).await.unwrap();
+        let second = generator.batch_embed(&texts).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(llm.calls(), 2);
+    }
 
     #[test]
     fn vector_quantizer_compression_ratio() {
         let q = VectorQuantizer::new(8, 256);
         let ratio = q.compression_ratio(768);
         assert!(ratio > 1.0);
+    }
+
+    #[test]
+    fn vector_quantizer_trains_kmeans_codebooks() {
+        let vectors = vec![
+            vec![0.0, 0.0, 10.0, 10.0],
+            vec![0.1, 0.0, 10.1, 10.0],
+            vec![9.0, 9.0, 0.0, 0.0],
+            vec![9.1, 9.0, 0.1, 0.0],
+        ];
+        let mut q = VectorQuantizer::new(2, 2);
+        q.train(&vectors);
+        assert_eq!(q.codebooks.len(), 2);
+        assert_eq!(q.codebooks[0].len(), 2);
+        assert_eq!(q.encode(&vectors[0]).unwrap().len(), 2);
+        assert_ne!(q.encode(&vectors[0]), q.encode(&vectors[2]));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! ProgressiveLoader — 四层渐进式加载（索引→摘要→完整→证据）。
 
-use agent_context_db_core::{ContentLevel, ContentPayload, ContextEntry, ContextUri};
+use agent_context_db_core::{ContentPayload, ContextEntry};
 
 /// 加载层级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -23,7 +23,7 @@ impl ProgressiveLoader {
     }
 
     /// 按预算逐层加载 — 预算紧张时降级。
-    pub fn load_level(&self, entry: &ContextEntry) -> LoadLevel {
+    pub fn load_level(&self, _entry: &ContextEntry) -> LoadLevel {
         let remaining = self.budget.saturating_sub(self.used);
         match remaining {
             r if r >= 2000 => LoadLevel::Full,

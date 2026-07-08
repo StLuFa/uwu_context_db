@@ -4,7 +4,7 @@
 //! 达到 N 个独立源 = Established（已确立）。
 
 use crate::marketplace::types::*;
-use agent_context_db_core::{ContextUri, VectorIndex, VectorSimilarity};
+use agent_context_db_core::VectorIndex;
 use std::sync::Arc;
 
 /// 共识追踪器 — 检测多源独立收敛。

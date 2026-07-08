@@ -9,15 +9,22 @@
 //!   不反向依赖检索层或 uwu 扩展。
 //! - `VersionStore` 是端口（零实现）；线性快照 / DAG 后端由宿主注入。
 
+pub mod belief_revision;
 pub mod crdt_merge;
 pub mod innovation;
 pub mod model;
 pub mod reasoning;
 
+pub use belief_revision::{
+    AgmBeliefReviser, AgmRevisionConfig, BeliefConflict, BeliefLiteral, BeliefPolarity,
+    BeliefPredicate, BeliefRevisionAction, BeliefRevisionDecision, BeliefSentence,
+    revision_to_resolution,
+};
 pub use crdt_merge::{CrdtMergeResult, CrdtMerger, CrdtStrategy};
 pub use innovation::{
-    CausalHypothesis, CausalInference, CrystalDistiller, DreamConsolidator, KnowledgeCrystal,
-    RepairAction, SelfHealer,
+    CausalDiscoveryConfig, CausalEdge, CausalGraph, CausalHypothesis, CausalInference,
+    CausalIntervention, CounterfactualImpact, CrystalDistiller, DreamConsolidator,
+    InterventionResult, KnowledgeCrystal, RepairAction, SelfHealer,
 };
 pub use model::{
     Author, Branch, BranchLifecycle, BranchName, BranchType, CausalDag, ChangeSet, ChangeType,

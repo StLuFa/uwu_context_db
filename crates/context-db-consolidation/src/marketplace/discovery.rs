@@ -223,6 +223,7 @@ fn market_entry_from_publication(publication: PublicationMetadata) -> MarketEntr
         confidence: publication.corroboration.level as u8 as f32
             / CorroborationLevel::Established as u8 as f32,
         corroboration: publication.corroboration,
+        provenance: publication.provenance,
         license: match publication.license.scope {
             LicenseScope::Open if !publication.license.attribution_required => {
                 KnowledgeLicense::PublicDomain

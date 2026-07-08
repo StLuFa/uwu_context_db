@@ -24,6 +24,8 @@ pub enum ContextError {
     Io(#[from] std::io::Error),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("trust policy violation: {0}")]
+    TrustPolicy(String),
 }
 
 pub type Result<T> = std::result::Result<T, ContextError>;

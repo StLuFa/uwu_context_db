@@ -20,9 +20,12 @@
 //! - `multi_perspective` — 多视角巩固
 //! - `hybrid_retrieval` — 三维混合检索
 
+pub mod consolidation;
 pub mod curriculum;
 pub mod dpo;
+pub mod gen_agents;
 pub mod hybrid_retrieval;
+pub mod lats;
 pub mod metric;
 pub mod multi_perspective;
 pub mod pipeline;
@@ -37,9 +40,7 @@ pub mod tree_search;
 pub mod voting;
 
 use agent_context_db_consolidation::ConsolidationProduct;
-use agent_context_db_core::{
-    ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType, Result,
-};
+use agent_context_db_core::{ContentType, ContextEntry, ContextUri, EpistemicType, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -235,25 +236,6 @@ pub struct EpochResult {
     pub accuracy: f32,
 }
 
-/// 认知驱动训练管线（骨架已废弃，使用 `crate::pipeline::CognitiveTrainingPipeline`）。
-#[deprecated(note = "使用 crate::pipeline::CognitiveTrainingPipeline")]
-pub struct CognitiveTrainingPipeline;
-
-#[allow(deprecated)]
-impl CognitiveTrainingPipeline {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// 执行一轮训练（骨架）。
-    pub async fn train(&self, _config: &TrainingConfig) -> Result<TrainingReport> {
-        Ok(TrainingReport {
-            epochs: vec![],
-            accuracy_delta: 0.0,
-        })
-    }
-}
-
 // ===========================================================================
 // 认知梯度提取（ConsolidationProduct → CognitiveGradient）———— P1-1
 // ===========================================================================
@@ -301,7 +283,7 @@ pub fn extract_gradients_from_products(
             },
             ContentType::Hypothesis => {
                 let outcome = match product.hypothesis_outcome {
-                    Some(o) => crate::HypothesisOutcome::Confirmed,
+                    Some(_o) => crate::HypothesisOutcome::Confirmed,
                     _ => crate::HypothesisOutcome::Falsified,
                 };
                 CognitiveGradient {

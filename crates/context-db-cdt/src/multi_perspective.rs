@@ -2,9 +2,8 @@
 //!
 //! 对同一主题从 4 个认知视角分别收集证据，再合成为高质量巩固产物。
 
-use agent_context_db_core::{ContentType, ContextEntry, ContextUri, EpistemicType, Result};
+use agent_context_db_core::{ContextEntry, ContextUri, EpistemicType};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 // ===========================================================================
 // 视角定义

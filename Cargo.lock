@@ -49,6 +49,7 @@ dependencies = [
  "agent-context-db-testkit",
  "agent-context-db-version",
  "async-trait",
+ "blake3",
  "chrono",
  "moka",
  "parking_lot",
@@ -66,7 +67,10 @@ version = "0.0.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64",
+ "blake3",
  "chrono",
+ "ed25519-dalek",
  "metrics",
  "moka",
  "parking_lot",
@@ -89,10 +93,15 @@ dependencies = [
  "agent-context-db-marketplace-types",
  "async-trait",
  "chrono",
+ "ed25519-dalek",
+ "hex",
  "parking_lot",
+ "rand 0.8.6",
+ "rand_distr",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "uuid",
  "uwu_event_mesh",
 ]
@@ -115,8 +124,10 @@ name = "agent-context-db-marketplace-types"
 version = "0.0.0"
 dependencies = [
  "agent-context-db-core",
+ "blake3",
  "chrono",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -157,6 +168,7 @@ dependencies = [
  "aho-corasick",
  "arc-swap",
  "async-trait",
+ "blake3",
  "chrono",
  "criterion",
  "parking_lot",
@@ -175,13 +187,16 @@ name = "agent-context-db-session"
 version = "0.0.0"
 dependencies = [
  "agent-context-db-core",
+ "agent-context-db-testkit",
  "async-trait",
+ "base64",
  "chrono",
  "parking_lot",
  "serde",
  "serde_json",
  "tokio",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -868,6 +883,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -994,6 +1010,7 @@ version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -1005,9 +1022,12 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
+ "serde",
  "sha2",
  "signature",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2862,6 +2882,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "rand_distr"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
+dependencies = [
+ "num-traits",
+ "rand 0.8.6",
 ]
 
 [[package]]

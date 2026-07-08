@@ -2,9 +2,8 @@
 //!
 //! F9 ContextPubSub 已删除，使用 `crate::event_store`（基于 `uwu_event_mesh`）替代。
 
-use crate::{ContentLevel, ContentPayload, ContextEntry, ContextUri};
+use crate::{ContentPayload, ContextEntry, ContextUri};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,7 +184,7 @@ pub fn record_retrieval(hits: usize, duration_ms: u64, tokens: usize, cache_hit:
 }
 
 /// 记录一次写入操作。
-pub fn record_write(uri: &ContextUri, success: bool) {
+pub fn record_write(_uri: &ContextUri, success: bool) {
     metrics::counter!("uwu.write.requests").increment(1);
     if success {
         metrics::counter!("uwu.write.success").increment(1);

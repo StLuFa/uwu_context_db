@@ -1,7 +1,6 @@
 //! CognitivePreferenceExtractor — 三层偏好信号提取。
 
 use crate::{CognitiveDelta, CognitivePreferencePair, PreferenceSource, TrajectorySummary};
-use agent_context_db_core::{ContentType, ContextUri, Result};
 
 /// 认知偏好提取器。
 pub struct CognitivePreferenceExtractor;

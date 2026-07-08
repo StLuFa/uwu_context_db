@@ -16,6 +16,8 @@
 //! 内存版实现见 `agent-context-db-testkit`；生产由 PG + Qdrant 适配器注入。
 
 pub mod config;
+pub mod embedding_cache;
+pub mod embedding_migration;
 pub mod error;
 pub mod event;
 pub mod event_store;
@@ -33,8 +35,15 @@ pub mod similarity;
 pub mod store;
 pub mod uri;
 pub mod vector;
+pub mod watch;
+pub mod write_security;
 pub mod zerocopy;
 
+pub use embedding_cache::{EmbeddingCache, MemoryEmbeddingCache, embedding_content_hash};
+pub use embedding_migration::{
+    EmbeddingMigrationAction, EmbeddingMigrationExecutor, EmbeddingMigrationPhase,
+    EmbeddingMigrationPlan, EmbeddingMigrationReport, EmbeddingModelVersion,
+};
 pub use error::{ContextError, Result};
 pub use event::{
     ContextTemplate, InheritanceChain, InheritanceNode, OverrideAction, OverrideRule,
@@ -48,11 +57,10 @@ pub use event_store::{
     Subscription, Topic, TopicPattern, TypeRegistry, TypedSubscription,
 };
 pub use lifecycle::{
-    AccessEvent, AccessOutcome, DegradeAction, EbbinghausModel, ForgettingCurve, ForgettingModel,
-    ImportanceScore, ImportanceWeights, LifecycleAction, LifecycleEngine, LifecyclePolicy,
-    LifecycleRule, TokenBudget,
+    AccessEvent, AccessOutcome, EbbinghausModel, ForgettingModel, ImportanceScore,
+    ImportanceWeights, LifecycleAction, LifecycleEngine, LifecycleRule, TokenBudget,
 };
-pub use llm::{JsonSchema, LlmClient, LlmError, LlmOpts, LlmStream};
+pub use llm::{EmbeddingVector, JsonSchema, LlmClient, LlmError, LlmOpts, LlmStream};
 pub use lsh::LshIndex;
 pub use model::{
     BlobRef, ConsolidationMeta, ConsolidationStatus, ContentHash, ContentLevel, ContentPart,
@@ -60,16 +68,16 @@ pub use model::{
     DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit, LineageEntry,
     MediaType, MvccVersion, StateScope, TenantId, TreeNode, ValidityRecord, VersionEntry,
 };
-#[allow(deprecated)]
-pub use model::{ContentRef, MemoryClass};
 pub use observability::{
     ProvenanceEdge, ProvenanceGraph, ProvenanceNode, ProvenanceRelationType, QualityDimension,
     QualityScore, QualityScorer,
 };
-pub use pack::{AclRule, ContextPack, PackMeta, PathAcl, Permissions, Principal};
+pub use pack::{
+    AclProtectedStore, AclRule, ContextPack, PackMeta, PackSignature, PackTrustPolicy, PathAcl,
+    Permissions, Principal,
+};
 pub use rate_limiter::{MemoryRateLimiter, RateLimiter};
 pub use read_cache::{MemoryReadCache, ReadCache};
-#[allow(deprecated)]
 pub use similarity::{
     Cluster, CrossAgentDedup, DedupRecommendation, KnowledgeNetwork, LocalKnowledgeNetwork,
     SimilarityResult, VectorSimilarity,
@@ -80,3 +88,11 @@ pub use store::{
 };
 pub use uri::{ContextUri, SCHEME, UriCategory};
 pub use vector::{IndexHit, IndexPoint, VectorIndex};
+pub use watch::{
+    ChangeEvent, ChangeKind, WatchCheckpoint, WatchHub, WatchOptions, WatchSource, WatchStream,
+    WatchableStore,
+};
+pub use write_security::{
+    SensitiveFinding, SensitiveKind, redact_sensitive_entry, sanitize_entry_for_write,
+    scan_sensitive_entry,
+};

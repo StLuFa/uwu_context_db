@@ -14,6 +14,8 @@
 
 pub mod associative;
 pub mod cache;
+pub mod compiler;
+pub mod graph_rag;
 pub mod innovation;
 pub mod intent;
 pub mod operators;
@@ -24,16 +26,20 @@ pub mod query;
 pub mod retriever;
 
 pub use associative::AssociativeExpander;
+pub use graph_rag::{
+    GraphRagCommunity, GraphRagEngine, GraphRagIndex, GraphRagIndexConfig, GraphRagIndexStats,
+    GraphRagIndexer, GraphRagRequest,
+};
 pub use innovation::{IncrementalRetrievalLearner, PredictivePrefetcher, RelevanceFeedback};
 pub use intent::{
     BuiltinIntentPolicyProvider, CompiledIntentPolicy, EventMeshIntentTraceSink,
     FileIntentPolicyProvider, IntentCaller, IntentCandidate, IntentDecision, IntentExecutionGraph,
     IntentExecutionPlan, IntentFeedbackEvent, IntentFeedbackLearning, IntentInput, IntentKind,
     IntentPolicyLayer, IntentPolicyLayerKind, IntentPolicyPack, IntentPolicyProvider,
-    IntentPolicyRef, IntentPolicyReloadReport, IntentPolicyReloadStatus,
-    IntentPolicySignature, IntentPolicySignatureVerifier, IntentPolicySnapshot,
-    IntentRoute, IntentTraceEvent, IntentTraceSink, LayeredIntentPolicyProvider,
-    RuleBasedIntentAnalyzer, SignedIntentPolicyPack, TracingIntentTraceSink,
+    IntentPolicyRef, IntentPolicyReloadReport, IntentPolicyReloadStatus, IntentPolicySignature,
+    IntentPolicySignatureVerifier, IntentPolicySnapshot, IntentRoute, IntentTraceEvent,
+    IntentTraceSink, LayeredIntentPolicyProvider, RuleBasedIntentAnalyzer, SignedIntentPolicyPack,
+    TracingIntentTraceSink,
 };
 pub use operators::{ExecContext, ExecStats, RecordBatch};
 pub use perf::{
@@ -47,7 +53,9 @@ pub use quality::{CompressionAwareLoader, HallucinationDetector, PressureLevel, 
 pub use query::{Condition, MergeStrategy, Predicate, Query, SortKey};
 pub use retriever::{ContextRetriever, ContextRetrieverBuilder, RuleBasedPlanner};
 
-use agent_context_db_core::{ContentLevel, ContentPayload, ContentType, ContextUri, Result};
+use agent_context_db_core::{
+    ContentLevel, ContentPayload, ContentType, ContextMeta, ContextUri, LlmClient, LlmOpts, Result,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -87,6 +95,10 @@ pub struct RetrievalHit {
     pub parent_chain: Vec<ContextUri>,
     /// 内容类型（从 URI 或元数据中获取）。
     pub content_type: Option<ContentType>,
+    /// 条目元数据，用于 WQL 条件完整执行。
+    pub metadata: ContextMeta,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ===========================================================================
@@ -249,6 +261,9 @@ mod tests {
             relevance: score,
             parent_chain: vec![],
             content_type: None,
+            metadata: Default::default(),
+            created_at: None,
+            updated_at: None,
         };
         let rr = ScoreReranker { keep: 2 };
         let out = rr

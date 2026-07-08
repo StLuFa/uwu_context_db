@@ -2,7 +2,6 @@
 
 use crate::marketplace::types::*;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// 采纳结果。
 #[derive(Debug, Clone)]

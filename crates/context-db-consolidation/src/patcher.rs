@@ -1,7 +1,7 @@
 //! SkillPatcher — 运行时运行时 patch。
 
 use crate::ConsolidationProduct;
-use agent_context_db_core::{ContextEntry, ContextUri, Result};
+use agent_context_db_core::{ContextEntry, ContextUri};
 
 pub struct SkillPatcher;
 

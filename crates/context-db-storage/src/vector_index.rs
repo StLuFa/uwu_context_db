@@ -88,6 +88,9 @@ mod tests {
         let point = IndexPoint {
             uri: uri.clone(),
             vector: vec![1.0, 0.0],
+            embedding_model_id: None,
+            embedding_dim: None,
+            embedding_version: None,
             payload: serde_json::json!({"k": "v"}),
         };
         let record = uwu_database::Record {

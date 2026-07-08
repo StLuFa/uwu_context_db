@@ -30,7 +30,6 @@ pub use governance::*;
 pub use identity::*;
 pub use intent::*;
 pub use learning::*;
-pub use nats::*;
 pub use persistence::*;
 pub use planner::*;
 pub use privacy::*;

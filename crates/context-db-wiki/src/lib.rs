@@ -62,6 +62,9 @@ impl VectorStore for WikiVectorStoreAdapter {
                 IndexPoint {
                     uri,
                     vector,
+                    embedding_model_id: None,
+                    embedding_dim: None,
+                    embedding_version: None,
                     payload: metadata,
                 },
             )

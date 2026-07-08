@@ -31,7 +31,11 @@ pub mod tiered_cache;
 use crate::quality::{HorizonAwareQualityScorer, HorizonQualitySignals, QualityRoute};
 use agent_context_db_core::{
     ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType, LineageEntry,
-    LlmClient, LlmError, LlmOpts, MvccVersion, Result, StateScope, ValidityRecord,
+    LlmClient, LlmOpts, Result, StateScope, ValidityRecord,
+};
+use agent_context_db_knowledge_network::identity::IdentityRegistry;
+use agent_context_db_marketplace_types::{
+    AgentId, KnowledgeProvenance, KnowledgeProvenancePayload, evidence_chain_hash,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -58,7 +62,39 @@ pub struct ConsolidationProduct {
     pub preconditions: Option<String>,
     pub expected_outcome: Option<String>,
     pub related_policy_uris: Vec<ContextUri>,
+    pub provenance: Option<KnowledgeProvenance>,
     pub metadata: ConsolidationMeta,
+}
+
+impl ConsolidationProduct {
+    pub fn provenance_payload(
+        &self,
+        publisher: AgentId,
+        created_at: DateTime<Utc>,
+    ) -> KnowledgeProvenancePayload {
+        KnowledgeProvenancePayload {
+            publisher,
+            content: self.content.clone(),
+            evidence_chain_hash: evidence_chain_hash(&self.evidence_uris),
+            evidence_uris: self.evidence_uris.clone(),
+            quality_score: self.quality_score,
+            confidence: self.confidence,
+            epistemic_type: self.epistemic_type,
+            content_type: self.content_type,
+            created_at,
+        }
+    }
+
+    pub fn sign_provenance(
+        &mut self,
+        publisher: AgentId,
+        identities: &IdentityRegistry,
+    ) -> std::result::Result<(), agent_context_db_knowledge_network::types::KnowledgeNetworkError>
+    {
+        let payload = self.provenance_payload(publisher, Utc::now());
+        self.provenance = Some(identities.sign_knowledge_provenance(&payload)?);
+        Ok(())
+    }
 }
 
 /// 假设验证结果。
@@ -494,6 +530,7 @@ Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup).
             preconditions: None,
             expected_outcome: None,
             related_policy_uris: vec![],
+            provenance: None,
             metadata: ConsolidationMeta {
                 source_session: None,
                 generation: 1,
@@ -707,7 +744,7 @@ impl DualTimeline {
         metas: &mut [&mut agent_context_db_core::ContextMeta],
     ) -> usize {
         let mut propagated = 0;
-        for (descendant, meta) in descendants.iter().zip(metas.iter_mut()) {
+        for (_descendant, meta) in descendants.iter().zip(metas.iter_mut()) {
             if meta
                 .validity
                 .as_ref()
@@ -1094,6 +1131,7 @@ impl SleeptimeExecutor {
                             preconditions: None,
                             expected_outcome: None,
                             related_policy_uris: vec![],
+                            provenance: None,
                             metadata: ConsolidationMeta {
                                 source_session: None,
                                 generation: 0,
@@ -1171,6 +1209,7 @@ impl SleeptimeExecutor {
                             preconditions: None,
                             expected_outcome: None,
                             related_policy_uris: vec![],
+                            provenance: None,
                             metadata: ConsolidationMeta {
                                 source_session: None,
                                 generation: 0,

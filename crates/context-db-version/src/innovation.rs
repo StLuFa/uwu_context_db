@@ -1,7 +1,7 @@
 //! 版本层创新功能（F19 知识晶体 + F21 自修复 + F23 梦境巩固 + F27 因果推断）。
 
-use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, FsOps, LlmClient, LlmOpts};
-use std::collections::HashMap;
+use agent_context_db_core::{ContentLevel, ContextUri, FsOps, LlmClient, LlmOpts};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{CommitId, TemporalReasoner, VersionStore};
@@ -383,93 +383,688 @@ pub struct CausalHypothesis {
     pub confidence: f32,
 }
 
-/// 因果推断器 —— 基于时间序列的统计相关性分析。
-///
-/// 不是真正的因果模型，而是在 DAG 版本历史上做 Granger 式的时间先导检验。
+/// 版本历史上的因果结构学习配置。
+#[derive(Debug, Clone)]
+pub struct CausalDiscoveryConfig {
+    /// 最多读取多少条 commit 作为观测样本。
+    pub max_log_count: usize,
+    /// 进入结构学习的最大 URI 数，避免高维稀疏历史导致组合爆炸。
+    pub max_variables: usize,
+    /// PC 条件独立检验的最大条件集大小。
+    pub max_conditioning_set: usize,
+    /// 一条候选因果边至少需要多少次 cause 暴露。
+    pub min_support: usize,
+    /// 条件风险差低于该阈值时认为可被混淆变量解释。
+    pub independence_threshold: f32,
+    /// GES/BIC 的复杂度惩罚倍数。
+    pub bic_penalty: f32,
+    /// 每个 effect 最多保留多少个直接父节点。
+    pub max_parents: usize,
+}
+
+impl Default for CausalDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            max_log_count: 512,
+            max_variables: 64,
+            max_conditioning_set: 2,
+            min_support: 3,
+            independence_threshold: 0.08,
+            bic_penalty: 1.0,
+            max_parents: 4,
+        }
+    }
+}
+
+/// 一个从结构学习得到的可干预因果边。
+#[derive(Debug, Clone)]
+pub struct CausalEdge {
+    pub cause_uri: ContextUri,
+    pub effect_uri: ContextUri,
+    /// do(cause=true) 对 effect 下一步变更概率的估计提升。
+    pub average_treatment_effect: f32,
+    /// 支持该边的 cause 暴露次数。
+    pub support: usize,
+    /// 结构学习置信度，融合 PC 条件独立检验和 GES/BIC 增益。
+    pub confidence: f32,
+    /// 使该边仍不独立的条件变量集合。
+    pub adjustment_set: Vec<ContextUri>,
+}
+
+/// 可干预的因果图。
+#[derive(Debug, Clone, Default)]
+pub struct CausalGraph {
+    pub nodes: Vec<ContextUri>,
+    pub edges: Vec<CausalEdge>,
+    children: HashMap<ContextUri, Vec<usize>>,
+    parents: HashMap<ContextUri, Vec<usize>>,
+}
+
+impl CausalGraph {
+    pub fn new(nodes: Vec<ContextUri>, edges: Vec<CausalEdge>) -> Self {
+        let mut children: HashMap<ContextUri, Vec<usize>> = HashMap::new();
+        let mut parents: HashMap<ContextUri, Vec<usize>> = HashMap::new();
+        for (idx, edge) in edges.iter().enumerate() {
+            children
+                .entry(edge.cause_uri.clone())
+                .or_default()
+                .push(idx);
+            parents
+                .entry(edge.effect_uri.clone())
+                .or_default()
+                .push(idx);
+        }
+        Self {
+            nodes,
+            edges,
+            children,
+            parents,
+        }
+    }
+
+    pub fn outgoing(&self, uri: &ContextUri) -> Vec<&CausalEdge> {
+        self.children
+            .get(uri)
+            .map(|idxs| idxs.iter().map(|idx| &self.edges[*idx]).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn incoming(&self, uri: &ContextUri) -> Vec<&CausalEdge> {
+        self.parents
+            .get(uri)
+            .map(|idxs| idxs.iter().map(|idx| &self.edges[*idx]).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn descendants(&self, uri: &ContextUri) -> Vec<ContextUri> {
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from([uri.clone()]);
+        visited.insert(uri.clone());
+        while let Some(node) = queue.pop_front() {
+            for edge in self.outgoing(&node) {
+                if visited.insert(edge.effect_uri.clone()) {
+                    result.push(edge.effect_uri.clone());
+                    queue.push_back(edge.effect_uri.clone());
+                }
+            }
+        }
+        result
+    }
+
+    fn has_path(&self, from: &ContextUri, to: &ContextUri) -> bool {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from([from.clone()]);
+        while let Some(node) = queue.pop_front() {
+            if &node == to {
+                return true;
+            }
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            for edge in self.outgoing(&node) {
+                queue.push_back(edge.effect_uri.clone());
+            }
+        }
+        false
+    }
+}
+
+/// Pearl do-operator 风格的二值干预。
+#[derive(Debug, Clone)]
+pub struct CausalIntervention {
+    pub target_uri: ContextUri,
+    /// true 表示 do(target changed/fixed=true)，false 表示 do(remove target change)。
+    pub value: bool,
+}
+
+impl CausalIntervention {
+    pub fn fix(target_uri: ContextUri) -> Self {
+        Self {
+            target_uri,
+            value: true,
+        }
+    }
+
+    pub fn remove(target_uri: ContextUri) -> Self {
+        Self {
+            target_uri,
+            value: false,
+        }
+    }
+}
+
+/// 干预后某个下游节点的反事实影响估计。
+#[derive(Debug, Clone)]
+pub struct CounterfactualImpact {
+    pub effect_uri: ContextUri,
+    pub direct_effect: f32,
+    pub total_effect: f32,
+    pub confidence: f32,
+    pub causal_path: Vec<ContextUri>,
+}
+
+/// do-calculus 干预查询结果。
+#[derive(Debug, Clone)]
+pub struct InterventionResult {
+    pub intervention: CausalIntervention,
+    pub affected: Vec<CounterfactualImpact>,
+}
+
+impl InterventionResult {
+    pub fn affected_uris(&self) -> Vec<ContextUri> {
+        self.affected
+            .iter()
+            .map(|impact| impact.effect_uri.clone())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CausalSamples {
+    variables: Vec<ContextUri>,
+    variable_index: HashMap<ContextUri, usize>,
+    rows: Vec<Vec<bool>>,
+}
+
+/// 因果推断器 —— 在版本历史上做结构学习和 do-calculus 干预推断。
 pub struct CausalInference<V: VersionStore> {
     store: Arc<V>,
     _temporal: TemporalReasoner<V>,
+    config: CausalDiscoveryConfig,
 }
 
 impl<V: VersionStore> CausalInference<V> {
     pub fn new(store: Arc<V>) -> Self {
+        Self::with_config(store, CausalDiscoveryConfig::default())
+    }
+
+    pub fn with_config(store: Arc<V>, config: CausalDiscoveryConfig) -> Self {
         let temporal = TemporalReasoner::new(store.clone());
         Self {
             store,
             _temporal: temporal,
+            config,
         }
     }
 
-    /// 检测一个 URI 的变更是否在统计上"导致"另一个 URI 的变更。
-    ///
-    /// 条件：cause 变更后 effect 在时间窗口内也变更的比例 > 随机基线。
-    pub async fn infer_causality(
+    /// 学习可干预因果图：PC 条件独立检验去混淆，GES/BIC 选择直接父边。
+    pub async fn discover_causal_graph(
         &self,
         scope: &ContextUri,
-    ) -> std::result::Result<Vec<CausalHypothesis>, crate::VersionError> {
+    ) -> std::result::Result<CausalGraph, crate::VersionError> {
         let log = self
             .store
             .log(
                 scope,
                 &crate::LogOpts {
-                    max_count: Some(100),
+                    max_count: Some(self.config.max_log_count),
                     ..Default::default()
                 },
             )
             .await?;
+        let samples = build_causal_samples(log, &self.config);
+        Ok(learn_causal_graph(&samples, &self.config))
+    }
 
-        // 统计 URI 对的时序共现
-        let mut pair_counts: HashMap<(String, String), (usize, usize)> = HashMap::new();
-        // (cause, effect) → (cause_then_effect_count, total_cause_count)
+    /// 对一个知识修正做反事实干预，返回会被影响的下游知识。
+    pub async fn intervene(
+        &self,
+        scope: &ContextUri,
+        intervention: CausalIntervention,
+    ) -> std::result::Result<InterventionResult, crate::VersionError> {
+        let graph = self.discover_causal_graph(scope).await?;
+        Ok(apply_intervention(&graph, intervention))
+    }
 
-        for window in log.windows(3) {
-            for i in 0..window.len() {
-                for j in (i + 1)..window.len() {
-                    let earlier = &window[i];
-                    let later = &window[j];
+    /// BackwardEvolver 可直接消费这个下游影响面，做反向重核验/lineage 更新。
+    pub async fn downstream_impacts(
+        &self,
+        scope: &ContextUri,
+        corrected_uri: ContextUri,
+    ) -> std::result::Result<Vec<CounterfactualImpact>, crate::VersionError> {
+        Ok(self
+            .intervene(scope, CausalIntervention::fix(corrected_uri))
+            .await?
+            .affected)
+    }
+}
 
-                    for early_change in &earlier.metadata.changes.adds {
-                        for late_change in &later.metadata.changes.adds {
-                            let key = (early_change.to_string(), late_change.to_string());
-                            let entry = pair_counts.entry(key).or_insert((0, 0));
-                            entry.0 += 1; // cause then effect
-                            entry.1 += 1; // total cause occurrences
-                        }
-                    }
+fn build_causal_samples(
+    mut log: Vec<crate::Commit>,
+    config: &CausalDiscoveryConfig,
+) -> CausalSamples {
+    log.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    let mut frequencies: HashMap<ContextUri, usize> = HashMap::new();
+    let mut touched_by_commit = Vec::new();
+    for commit in &log {
+        let touched = touched_uris(commit);
+        for uri in &touched {
+            *frequencies.entry(uri.clone()).or_insert(0) += 1;
+        }
+        touched_by_commit.push(touched);
+    }
+
+    let mut variables = frequencies.into_iter().collect::<Vec<_>>();
+    variables.sort_by(|(a_uri, a_count), (b_uri, b_count)| {
+        b_count
+            .cmp(a_count)
+            .then_with(|| a_uri.to_string().cmp(&b_uri.to_string()))
+    });
+    variables.truncate(config.max_variables);
+    let variables = variables
+        .into_iter()
+        .map(|(uri, _)| uri)
+        .collect::<Vec<_>>();
+    let variable_index = variables
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, uri)| (uri, idx))
+        .collect::<HashMap<_, _>>();
+
+    let rows = touched_by_commit
+        .into_iter()
+        .map(|touched| {
+            let mut row = vec![false; variables.len()];
+            for uri in touched {
+                if let Some(idx) = variable_index.get(&uri) {
+                    row[*idx] = true;
                 }
             }
-        }
+            row
+        })
+        .collect();
 
-        let mut hypotheses = Vec::new();
-        for ((cause, effect), (co_occurrence, total)) in pair_counts {
-            if total < 3 {
+    CausalSamples {
+        variables,
+        variable_index,
+        rows,
+    }
+}
+
+fn touched_uris(commit: &crate::Commit) -> HashSet<ContextUri> {
+    let mut touched = HashSet::new();
+    touched.extend(commit.metadata.changes.adds.iter().cloned());
+    touched.extend(commit.metadata.changes.deletes.iter().cloned());
+    for update in &commit.metadata.changes.updates {
+        touched.insert(update.uri.clone());
+    }
+    for rename in &commit.metadata.changes.renames {
+        touched.insert(rename.from.clone());
+        touched.insert(rename.to.clone());
+    }
+    touched
+}
+
+fn learn_causal_graph(samples: &CausalSamples, config: &CausalDiscoveryConfig) -> CausalGraph {
+    if samples.rows.len() < 2 || samples.variables.len() < 2 {
+        return CausalGraph::new(samples.variables.clone(), Vec::new());
+    }
+
+    let pc_candidates = pc_candidates(samples, config);
+    let mut graph = CausalGraph::new(samples.variables.clone(), Vec::new());
+    let mut edges = Vec::new();
+
+    for effect_idx in 0..samples.variables.len() {
+        let parents = ges_parents_for_effect(samples, effect_idx, &pc_candidates, config);
+        for parent in parents {
+            let (ate, support) = conditional_risk_difference(
+                samples,
+                parent.cause_idx,
+                effect_idx,
+                &parent.adjustment_set,
+            );
+            if support < config.min_support || ate <= 0.0 {
                 continue;
             }
-            let temporal_precedence = co_occurrence as f32 / total as f32;
-            if temporal_precedence > 0.5 {
-                let (cause_uri, effect_uri) =
-                    match (ContextUri::parse(cause), ContextUri::parse(effect)) {
-                        (Ok(c), Ok(e)) => (c, e),
-                        _ => continue,
-                    };
-                hypotheses.push(CausalHypothesis {
-                    cause_uri,
-                    effect_uri,
-                    temporal_precedence,
-                    co_occurrence: co_occurrence as f32 / log.len().max(1) as f32,
-                    confidence: temporal_precedence * 0.7
-                        + (co_occurrence as f32 / log.len().max(1) as f32) * 0.3,
+            let cause_uri = samples.variables[parent.cause_idx].clone();
+            let effect_uri = samples.variables[effect_idx].clone();
+            if graph.has_path(&effect_uri, &cause_uri) {
+                continue;
+            }
+            let confidence = (ate * 0.62
+                + parent.bic_gain.min(8.0) / 8.0 * 0.28
+                + support_confidence(support) * 0.10)
+                .clamp(0.0, 1.0);
+            edges.push(CausalEdge {
+                cause_uri,
+                effect_uri,
+                average_treatment_effect: ate,
+                support,
+                confidence,
+                adjustment_set: parent
+                    .adjustment_set
+                    .iter()
+                    .map(|idx| samples.variables[*idx].clone())
+                    .collect(),
+            });
+            graph = CausalGraph::new(samples.variables.clone(), edges.clone());
+        }
+    }
+
+    edges.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    CausalGraph::new(samples.variables.clone(), edges)
+}
+
+#[derive(Debug, Clone)]
+struct PcCandidate {
+    cause_idx: usize,
+    effect_idx: usize,
+    adjustment_set: Vec<usize>,
+}
+
+fn pc_candidates(samples: &CausalSamples, config: &CausalDiscoveryConfig) -> Vec<PcCandidate> {
+    let mut candidates = Vec::new();
+    for cause_idx in 0..samples.variables.len() {
+        for effect_idx in 0..samples.variables.len() {
+            if cause_idx == effect_idx {
+                continue;
+            }
+            let support = exposure_support(samples, cause_idx);
+            if support < config.min_support {
+                continue;
+            }
+            let mut controls = (0..samples.variables.len())
+                .filter(|idx| *idx != cause_idx && *idx != effect_idx)
+                .collect::<Vec<_>>();
+            controls.sort_by(|a, b| {
+                marginal_association(samples, *b, effect_idx)
+                    .partial_cmp(&marginal_association(samples, *a, effect_idx))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            controls.truncate(12);
+
+            let mut survived = true;
+            let mut best_adjustment = Vec::new();
+            for cond_size in 0..=config.max_conditioning_set.min(controls.len()) {
+                for set in conditioning_sets(&controls, cond_size) {
+                    let (diff, _) =
+                        conditional_risk_difference(samples, cause_idx, effect_idx, &set);
+                    if diff.abs() < config.independence_threshold {
+                        survived = false;
+                        break;
+                    }
+                    if best_adjustment.is_empty() && !set.is_empty() {
+                        best_adjustment = set;
+                    }
+                }
+                if !survived {
+                    break;
+                }
+            }
+            if survived {
+                candidates.push(PcCandidate {
+                    cause_idx,
+                    effect_idx,
+                    adjustment_set: best_adjustment,
                 });
             }
         }
+    }
+    candidates
+}
 
-        hypotheses.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
+#[derive(Debug, Clone)]
+struct GesParent {
+    cause_idx: usize,
+    adjustment_set: Vec<usize>,
+    bic_gain: f32,
+}
+
+fn ges_parents_for_effect(
+    samples: &CausalSamples,
+    effect_idx: usize,
+    candidates: &[PcCandidate],
+    config: &CausalDiscoveryConfig,
+) -> Vec<GesParent> {
+    let mut selected = Vec::new();
+    let mut selected_set = Vec::new();
+    let candidate_causes = candidates
+        .iter()
+        .filter(|candidate| candidate.effect_idx == effect_idx)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    loop {
+        if selected.len() >= config.max_parents {
+            break;
+        }
+        let baseline = local_bic(samples, effect_idx, &selected_set, config);
+        let mut best: Option<GesParent> = None;
+        for candidate in &candidate_causes {
+            if selected_set.contains(&candidate.cause_idx) {
+                continue;
+            }
+            let mut trial = selected_set.clone();
+            trial.push(candidate.cause_idx);
+            let score = local_bic(samples, effect_idx, &trial, config);
+            let gain = baseline - score;
+            if gain <= 0.0 {
+                continue;
+            }
+            let parent = GesParent {
+                cause_idx: candidate.cause_idx,
+                adjustment_set: candidate.adjustment_set.clone(),
+                bic_gain: gain,
+            };
+            if best
+                .as_ref()
+                .map_or(true, |old| parent.bic_gain > old.bic_gain)
+            {
+                best = Some(parent);
+            }
+        }
+        if let Some(parent) = best {
+            selected_set.push(parent.cause_idx);
+            selected.push(parent);
+        } else {
+            break;
+        }
+    }
+
+    selected
+}
+
+fn local_bic(
+    samples: &CausalSamples,
+    effect_idx: usize,
+    parents: &[usize],
+    config: &CausalDiscoveryConfig,
+) -> f32 {
+    let n = samples.rows.len().saturating_sub(1).max(1) as f32;
+    let mut buckets: HashMap<u64, (usize, usize)> = HashMap::new();
+    for t in 1..samples.rows.len() {
+        let mut key = 0_u64;
+        for (bit, parent_idx) in parents.iter().take(63).enumerate() {
+            if samples.rows[t - 1][*parent_idx] {
+                key |= 1_u64 << bit;
+            }
+        }
+        let entry = buckets.entry(key).or_insert((0, 0));
+        entry.0 += 1;
+        if samples.rows[t][effect_idx] {
+            entry.1 += 1;
+        }
+    }
+
+    let entropy = buckets
+        .values()
+        .map(|(count, positives)| {
+            let p = (*positives as f32 / *count as f32).clamp(1e-6, 1.0 - 1e-6);
+            let h = -(p * p.ln() + (1.0 - p) * (1.0 - p).ln());
+            *count as f32 * h
+        })
+        .sum::<f32>();
+    let params = (1_usize << parents.len().min(12)) as f32;
+    entropy + config.bic_penalty * params * n.ln()
+}
+
+fn conditional_risk_difference(
+    samples: &CausalSamples,
+    cause_idx: usize,
+    effect_idx: usize,
+    controls: &[usize],
+) -> (f32, usize) {
+    let mut buckets: HashMap<u64, (usize, usize, usize, usize)> = HashMap::new();
+    for t in 1..samples.rows.len() {
+        let mut key = 0_u64;
+        for (bit, control_idx) in controls.iter().take(63).enumerate() {
+            if samples.rows[t - 1][*control_idx] {
+                key |= 1_u64 << bit;
+            }
+        }
+        let entry = buckets.entry(key).or_insert((0, 0, 0, 0));
+        let cause = samples.rows[t - 1][cause_idx];
+        let effect = samples.rows[t][effect_idx];
+        match (cause, effect) {
+            (true, true) => {
+                entry.0 += 1;
+                entry.1 += 1;
+            }
+            (true, false) => entry.1 += 1,
+            (false, true) => {
+                entry.2 += 1;
+                entry.3 += 1;
+            }
+            (false, false) => entry.3 += 1,
+        }
+    }
+
+    let mut weighted = 0.0;
+    let mut weight = 0_usize;
+    let mut support = 0_usize;
+    for (cause_hits, cause_total, base_hits, base_total) in buckets.into_values() {
+        if cause_total == 0 || base_total == 0 {
+            support += cause_total;
+            continue;
+        }
+        let local_weight = cause_total + base_total;
+        let treated = cause_hits as f32 / cause_total as f32;
+        let baseline = base_hits as f32 / base_total as f32;
+        weighted += (treated - baseline) * local_weight as f32;
+        weight += local_weight;
+        support += cause_total;
+    }
+
+    if weight == 0 {
+        (0.0, support)
+    } else {
+        (weighted / weight as f32, support)
+    }
+}
+
+fn exposure_support(samples: &CausalSamples, variable_idx: usize) -> usize {
+    samples
+        .rows
+        .iter()
+        .take(samples.rows.len().saturating_sub(1))
+        .filter(|row| row[variable_idx])
+        .count()
+}
+
+fn marginal_association(samples: &CausalSamples, cause_idx: usize, effect_idx: usize) -> f32 {
+    conditional_risk_difference(samples, cause_idx, effect_idx, &[])
+        .0
+        .abs()
+}
+
+fn conditioning_sets(controls: &[usize], size: usize) -> Vec<Vec<usize>> {
+    if size == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    build_conditioning_sets(controls, size, 0, &mut current, &mut out);
+    out
+}
+
+fn build_conditioning_sets(
+    controls: &[usize],
+    size: usize,
+    start: usize,
+    current: &mut Vec<usize>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    if current.len() == size {
+        out.push(current.clone());
+        return;
+    }
+    for idx in start..controls.len() {
+        current.push(controls[idx]);
+        build_conditioning_sets(controls, size, idx + 1, current, out);
+        current.pop();
+    }
+}
+
+fn support_confidence(support: usize) -> f32 {
+    (support as f32 / 12.0).min(1.0)
+}
+
+fn apply_intervention(graph: &CausalGraph, intervention: CausalIntervention) -> InterventionResult {
+    let sign = if intervention.value { 1.0 } else { -1.0 };
+    let mut best: HashMap<ContextUri, CounterfactualImpact> = HashMap::new();
+    let mut queue = VecDeque::new();
+
+    for edge in graph.outgoing(&intervention.target_uri) {
+        let total = sign * edge.average_treatment_effect;
+        queue.push_back((
+            edge.effect_uri.clone(),
+            edge.average_treatment_effect,
+            total,
+            edge.confidence,
+            vec![intervention.target_uri.clone(), edge.effect_uri.clone()],
+        ));
+    }
+
+    while let Some((node, direct, total, confidence, path)) = queue.pop_front() {
+        let replace = best.get(&node).map_or(true, |old| {
+            total.abs() * confidence > old.total_effect.abs() * old.confidence
         });
+        if replace {
+            best.insert(
+                node.clone(),
+                CounterfactualImpact {
+                    effect_uri: node.clone(),
+                    direct_effect: direct,
+                    total_effect: total,
+                    confidence,
+                    causal_path: path.clone(),
+                },
+            );
+        }
 
-        Ok(hypotheses)
+        for edge in graph.outgoing(&node) {
+            if path.contains(&edge.effect_uri) {
+                continue;
+            }
+            let mut next_path = path.clone();
+            next_path.push(edge.effect_uri.clone());
+            queue.push_back((
+                edge.effect_uri.clone(),
+                0.0,
+                total * edge.average_treatment_effect,
+                (confidence * edge.confidence).sqrt(),
+                next_path,
+            ));
+        }
+    }
+
+    let mut affected = best.into_values().collect::<Vec<_>>();
+    affected.sort_by(|a, b| {
+        (b.total_effect.abs() * b.confidence)
+            .partial_cmp(&(a.total_effect.abs() * a.confidence))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    InterventionResult {
+        intervention,
+        affected,
     }
 }
 
@@ -576,5 +1171,124 @@ mod tests {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         assert!(v[0].confidence > v[1].confidence);
+    }
+
+    #[test]
+    fn causal_discovery_filters_confounding_and_keeps_intervention_edge() {
+        let a = ContextUri::parse("uwu://t/agent/a/memories/events/knowledge-a").unwrap();
+        let b = ContextUri::parse("uwu://t/agent/a/memories/events/knowledge-b").unwrap();
+        let c = ContextUri::parse("uwu://t/agent/a/memories/events/shared-cause-c").unwrap();
+        let d = ContextUri::parse("uwu://t/agent/a/memories/events/downstream-d").unwrap();
+
+        let rows = vec![
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![d.clone()],
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![d.clone()],
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![d.clone()],
+            vec![c.clone(), b.clone()],
+            vec![],
+            vec![c.clone(), b.clone()],
+            vec![],
+            vec![a.clone()],
+            vec![d.clone()],
+            vec![a.clone()],
+            vec![d.clone()],
+        ];
+        let samples = test_samples(rows);
+        let graph = learn_causal_graph(
+            &samples,
+            &CausalDiscoveryConfig {
+                min_support: 2,
+                independence_threshold: 0.05,
+                max_conditioning_set: 1,
+                bic_penalty: 0.1,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.cause_uri == a && edge.effect_uri == d)
+        );
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.cause_uri == a && edge.effect_uri == b)
+        );
+
+        let result = apply_intervention(&graph, CausalIntervention::fix(a.clone()));
+        assert_eq!(result.affected[0].effect_uri, d);
+        assert!(result.affected[0].total_effect > 0.0);
+    }
+
+    #[test]
+    fn causal_intervention_propagates_multi_hop_downstream_impacts() {
+        let a = ContextUri::parse("uwu://t/agent/a/memories/events/a").unwrap();
+        let b = ContextUri::parse("uwu://t/agent/a/memories/events/b").unwrap();
+        let c = ContextUri::parse("uwu://t/agent/a/memories/events/c").unwrap();
+        let graph = CausalGraph::new(
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![
+                CausalEdge {
+                    cause_uri: a.clone(),
+                    effect_uri: b.clone(),
+                    average_treatment_effect: 0.8,
+                    support: 8,
+                    confidence: 0.9,
+                    adjustment_set: vec![],
+                },
+                CausalEdge {
+                    cause_uri: b.clone(),
+                    effect_uri: c.clone(),
+                    average_treatment_effect: 0.5,
+                    support: 7,
+                    confidence: 0.8,
+                    adjustment_set: vec![],
+                },
+            ],
+        );
+
+        let result = apply_intervention(&graph, CausalIntervention::remove(a));
+        let affected = result.affected_uris();
+        assert!(affected.contains(&b));
+        assert!(affected.contains(&c));
+        assert!(
+            result
+                .affected
+                .iter()
+                .any(|impact| impact.effect_uri == c && impact.total_effect < 0.0)
+        );
+    }
+
+    fn test_samples(rows: Vec<Vec<ContextUri>>) -> CausalSamples {
+        let mut variables = rows.iter().flatten().cloned().collect::<Vec<_>>();
+        variables.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        variables.dedup();
+        let variable_index = variables
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(idx, uri)| (uri, idx))
+            .collect::<HashMap<_, _>>();
+        let rows = rows
+            .into_iter()
+            .map(|uris| {
+                let mut row = vec![false; variables.len()];
+                for uri in uris {
+                    row[*variable_index.get(&uri).unwrap()] = true;
+                }
+                row
+            })
+            .collect();
+        CausalSamples {
+            variables,
+            variable_index,
+            rows,
+        }
     }
 }

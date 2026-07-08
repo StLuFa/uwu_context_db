@@ -5,8 +5,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use agent_context_db_marketplace_types::{
-    AgentId, BondLevel, CorroborationLevel, CorroborationProof, LicenseInfo, LicenseScope,
-    LineageAction, LineageNode, MarketEntryType, MarketId, PublicationMetadata, ThreatSeverity,
+    AgentId, BondLevel, CorroborationLevel, CorroborationProof, KnowledgeProvenance,
+    KnowledgeProvenancePayload, LicenseInfo, LicenseScope, LineageAction, LineageNode,
+    MarketEntryType, MarketId, PublicationMetadata, ThreatSeverity,
 };
 
 /// 市场条目 — Agent 发布到市场的知识晶体。
@@ -26,6 +27,8 @@ pub struct MarketEntry {
     pub confidence: f32,
     /// 确认证明：哪些 Agent 独立确认了此知识
     pub corroboration: CorroborationProof,
+    /// 发布者签名与证据链哈希，用于离线验证知识来源与抗篡改。
+    pub provenance: Option<KnowledgeProvenance>,
     /// 许可证
     pub license: KnowledgeLicense,
     pub epistemic_type: EpistemicType,
@@ -38,6 +41,22 @@ pub struct MarketEntry {
 }
 
 impl MarketEntry {
+    pub fn provenance_payload(&self) -> KnowledgeProvenancePayload {
+        KnowledgeProvenancePayload {
+            publisher: self.publisher.clone(),
+            content: self.principle.clone(),
+            evidence_chain_hash: agent_context_db_marketplace_types::evidence_chain_hash(
+                &self.evidence_uris,
+            ),
+            evidence_uris: self.evidence_uris.clone(),
+            quality_score: self.quality_score,
+            confidence: self.confidence,
+            epistemic_type: self.epistemic_type,
+            content_type: self.content_type,
+            created_at: self.created_at,
+        }
+    }
+
     pub fn publication_metadata(&self) -> PublicationMetadata {
         PublicationMetadata {
             id: self.id,
@@ -47,6 +66,7 @@ impl MarketEntry {
             source_uri: self.evidence_uris.first().cloned(),
             quality_score: self.quality_score,
             corroboration: self.corroboration.clone(),
+            provenance: self.provenance.clone(),
             license: self.license.clone().into(),
             epistemic_type: self.epistemic_type,
             content_type: self.content_type,

@@ -4,6 +4,7 @@
 //! 后端适配器（Qdrant/Pgvector/Memory）由 storage 层实现。
 
 use crate::error::Result;
+use crate::llm::EmbeddingVector;
 use crate::uri::ContextUri;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -14,8 +15,31 @@ pub struct IndexPoint {
     /// 指向内容层的 uwu:// URI。
     pub uri: ContextUri,
     pub vector: Vec<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_dim: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_version: Option<u64>,
     #[serde(default)]
     pub payload: serde_json::Value,
+}
+
+impl IndexPoint {
+    pub fn from_embedding(
+        uri: ContextUri,
+        embedding: EmbeddingVector,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            uri,
+            vector: embedding.vector,
+            embedding_model_id: Some(embedding.model_id),
+            embedding_dim: Some(embedding.dim),
+            embedding_version: Some(embedding.version),
+            payload,
+        }
+    }
 }
 
 /// 索引命中结果。

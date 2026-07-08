@@ -1,6 +1,6 @@
 //! LineageTracker + PhylogenyTree — 知识演化树追踪。
 
-use agent_context_db_core::{ContextEntry, ContextUri, MvccVersion};
+use agent_context_db_core::{ContextEntry, ContextUri};
 use chrono::{DateTime, Utc};
 
 /// 血统追踪器。
@@ -31,7 +31,7 @@ impl LineageTracker {
 
     /// 记录一条血统变更。
     pub fn record_lineage(
-        parent: &ContextEntry,
+        _parent: &ContextEntry,
         child: &ContextEntry,
         change_summary: &str,
     ) -> PhylogenyNode {
@@ -46,7 +46,7 @@ impl LineageTracker {
 
     /// 从演化链构建系统发生树。
     pub fn build_tree(root: &ContextEntry, lineage: &[PhylogenyNode]) -> PhylogenyTree {
-        let mut root_node = PhylogenyNode {
+        let root_node = PhylogenyNode {
             uri: root.uri.clone(),
             version: 0,
             timestamp: Utc::now(),

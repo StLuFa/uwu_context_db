@@ -3,7 +3,7 @@
 //! - [`HallucinationDetector`]：对检索结果做一致性/幻觉检测
 //! - [`CompressionAwareLoader`]：根据 context window 压力动态调整 L0/L1/L2
 
-use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, LlmClient, LlmOpts, Result};
+use agent_context_db_core::{ContentLevel, ContextUri, LlmClient, LlmOpts, Result};
 use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -268,6 +268,7 @@ impl CompressionAwareLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_context_db_core::ContentPayload;
 
     #[test]
     fn pressure_from_ratio() {
@@ -292,6 +293,9 @@ mod tests {
             relevance: 0.9,
             parent_chain: vec![],
             content_type: None,
+            metadata: Default::default(),
+            created_at: None,
+            updated_at: None,
         }];
 
         let plan = loader.allocate_levels(&hits);

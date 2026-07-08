@@ -3,7 +3,7 @@
 //! 语义路径不由手写，而是向量聚类自动生成。
 //! Sleeptime 阶段对同类型晶体做增量聚类，类簇生成路径段。
 
-use agent_context_db_core::{ContentType, ContextUri, Result, VectorIndex};
+use agent_context_db_core::{ContentType, ContextUri, VectorIndex};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -96,7 +96,7 @@ impl SemanticAxis {
         // 更新 cluster_paths
         let mut paths = self.cluster_paths.write();
         paths.clear();
-        for (i, cluster) in type_clusters.iter().enumerate() {
+        for (_i, cluster) in type_clusters.iter().enumerate() {
             if !cluster.members.is_empty() {
                 paths.insert(cluster.label.clone(), cluster.members.clone());
             }

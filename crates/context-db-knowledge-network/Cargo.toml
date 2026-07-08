@@ -9,9 +9,16 @@ agent-context-db-core = { path = "../context-db-core" }
 agent-context-db-marketplace-types = { path = "../context-db-marketplace-types" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = "2"
+hex = "0.4"
 parking_lot = "0.12"
+rand = "0.8"
+rand_distr = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 uwu_event_mesh = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

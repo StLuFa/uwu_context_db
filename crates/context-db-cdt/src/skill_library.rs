@@ -1,6 +1,6 @@
 //! SkillLibrary — embedding 检索 + deposit（课程驱动）。
 
-use agent_context_db_core::{ContentType, ContextUri, Result, VectorIndex};
+use agent_context_db_core::{ContextUri, VectorIndex};
 use std::sync::Arc;
 
 /// Skill 条目。
@@ -49,6 +49,9 @@ impl SkillLibrary {
         let point = agent_context_db_core::IndexPoint {
             uri: skill.uri.clone(),
             vector: skill.embedding.clone(),
+            embedding_model_id: None,
+            embedding_dim: None,
+            embedding_version: None,
             payload: serde_json::json!({
                 "name": skill.name,
                 "precondition": skill.precondition,

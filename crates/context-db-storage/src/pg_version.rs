@@ -17,7 +17,7 @@
 //! - `version_entry_deltas(commit_id, uri, op, entry_json, rename_from)`
 //! - `version_heads(scope, commit_id)`
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 

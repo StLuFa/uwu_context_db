@@ -1,10 +1,9 @@
 //! 生命周期管理：per-entry 自适应遗忘 + 重要性评分 + 可组合规则引擎。
 //!
-//! 替代旧的全局固定 `ForgettingCurve` 和 `LifecyclePolicy::for_class` 硬编码。
+//! 使用可组合规则替代全局固定遗忘策略。
 
-use crate::{ContentLevel, ContentType, ContextEntry};
+use crate::ContentLevel;
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
 
 // ===========================================================================
 // 访问事件
@@ -393,6 +392,10 @@ impl LifecycleEngine {
         Self { rules, weights }
     }
 
+    pub fn score(&self, log: &[AccessEvent], meta: &crate::ContextMeta) -> ImportanceScore {
+        ImportanceScore::compute(log, meta, &self.weights)
+    }
+
     pub fn evaluate(&self, score: &ImportanceScore, meta: &crate::ContextMeta) -> LifecycleAction {
         self.rules
             .iter()
@@ -400,6 +403,15 @@ impl LifecycleEngine {
             .max_by_key(|r| r.priority)
             .map(|r| r.action.clone())
             .unwrap_or(LifecycleAction::Keep)
+    }
+
+    pub fn evaluate_entry(
+        &self,
+        log: &[AccessEvent],
+        meta: &crate::ContextMeta,
+    ) -> LifecycleAction {
+        let score = self.score(log, meta);
+        self.evaluate(&score, meta)
     }
 
     pub fn default_rules() -> Vec<LifecycleRule> {
@@ -431,84 +443,6 @@ impl LifecycleEngine {
                 priority: 20,
             },
         ]
-    }
-}
-
-// ===========================================================================
-// 旧类型（deprecated）
-// ===========================================================================
-
-#[deprecated(note = "使用 ForgettingModel trait 替代")]
-#[derive(Debug, Clone)]
-pub struct ForgettingCurve {
-    pub stability: f64,
-    pub reinforcements: u32,
-}
-
-#[allow(deprecated)]
-impl ForgettingCurve {
-    pub fn new() -> Self {
-        Self {
-            stability: 7.0,
-            reinforcements: 0,
-        }
-    }
-    pub fn retention(&self, created_at: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
-        let elapsed = (now - created_at).num_seconds() as f64 / 86400.0;
-        let s_eff = self.stability * (1.0 + 0.5 * self.reinforcements as f64);
-        (-elapsed / s_eff).exp().clamp(0.0, 1.0)
-    }
-    pub fn reinforce(&mut self) {
-        self.reinforcements = self.reinforcements.saturating_add(1);
-    }
-}
-
-impl Default for ForgettingCurve {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[deprecated(note = "使用 LifecycleAction 替代")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DegradeAction {
-    Downgrade,
-    Archive,
-    Delete,
-    Keep,
-}
-
-#[deprecated(note = "使用 LifecycleEngine 替代")]
-pub struct LifecyclePolicy {
-    pub curve: ForgettingCurve,
-}
-
-#[allow(deprecated)]
-impl LifecyclePolicy {
-    pub fn new() -> Self {
-        Self {
-            curve: ForgettingCurve::new(),
-        }
-    }
-    pub fn evaluate(&self, entry: &ContextEntry, now: DateTime<Utc>) -> LifecycleAction {
-        let r = self.curve.retention(entry.created_at, now);
-        if r < 0.05 {
-            LifecycleAction::Delete
-        } else if r < 0.15 {
-            LifecycleAction::Archive
-        } else if r < 0.35 {
-            LifecycleAction::Downgrade {
-                to_level: ContentLevel::L0,
-            }
-        } else {
-            LifecycleAction::Keep
-        }
-    }
-}
-
-impl Default for LifecyclePolicy {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

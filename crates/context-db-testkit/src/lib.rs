@@ -11,9 +11,9 @@ pub mod version;
 pub use version::MemoryVersionStore;
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentRepo, ContextDiff, ContextEntry, ContextError, ContextUri,
-    DirEntry, FindPattern, FsOps, GrepHit, MvccVersion, Result, TenantId, TenantOps, TreeNode,
-    VersionEntry, VersionOps,
+    ContentLevel, ContentPayload, ContentRepo, ContentStore, ContextDiff, ContextEntry,
+    ContextError, ContextUri, DirEntry, FindPattern, FsOps, GrepHit, MvccVersion, Result, TenantId,
+    TenantOps, TreeNode, VersionEntry, VersionOps, sanitize_entry_for_write,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -45,7 +45,8 @@ impl MemoryContextStore {
 
 #[async_trait]
 impl ContentRepo for MemoryContextStore {
-    async fn write(&self, mut entry: ContextEntry) -> Result<MvccVersion> {
+    async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
+        let mut entry = sanitize_entry_for_write(&entry);
         let mut map = self.entries.lock();
         let list = map.entry(entry.uri.to_string().clone()).or_default();
         let next = MvccVersion(list.len() as u64 + 1);
@@ -191,13 +192,51 @@ impl FsOps for MemoryContextStore {
                         });
                     }
                 }
-                ContentPayload::Text {
-                    sparse: l0,
-                    dense: l1,
-                    full: String::new(),
+                match &e.payload {
+                    ContentPayload::Text { full, .. } => ContentPayload::Text {
+                        sparse: l0,
+                        dense: l1,
+                        full: full.clone(),
+                    },
+                    other => other.clone(),
                 }
             }
         })
+    }
+}
+
+#[async_trait]
+impl ContentStore for MemoryContextStore {
+    async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload> {
+        <Self as FsOps>::read(self, uri, level).await
+    }
+
+    async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
+        <Self as ContentRepo>::write(self, entry).await
+    }
+
+    async fn delete(&self, uri: &ContextUri) -> Result<()> {
+        <Self as ContentRepo>::delete(self, uri).await
+    }
+
+    async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
+        <Self as ContentRepo>::rename(self, from, to).await
+    }
+
+    async fn batch_write(&self, entries: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
+        <Self as ContentRepo>::batch_write(self, entries).await
+    }
+
+    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
+        let map = self.entries.lock();
+        let mut entries: Vec<_> = map
+            .iter()
+            .filter(|(uri, _)| uri.starts_with(prefix))
+            .filter_map(|(_, versions)| versions.last().cloned())
+            .collect();
+        entries.sort_by(|a, b| a.uri.cmp(&b.uri));
+        entries.truncate(limit);
+        Ok(entries)
     }
 }
 
@@ -353,6 +392,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_sanitizes_sensitive_payload_before_storage() {
+        let store = MemoryContextStore::new();
+        let uri = ContextUri::parse("uwu://t/agent/a/memories/evidence/pii").unwrap();
+        store
+            .write(entry(
+                &uri.to_string(),
+                "contact user@example.com with sk-secret12345678901234567890",
+            ))
+            .await
+            .unwrap();
+
+        let payload = store.read(&uri, ContentLevel::L2).await.unwrap();
+        let ContentPayload::Text { sparse, full, .. } = payload else {
+            panic!("expected text payload");
+        };
+        assert!(!sparse.contains("user@example.com"));
+        assert!(!full.contains("sk-secret12345678901234567890"));
+        assert!(sparse.contains("[REDACTED_EMAIL]"));
+        assert!(full.contains("[REDACTED_SECRET]"));
+        assert!(
+            store
+                .latest(&uri.to_string())
+                .unwrap()
+                .metadata
+                .custom
+                .get("security_redactions")
+                .is_some()
+        );
     }
 
     #[tokio::test]

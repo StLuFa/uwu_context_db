@@ -3,19 +3,23 @@
 //! CDT 训练闭环：
 //! 轨迹采集 → 认知编码 → 巩固精炼 → 认知梯度提取 → 偏好策略优化 → Skill 写入 → 反馈回流
 
+use crate::consolidation::CdtConsolidationBridge;
 use crate::curriculum::CurriculumGenerator;
 use crate::dpo::KnowledgeConstrainedDPO;
+use crate::dpo::PreferenceScores;
+use crate::metric::{
+    BootstrapDemoOptimizer, CognitiveBootstrap, ForgettingPriorityOptimizer, OptimizerPipeline,
+};
 use crate::preference::CognitivePreferenceExtractor;
 use crate::skill_library::{SkillEntry, SkillLibrary};
 use crate::trajectory_encoder::{Trajectory, TrajectoryEncoder};
 use crate::{
     CognitiveGradient, CognitiveMetric, CognitivePreferencePair, EpochResult, GateDecision,
-    PolicyGate, TrainingConfig, TrainingGoal, TrainingReport, TrajectorySummary,
+    PolicyGate, TrainingConfig, TrainingReport, TrajectorySummary,
 };
-use agent_context_db_consolidation::{ConsolidationEngine, ConsolidationProduct};
+use agent_context_db_consolidation::ConsolidationEngine;
 use agent_context_db_core::{
-    ContentType, ContextEntry, ContextUri, EpistemicType, LifecycleEngine, LlmClient, LlmOpts,
-    Result, VectorIndex,
+    ContentType, ContextUri, LifecycleEngine, LlmClient, Result, TenantId, VectorIndex,
 };
 use std::sync::Arc;
 
@@ -62,14 +66,24 @@ impl CognitiveTrainingPipeline {
         };
         let mut best_accuracy = 0.0;
 
-        // ── 阶段 0: 认知偏好提取 ──
+        // ── 阶段 0: 认知偏好提取 + DSPy bootstrap 优化 ──
         let pairs: Vec<_> = trajectories
             .iter()
             .map(|t| (t.clone(), t.success))
             .collect();
         let preferences = CognitivePreferenceExtractor::extract_pairs(&pairs);
+        let mut effective_config = config.clone();
+        let bootstrap = CognitiveBootstrap::new(config.min_confidence).with_max_demos(5);
+        let bootstrap_report = bootstrap.extract_from_preferences(&preferences);
+        OptimizerPipeline::new()
+            .with(Box::new(BootstrapDemoOptimizer {
+                demos: bootstrap_report.demos,
+            }))
+            .with(Box::new(ForgettingPriorityOptimizer))
+            .run(&mut effective_config)
+            .await?;
 
-        for epoch in 0..config.epochs {
+        for epoch in 0..effective_config.epochs {
             let mut gradients_applied = 0usize;
             let mut gradients_rejected = 0usize;
             let mut total_contradictions = 0usize;
@@ -108,8 +122,11 @@ impl CognitiveTrainingPipeline {
             });
 
             // ── 阶段 3: 策略优化（偏好loss + 门控） ──
-            for gradient in all_gradients.iter().take(config.gradient_batch_size) {
-                if gradient.weight < config.min_confidence {
+            for gradient in all_gradients
+                .iter()
+                .take(effective_config.gradient_batch_size)
+            {
+                if gradient.weight < effective_config.min_confidence {
                     gradients_rejected += 1;
                     continue;
                 }
@@ -123,12 +140,9 @@ impl CognitiveTrainingPipeline {
                     }
                 };
 
-                let loss = self.dpo.pair_loss(
-                    chosen.chosen.avg_confidence,
-                    rejected.rejected.avg_confidence,
-                    chosen.chosen.contradictions,
-                    rejected.rejected.contradictions,
-                );
+                let loss = self
+                    .dpo
+                    .trajectory_pair_loss(&chosen.chosen, &rejected.rejected);
 
                 // 门控：loss 改善 > 0 才接受
                 if loss < 0.0 {
@@ -200,19 +214,46 @@ impl CognitiveTrainingPipeline {
         encoder: &TrajectoryEncoder,
         skill_library: &SkillLibrary,
         curriculum: &CurriculumGenerator,
-        vector_index: &Arc<dyn VectorIndex>,
+        _vector_index: &Arc<dyn VectorIndex>,
     ) -> Result<TrainingReport> {
         let mut report = TrainingReport {
             epochs: vec![],
             accuracy_delta: 0.0,
         };
         let mut best_accuracy = 0.0;
+        let mut effective_config = config.clone();
+        let summaries: Vec<TrajectorySummary> = trajectories
+            .iter()
+            .enumerate()
+            .map(|(idx, t)| TrajectorySummary {
+                task_id: if t.task_id.is_empty() {
+                    format!("trajectory-{idx}")
+                } else {
+                    t.task_id.clone()
+                },
+                task_description: t.task_description.clone(),
+                success: t.success,
+                steps: t.steps.len(),
+                contradictions: usize::from(t.error_message.is_some()),
+                avg_confidence: if t.success { 0.85 } else { 0.35 },
+            })
+            .collect();
+        let bootstrap_report = CognitiveBootstrap::new(config.min_confidence)
+            .with_max_demos(5)
+            .extract_from_trajectories(&summaries);
+        OptimizerPipeline::new()
+            .with(Box::new(BootstrapDemoOptimizer {
+                demos: bootstrap_report.demos,
+            }))
+            .with(Box::new(ForgettingPriorityOptimizer))
+            .run(&mut effective_config)
+            .await?;
 
         // ── 阶段 1: 轨迹 → 认知编码 ──
         let entries = encoder.encode_batch(trajectories);
         tracing::info!(count = entries.len(), "trajectories encoded to memories");
 
-        for epoch in 0..config.epochs {
+        for epoch in 0..effective_config.epochs {
             // ── 阶段 2: 巩固精炼 ──
             let products = self.consolidation.consolidate_batch(&entries).await?;
             tracing::info!(
@@ -223,7 +264,7 @@ impl CognitiveTrainingPipeline {
 
             // ── 阶段 3: 认知梯度提取 ──
             let gradients =
-                crate::extract_gradients_from_products(&products, config.min_confidence);
+                crate::extract_gradients_from_products(&products, effective_config.min_confidence);
             tracing::info!(
                 epoch = epoch,
                 gradients = gradients.len(),
@@ -238,6 +279,7 @@ impl CognitiveTrainingPipeline {
                     .llm
                     .embed(&_goal.expected_new_knowledge)
                     .await
+                    .map(|embedding| embedding.vector)
                     .unwrap_or_else(|_| vec![0.0_f32; 1536]);
                 let retrieved = skill_library.retrieve(&task_embedding, 5).await;
                 epoch_skills.extend(retrieved);
@@ -246,25 +288,35 @@ impl CognitiveTrainingPipeline {
             // ── 阶段 5: 策略优化（偏好loss） ──
             let mut gradients_applied = 0usize;
             let mut gradients_rejected = 0usize;
+            let mut accepted_gradients = Vec::new();
 
-            for gradient in gradients.iter().take(config.gradient_batch_size) {
-                if gradient.weight < config.min_confidence {
+            for gradient in gradients.iter().take(effective_config.gradient_batch_size) {
+                if gradient.weight < effective_config.min_confidence {
                     gradients_rejected += 1;
                     continue;
                 }
 
                 if let Some((chosen, rejected)) = find_best_worst_pair_from_gradients(&gradients) {
-                    let loss = self
-                        .dpo
-                        .pair_loss(chosen.confidence, rejected.confidence, 0, 0);
+                    let loss = self.dpo.loss_from_scores(
+                        PreferenceScores {
+                            chosen: chosen.weight as f64,
+                            rejected: rejected.weight as f64,
+                            reference_chosen: chosen.confidence as f64 * 0.5,
+                            reference_rejected: rejected.confidence as f64 * 0.5,
+                        },
+                        rejected.contradiction_uris.len() as i32
+                            - chosen.contradiction_uris.len() as i32,
+                    );
                     if loss < 0.0 {
                         gradients_applied += 1;
+                        accepted_gradients.push(gradient.clone());
                         // ── 阶段 6: Skill 写入 ──
                         if let ContentType::Skill = gradient.epistemic_type {
                             let skill_embedding = self
                                 .llm
                                 .embed(&gradient.source_uri.to_string())
                                 .await
+                                .map(|embedding| embedding.vector)
                                 .unwrap_or_else(|_| vec![0.0_f32; 1536]);
                             let skill = SkillEntry {
                                 uri: gradient.source_uri.clone(),
@@ -282,6 +334,17 @@ impl CognitiveTrainingPipeline {
                 }
             }
 
+            // ── 阶段 7: CDT 信号沉淀为长期巩固产物 ──
+            let bridge = CdtConsolidationBridge::new(
+                format!("t/agent/cdt/epoch-{epoch}"),
+                TenantId(uuid::Uuid::new_v4()),
+            );
+            let consolidated_signals = bridge.products_from_gradients(&accepted_gradients);
+            let materialized_entries = accepted_gradients
+                .iter()
+                .map(|gradient| bridge.entry_from_signal(&bridge.signal_from_gradient(gradient)))
+                .collect::<Vec<_>>();
+
             let metric = CognitiveMetric::compute(
                 0,
                 gradients.iter().map(|g| g.confidence).sum::<f32>() / gradients.len().max(1) as f32,
@@ -295,8 +358,8 @@ impl CognitiveTrainingPipeline {
 
             report.epochs.push(EpochResult {
                 epoch,
-                memories_encoded: entries.len(),
-                gradients_extracted: gradients.len(),
+                memories_encoded: entries.len() + materialized_entries.len(),
+                gradients_extracted: gradients.len() + consolidated_signals.len(),
                 gradients_applied,
                 gradients_rejected,
                 accuracy: metric.composite,
@@ -306,6 +369,8 @@ impl CognitiveTrainingPipeline {
                 epoch = epoch,
                 applied = gradients_applied,
                 rejected = gradients_rejected,
+                cdt_consolidation_products = consolidated_signals.len(),
+                materialized_entries = materialized_entries.len(),
                 accuracy = metric.composite,
                 "CDT epoch complete (full pipeline)"
             );

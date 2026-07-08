@@ -222,7 +222,7 @@ impl VersionStore for MemoryVersionStore {
     ) -> Result<Branch> {
         let scope_key = Self::scope_key(scope);
         let key = (scope_key.clone(), name.as_str().to_string());
-        let mut branches = self.branches.lock();
+        let branches = self.branches.lock();
         if branches.contains_key(&key) {
             return Err(VersionError::BranchExists(name.as_str().to_string()));
         }

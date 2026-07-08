@@ -1,11 +1,16 @@
 //! SecurityGate + ImmuneMemory — 写入前安全检查 + 抗体免疫。
 
-use agent_context_db_core::{ContentType, ContextEntry, ContextUri};
+use agent_context_db_core::{
+    ContextEntry, SensitiveFinding, redact_sensitive_entry, scan_sensitive_entry,
+};
 
 /// 注入扫描结果。
 #[derive(Debug, Clone)]
 pub enum ThreatVerdict {
     Safe,
+    Redacted {
+        findings: Vec<SensitiveFinding>,
+    },
     Suspicious {
         reason: String,
     },
@@ -39,7 +44,7 @@ impl SecurityGate {
         }
     }
 
-    /// 写入前扫描 — 检测注入/有害内容。
+    /// 写入前扫描 — 检测注入/有害内容与敏感信息。
     pub fn scan(&self, entry: &ContextEntry) -> ThreatVerdict {
         let text = entry.l0_text().to_lowercase();
 
@@ -52,14 +57,30 @@ impl SecurityGate {
             }
         }
 
-        // 空内容检查
         if text.trim().is_empty() {
             return ThreatVerdict::Suspicious {
                 reason: "empty content".into(),
             };
         }
 
-        ThreatVerdict::Safe
+        let findings = scan_sensitive_entry(entry);
+        if findings.is_empty() {
+            ThreatVerdict::Safe
+        } else {
+            ThreatVerdict::Redacted { findings }
+        }
+    }
+
+    pub fn redact_entry(&self, entry: &ContextEntry) -> (ContextEntry, Vec<SensitiveFinding>) {
+        redact_sensitive_entry(entry)
+    }
+
+    pub fn sanitize_for_write(&self, entry: &ContextEntry) -> Result<ContextEntry, ThreatVerdict> {
+        match self.scan(entry) {
+            ThreatVerdict::Safe | ThreatVerdict::Suspicious { .. } => Ok(entry.clone()),
+            ThreatVerdict::Redacted { .. } => Ok(self.redact_entry(entry).0),
+            blocked @ ThreatVerdict::Blocked { .. } => Err(blocked),
+        }
     }
 }
 
@@ -113,5 +134,47 @@ impl ImmuneMemory {
             }
         }
         ThreatVerdict::Safe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_context_db_core::{ContentPayload, ContextEntry, ContextUri, TenantId};
+
+    #[test]
+    fn security_gate_redacts_pii_across_text_levels() {
+        let gate = SecurityGate::new();
+        let mut entry = ContextEntry::new_text(
+            ContextUri::parse("uwu://t/agent/a/memories/evidence/e1").unwrap(),
+            TenantId(uuid::Uuid::nil()),
+            "email me at user@example.com",
+        );
+        entry.payload = ContentPayload::Text {
+            sparse: "email me at user@example.com".into(),
+            dense: "phone +1-555-123-4567".into(),
+            full: "token sk-secret12345678901234567890".into(),
+        };
+
+        assert!(matches!(gate.scan(&entry), ThreatVerdict::Redacted { .. }));
+        let sanitized = gate.sanitize_for_write(&entry).unwrap();
+        let ContentPayload::Text {
+            sparse,
+            dense,
+            full,
+        } = sanitized.payload
+        else {
+            panic!("expected text payload");
+        };
+        assert!(sparse.contains("[REDACTED_EMAIL]"));
+        assert!(dense.contains("[REDACTED_ID]"));
+        assert!(full.contains("[REDACTED_SECRET]"));
+        assert!(
+            sanitized
+                .metadata
+                .custom
+                .get("security_redactions")
+                .is_some()
+        );
     }
 }

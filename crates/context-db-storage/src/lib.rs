@@ -19,7 +19,10 @@ pub mod uwu_cache_adapter;
 pub mod vector_index;
 
 // Re-export core vector types（来源统一）
-pub use agent_context_db_core::{IndexHit, IndexPoint, VectorIndex};
+pub use agent_context_db_core::{
+    AclProtectedStore, IndexHit, IndexPoint, PathAcl, Principal, VectorIndex, WatchHub,
+    WatchSource, WatchableStore,
+};
 
 pub use migrations::context_db_migrations;
 pub use perf::{
@@ -46,7 +49,7 @@ pub struct ContextDbService<S> {
 
 impl<S> ContextDbService<S>
 where
-    S: agent_context_db_core::ContextStore + 'static,
+    S: agent_context_db_core::FsOps + agent_context_db_core::ContentRepo + 'static,
 {
     /// 通用构造器：注入任意实现了 ContextStore 的内容层 + VectorIndex。
     pub fn new(content: Arc<S>, index: Arc<dyn VectorIndex>) -> Self {
@@ -69,6 +72,16 @@ where
     }
 }
 
+impl<S> ContextDbService<S>
+where
+    S: WatchSource + 'static,
+{
+    /// 交出 CDC/watch 端口。
+    pub fn watch_source(&self) -> Arc<S> {
+        self.content.clone()
+    }
+}
+
 impl<S> Clone for ContextDbService<S> {
     fn clone(&self) -> Self {
         Self {
@@ -82,15 +95,17 @@ impl<S> Clone for ContextDbService<S> {
 // uwu_database 便捷构造器
 // ===========================================================================
 
-/// 使用 `uwu_database::Database` 快速构造 `ContextDbService<PgContextStore>`。
+/// 使用 `uwu_database::Database` 快速构造带 ACL 的 `ContextDbService`。
 ///
-/// 内容层自动从 `DbPool` 构建 `PgContextStore`；
+/// 内容层自动从 `DbPool` 构建 `PgContextStore` 并包上 `AclProtectedStore`；
 /// 向量层优先使用 `Database.vector`，无配置时回退到空实现。
 ///
 /// 首次调用会自动应用 context-db 的 SQL 迁移。
 pub async fn service_from_uwu_db(
     db: uwu_database::Database,
-) -> Result<ContextDbService<PgContextStore>> {
+    acl: Arc<PathAcl>,
+    principal: Principal,
+) -> Result<ContextDbService<WatchableStore<AclProtectedStore<PgContextStore>>>> {
     // 1. 应用迁移
     let mut migrator = uwu_database::Migrator::new();
     for m in context_db_migrations() {
@@ -100,8 +115,11 @@ pub async fn service_from_uwu_db(
         agent_context_db_core::ContextError::Storage(format!("migration failed: {e}"))
     })?;
 
-    // 2. 构造内容层适配器
-    let content = Arc::new(PgContextStore::new(Arc::new(db.pool)));
+    // 2. 构造带 ACL 的内容层适配器
+    let content = Arc::new(WatchableStore::new(
+        AclProtectedStore::new(PgContextStore::new(Arc::new(db.pool)), acl, principal),
+        Arc::new(WatchHub::default()),
+    ));
 
     // 3. 构造向量层适配器（无配置时回退空实现）
     let index: Arc<dyn VectorIndex> = match db.vector {
@@ -164,6 +182,7 @@ impl VectorIndex for NoopVectorIndex {
 #[cfg(test)]
 mod pg_tests {
     use super::*;
+    use agent_context_db_core::{AclRule, Permissions};
     use uwu_database::Database;
     use uwu_database::config::{
         CacheBackend, CacheConfig, DbConfig, DeployConfig, RuntimeConfig, SqlBackend,
@@ -176,6 +195,21 @@ mod pg_tests {
 
     fn require_pg() -> String {
         pg_url().expect("SKIP: DATABASE_URL not set")
+    }
+
+    fn full_acl() -> Arc<PathAcl> {
+        let acl = Arc::new(PathAcl::new());
+        acl.add_rule(AclRule {
+            path_pattern: "uwu://".into(),
+            principal: Principal::User("test".into()),
+            permissions: Permissions::full(),
+            priority: 1,
+        });
+        acl
+    }
+
+    fn test_principal() -> Principal {
+        Principal::User("test".into())
     }
 
     fn test_cfg() -> RuntimeConfig {
@@ -212,7 +246,9 @@ mod pg_tests {
         let cfg = test_cfg();
         let db = Database::connect(&cfg).await.unwrap();
 
-        let service = service_from_uwu_db(db).await.unwrap();
+        let service = service_from_uwu_db(db, full_acl(), test_principal())
+            .await
+            .unwrap();
 
         // 验证各端口可用
         let _fs = service.fs_ops();
@@ -230,12 +266,16 @@ mod pg_tests {
 
         // 第一次：创建表
         let db1 = Database::connect(&cfg).await.unwrap();
-        let svc1 = service_from_uwu_db(db1).await.unwrap();
+        let svc1 = service_from_uwu_db(db1, full_acl(), test_principal())
+            .await
+            .unwrap();
         drop(svc1);
 
         // 第二次：不应报错（表已存在）
         let db2 = Database::connect(&cfg).await.unwrap();
-        let svc2 = service_from_uwu_db(db2).await.unwrap();
+        let svc2 = service_from_uwu_db(db2, full_acl(), test_principal())
+            .await
+            .unwrap();
 
         // 验证 NoopVectorIndex 也可正常使用
         let idx = svc2.vector_index();

@@ -2,7 +2,7 @@
 //!
 //! 验证 Skill 执行是否引入知识图谱矛盾，认知置信度是否提升。
 
-use agent_context_db_core::{ContextUri, GraphStore, Result};
+use agent_context_db_core::{ContextUri, GraphStore};
 
 /// 执行记录。
 pub struct Execution {

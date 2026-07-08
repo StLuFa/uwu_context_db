@@ -8,7 +8,7 @@ use crate::intent::QueryIntentClassifier;
 use crate::learning::{RouteOutcome, RouteOutcomeLearning};
 use crate::persistence::{InMemoryKnowledgeNetworkPersistence, KnowledgeNetworkPersistence};
 use crate::planner::{DefaultMeshQueryPlanner, MeshQueryPlanner, PlanningContext};
-use crate::privacy::{DpPolicy, InMemoryPrivacyBudgetLedger, PrivacyGuard};
+use crate::privacy::{DpPolicy, InMemoryPrivacyBudgetLedger, PrivacyGuard, has_k_anonymity};
 use crate::semantic_graph::SemanticCapabilityGraph;
 use crate::topology::TopologyOptimizer;
 use crate::transport::MeshTransport;
@@ -125,6 +125,20 @@ impl FederatedKnowledgeFabric {
             .await?;
         self.semantic_graph
             .boost_candidates(&query.domains, &sketch, &mut candidates);
+        if !has_k_anonymity(candidates.len(), &self.privacy.policy) {
+            self.privacy.budget_ledger.refund(&receipt).await?;
+            return Ok(ProgressiveMeshResult {
+                phase: MeshResultPhase::PartialFast,
+                hits: Vec::new(),
+                confidence: 0.0,
+                missing_peer_count: self
+                    .privacy
+                    .policy
+                    .min_k_anonymity
+                    .saturating_sub(candidates.len()),
+                privacy_receipts: vec![receipt],
+            });
+        }
         let mut route_scores = self
             .trust_router
             .route(candidates, opts.probe_peers.max(opts.fetch_peers));

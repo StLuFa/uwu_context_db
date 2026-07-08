@@ -5,7 +5,7 @@
 //! - AssociativeExpander 是**后处理钩子**，对主计划的输出统一扩边，与 CBO 解耦
 
 use crate::RetrievalHit;
-use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, FsOps, GraphStore, Result};
+use agent_context_db_core::{ContentLevel, ContentPayload, FsOps, GraphStore, Result};
 use std::sync::Arc;
 
 /// 联想扩展器 —— 在向量/类型召回基础上沿联想图扩展。
@@ -77,6 +77,9 @@ impl AssociativeExpander {
                     relevance: hit.relevance * weight,
                     parent_chain: vec![hit.uri.clone()],
                     content_type: None,
+                    metadata: Default::default(),
+                    created_at: None,
+                    updated_at: None,
                 });
             }
         }

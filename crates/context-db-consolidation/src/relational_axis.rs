@@ -35,7 +35,7 @@ impl RelationalAxis {
         &self,
         uris: &[ContextUri],
         kind: Option<RelKind>,
-        max_hops: usize,
+        _max_hops: usize,
     ) -> HashMap<String, Vec<ContextUri>> {
         let graph = match &self.graph {
             Some(g) => g,
@@ -64,7 +64,7 @@ impl RelationalAxis {
 
     /// 可解释性血统：沿 EvidenceOf + DerivedFrom 追溯。
     pub async fn evidence_tree(&self, uri: &ContextUri, max_hops: usize) -> Vec<ContextUri> {
-        let kinds = [RelKind::EvidenceOf, RelKind::DerivedFrom];
+        let _kinds = [RelKind::EvidenceOf, RelKind::DerivedFrom];
         let rels = self
             .expand_relations(&[uri.clone()], Some(RelKind::EvidenceOf), max_hops)
             .await;

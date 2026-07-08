@@ -5,7 +5,7 @@
 //! - **雪崩防护**：`put()` 对 TTL 加 ±10% 均匀分布抖动，避免大批条目同时过期
 //!   触发缓存击穿。
 
-use crate::{ContentLevel, ContentPayload, ContextUri, Result};
+use crate::{ContentLevel, ContentPayload, ContextUri};
 use async_trait::async_trait;
 use moka::policy::Expiry;
 use std::time::{Duration, Instant};

@@ -4,10 +4,11 @@
 //! - Phase2（异步）：语义处理（去重 → L0/L1 生成 → 写 .done 标记）
 
 use agent_context_db_core::{
-    ContentPayload, ContentRepo, ContextEntry, ContextMeta, ContextUri, MediaType, MemoryClass,
+    ContentPayload, ContentRepo, ContentType, ContextEntry, ContextMeta, ContextUri, MediaType,
     MvccVersion, Result, TenantId,
 };
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,6 +55,33 @@ impl SessionCompressorImpl {
     }
 }
 
+fn session_preview(session: &SessionHandle, max_chars: usize) -> String {
+    let mut preview = String::new();
+    for msg in &session.messages {
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        preview.push_str(match msg.role {
+            crate::Role::User => "user: ",
+            crate::Role::Assistant => "assistant: ",
+            crate::Role::System => "system: ",
+            crate::Role::Tool => "tool: ",
+        });
+        preview.push_str(&msg.content);
+        if preview.chars().count() >= max_chars {
+            return preview.chars().take(max_chars).collect();
+        }
+    }
+    preview
+}
+
+fn encode_compressed_jsonl(jsonl: &str) -> String {
+    match zstd::encode_all(jsonl.as_bytes(), 3) {
+        Ok(compressed) => format!("zstd+base64:{}", BASE64.encode(compressed)),
+        Err(_) => format!("plain:{}", jsonl),
+    }
+}
+
 #[async_trait]
 impl SessionCompressor for SessionCompressorImpl {
     async fn commit_phase1(&self, session: &SessionHandle) -> Result<CommitTaskId> {
@@ -75,13 +103,15 @@ impl SessionCompressor for SessionCompressorImpl {
             session.compression_index,
             session.messages.len()
         );
+        let dense_preview = session_preview(session, 2048);
+        let compressed_full = encode_compressed_jsonl(&jsonl);
         let entry = ContextEntry {
             uri: archive_uri.clone(),
             tenant: TenantId(uuid::Uuid::nil()),
             payload: ContentPayload::Text {
                 sparse: abstract_text,
-                dense: jsonl.clone(),
-                full: jsonl,
+                dense: dense_preview,
+                full: compressed_full,
             },
             media_type: MediaType::Text,
             metadata: ContextMeta::default(),
@@ -213,7 +243,7 @@ pub async fn run_full_compression(
                 let _abstract_ = semantic.generate_abstract(&dec.target_uri).await?;
                 memory_diff.adds.push(MemoryChange {
                     uri: dec.target_uri.clone(),
-                    class: dec.class,
+                    content_type: dec.content_type,
                     before: None,
                     after: Some(serde_json::json!({"abstract": _abstract_})),
                     reason: dec.reason.clone(),
@@ -222,7 +252,7 @@ pub async fn run_full_compression(
             ShimAction::Merge => {
                 memory_diff.updates.push(MemoryChange {
                     uri: dec.target_uri.clone(),
-                    class: dec.class,
+                    content_type: dec.content_type,
                     before: None,
                     after: Some(serde_json::json!({"merged": true})),
                     reason: dec.reason.clone(),
@@ -283,7 +313,7 @@ pub async fn run_full_compression(
 #[derive(Debug, Clone)]
 pub struct ShimCandidateAction {
     pub target_uri: ContextUri,
-    pub class: MemoryClass,
+    pub content_type: ContentType,
     pub action: ShimAction,
     pub reason: String,
 }
@@ -295,11 +325,10 @@ pub enum ShimAction {
     Merge,
 }
 
-/// Phase2 记忆提取 trait shim（G.5: 已弃用，建议直接依赖 parse crate）。
+/// Phase2 记忆提取 trait shim。
 ///
 /// 避免 session crate 直接依赖 parse crate。
 /// 实际实现在 context-db-parse crate 中，由 composition root 注入。
-#[deprecated(note = "直接使用 agent-context-db-parse")]
 #[async_trait]
 pub trait MemoryExtractorShim: Send + Sync {
     /// 从归档中提取记忆候选项（返回候选内容列表）。
@@ -309,10 +338,9 @@ pub trait MemoryExtractorShim: Send + Sync {
     async fn deduplicate(&self, candidates: Vec<String>) -> Result<Vec<ShimCandidateAction>>;
 }
 
-/// Phase2 语义处理 trait shim（G.5: 已弃用，建议直接依赖 parse crate）。
+/// Phase2 语义处理 trait shim。
 ///
 /// 避免 session crate 直接依赖 parse crate。
-#[deprecated(note = "直接使用 agent-context-db-parse")]
 #[async_trait]
 pub trait SemanticProcessorShim: Send + Sync {
     /// 为 URI 生成 L0 摘要。
@@ -326,6 +354,7 @@ pub trait SemanticProcessorShim: Send + Sync {
 mod tests {
     use super::*;
     use crate::{Role, SessionMessage};
+    use agent_context_db_core::FsOps;
 
     fn make_session() -> SessionHandle {
         SessionHandle {
@@ -357,6 +386,34 @@ mod tests {
         let uri = SessionCompressorImpl::archive_file_uri(&s);
         assert!(uri.to_string().contains("messages.jsonl"));
         assert!(uri.to_string().contains("/0/"));
+    }
+
+    #[tokio::test]
+    async fn phase1_stores_preview_and_compressed_full_archive() {
+        let store = std::sync::Arc::new(agent_context_db_testkit::MemoryContextStore::new());
+        let compressor = SessionCompressorImpl::new(store.clone());
+        let session = make_session();
+        compressor.commit_phase1(&session).await.unwrap();
+
+        let payload = store
+            .read(
+                &SessionCompressorImpl::archive_file_uri(&session),
+                agent_context_db_core::ContentLevel::L2,
+            )
+            .await
+            .unwrap();
+        let ContentPayload::Text {
+            sparse,
+            dense,
+            full,
+        } = payload
+        else {
+            panic!("expected text payload");
+        };
+        assert!(sparse.contains("compression #0"));
+        assert!(dense.contains("user: hello"));
+        assert!(!dense.contains("{\"role\""));
+        assert!(full.starts_with("zstd+base64:"));
     }
 
     #[test]

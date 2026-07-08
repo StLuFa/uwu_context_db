@@ -41,6 +41,46 @@ impl std::fmt::Display for AgentId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeProvenancePayload {
+    pub publisher: AgentId,
+    pub content: String,
+    pub evidence_uris: Vec<ContextUri>,
+    pub evidence_chain_hash: String,
+    pub quality_score: f32,
+    pub confidence: f32,
+    pub epistemic_type: EpistemicType,
+    pub content_type: ContentType,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeProvenance {
+    pub publisher: AgentId,
+    pub public_key: String,
+    pub signature: String,
+    pub evidence_chain_hash: String,
+    pub signed_at: DateTime<Utc>,
+}
+
+pub fn evidence_chain_hash(evidence_uris: &[ContextUri]) -> String {
+    let mut values = evidence_uris
+        .iter()
+        .map(|uri| uri.as_str().to_string())
+        .collect::<Vec<_>>();
+    values.sort();
+    blake3::hash(values.join("\n").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+pub fn provenance_payload_hash(
+    payload: &KnowledgeProvenancePayload,
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(payload)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BondLevel {
     Observer = 0,
@@ -177,6 +217,7 @@ pub struct PublicationMetadata {
     pub source_uri: Option<ContextUri>,
     pub quality_score: f32,
     pub corroboration: CorroborationProof,
+    pub provenance: Option<KnowledgeProvenance>,
     pub license: LicenseInfo,
     pub epistemic_type: EpistemicType,
     pub content_type: ContentType,

@@ -18,7 +18,7 @@ pub use extractor::MemoryExtractorImpl;
 pub use semantic::SemanticProcessorImpl;
 pub use trajectory::TrajectoryExtractorImpl;
 
-use agent_context_db_core::{ContextUri, MemoryClass, Result};
+use agent_context_db_core::{ContentType, ContextUri, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,7 +49,7 @@ pub trait MemoryExtractor: Send + Sync {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryCandidate {
-    pub class: MemoryClass,
+    pub content_type: ContentType,
     pub content: String,
     pub source_uri: ContextUri,
     pub confidence: f32,
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn dedup_decision_shapes() {
         let c = MemoryCandidate {
-            class: MemoryClass::Preferences,
+            content_type: ContentType::Preference,
             content: "likes dark mode".into(),
             source_uri: ContextUri::parse("uwu://t/user/u/sessions/s1").unwrap(),
             confidence: 0.9,

@@ -55,8 +55,12 @@ pub struct PersistentBudgetCharge {
 
 impl PersistentBudgetCharge {
     pub fn validate(&self) -> Result<()> {
-        let total = self.cost.query_epsilon + self.cost.response_epsilon + self.cost.relay_epsilon;
-        if total.is_finite() && total >= 0.0 {
+        let epsilon = self.cost.rdp.epsilon_delta(self.cost.delta as f64);
+        if epsilon.is_finite()
+            && epsilon >= 0.0
+            && self.cost.delta.is_finite()
+            && self.cost.delta > 0.0
+        {
             Ok(())
         } else {
             Err(KnowledgeNetworkError::PrivacyBudgetExhausted(

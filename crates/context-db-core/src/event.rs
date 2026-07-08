@@ -3,8 +3,7 @@
 //! F5 变更事件流 / EventEmitter / CausalLink 已迁移到 `event_store.rs`
 //! （基于 `uwu_event_mesh`）。
 
-use crate::{ContextEntry, ContextUri, MemoryClass};
-use chrono::{DateTime, Utc};
+use crate::{ContentType, ContextEntry, ContextUri};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -130,7 +129,7 @@ pub struct ContextTemplate {
 pub struct TemplateEntry {
     pub uri_template: String,
     pub abstract_template: String,
-    pub memory_class: Option<MemoryClass>,
+    pub content_type: Option<ContentType>,
 }
 
 /// 模板引擎。
@@ -157,9 +156,7 @@ impl TemplateEngine {
 
             let mut entry =
                 ContextEntry::new_text(uri, crate::TenantId(uuid::Uuid::nil()), abstract_);
-            if let Some(mc) = tpl.memory_class {
-                entry.metadata.memory_class = Some(mc);
-            }
+            entry.metadata.content_type = tpl.content_type;
             entries.push(entry);
         }
         entries
@@ -209,7 +206,7 @@ mod tests {
             entries: vec![TemplateEntry {
                 uri_template: "memories/profile/{name}".into(),
                 abstract_template: "Agent {name} initialized with role {role}".into(),
-                memory_class: Some(MemoryClass::Profile),
+                content_type: Some(ContentType::Profile),
             }],
             defaults: HashMap::from([("role".into(), "assistant".into())]),
         };

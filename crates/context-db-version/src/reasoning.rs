@@ -2,7 +2,7 @@
 //!
 //! 建立在 M2 DAG + 时间旅行基础设施上的高阶分析。
 
-use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, LlmClient, LlmOpts};
+use agent_context_db_core::{ContentLevel, ContextUri, LlmClient, LlmOpts};
 use std::sync::Arc;
 
 use crate::{AsOfTime, CommitId, LogOpts, VersionError, VersionStore};

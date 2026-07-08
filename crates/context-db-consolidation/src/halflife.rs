@@ -3,8 +3,8 @@
 //! 理论根基：放射性衰变 + Anki SM-2 间隔重复。
 //! 巩固时让 LLM 评估 domain volatility / specificity / technological context。
 
-use agent_context_db_core::{LlmClient, LlmError, LlmOpts};
-use chrono::{DateTime, Duration, Utc};
+use agent_context_db_core::{LlmClient, LlmOpts};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::sync::Arc;
 

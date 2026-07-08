@@ -2,13 +2,13 @@
 //!
 //! 每个物理计划节点对应一个算子实现，通过 `PhysicalPlan::execute()` 分发。
 
+use crate::RetrievalHit;
 use crate::planner::{PhysicalPlan, ScopeFilter, VectorFilter};
-use crate::query::{MergeStrategy, Predicate, RelationExpand};
-use crate::{RetrievalHit, RetrievalResult, RetrieveContext};
+use crate::query::{Condition, MergeStrategy, Predicate, Scope, SortKey};
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentType, ContextUri, FsOps, IndexHit, Result, VectorIndex,
+    ContentLevel, ContentPayload, ContentStore, ContentType, ContextEntry, ContextError,
+    ContextUri, FsOps, Result, VectorIndex,
 };
-use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +20,8 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct ExecContext {
     pub fs: Arc<dyn FsOps>,
+    /// 写入/读取主内容端口。WQL 的 metadata 条件需要从这里读取完整条目。
+    pub content: Option<Arc<dyn ContentStore>>,
     pub index: Option<Arc<dyn VectorIndex>>,
     /// 可选的关系图存储（用于图遍历查询）。
     pub graph: Option<Arc<dyn agent_context_db_core::GraphStore>>,
@@ -84,10 +86,13 @@ impl PhysicalPlan {
                 LimitOp::apply(inner, *budget).await
             }
             PhysicalPlan::GraphTraverse {
-                seeds,
+                input,
                 edges,
                 max_hops,
-            } => GraphTraverseOp::execute_traverse(seeds, edges, *max_hops, ctx).await,
+            } => {
+                let seeds = input.execute(ctx).await?;
+                GraphTraverseOp::execute_traverse(seeds, edges, *max_hops, ctx).await
+            }
             PhysicalPlan::Parallel { plans, merge } => {
                 ParallelOp::execute_parallel(plans, *merge, ctx).await
             }
@@ -122,37 +127,13 @@ impl TypeScanOp {
         limit: usize,
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
-        let prefix = match scope {
-            Some(ScopeFilter::UriPrefix(p)) => p.clone(),
-            _ => format!("uwu://t/"),
-        };
-        let _dir_uri = ContextUri::parse(&prefix)?;
-        let entries = ctx.fs.ls(&_dir_uri).await?;
-
-        let hits: Vec<RetrievalHit> = entries
-            .into_iter()
-            .take(limit)
-            .filter(|e| e.content_type == Some(*content_type))
-            .filter_map(|e| {
-                Some(RetrievalHit {
-                    uri: e.uri,
-                    level: ContentLevel::L0,
-                    content: ContentPayload::Text {
-                        sparse: e.abstract_,
-                        dense: String::new(),
-                        full: String::new(),
-                    },
-                    relevance: 0.9,
-                    parent_chain: vec![],
-                    content_type: e.content_type,
-                })
-            })
-            .collect();
-
-        Ok(RecordBatch {
-            records: hits,
-            stats: ExecStats::default(),
-        })
+        let prefix = prefix_for_scope(scope);
+        let mut batch = scan_prefix(&prefix, limit, 0.9, ctx).await?;
+        batch
+            .records
+            .retain(|hit| hit.content_type == Some(*content_type));
+        batch.stats.rows_scanned = batch.records.len();
+        Ok(batch)
     }
 }
 
@@ -161,32 +142,11 @@ pub struct PgPrefixScanOp;
 
 impl PgPrefixScanOp {
     async fn execute_scan(
-        _uri_prefix: &str,
+        uri_prefix: &str,
         limit: usize,
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
-        let dir_uri = ContextUri::parse(_uri_prefix)?;
-        let entries = ctx.fs.ls(&dir_uri).await?;
-        let hits: Vec<RetrievalHit> = entries
-            .into_iter()
-            .take(limit)
-            .map(|e| RetrievalHit {
-                uri: e.uri,
-                level: ContentLevel::L0,
-                content: ContentPayload::Text {
-                    sparse: e.abstract_,
-                    dense: String::new(),
-                    full: String::new(),
-                },
-                relevance: 0.8,
-                parent_chain: vec![],
-                content_type: e.content_type,
-            })
-            .collect();
-        Ok(RecordBatch {
-            records: hits,
-            stats: ExecStats::default(),
-        })
+        scan_prefix(uri_prefix, limit, 0.8, ctx).await
     }
 }
 
@@ -242,6 +202,9 @@ impl VectorSearchOp {
                 relevance: h.score,
                 parent_chain: vec![],
                 content_type: None,
+                metadata: Default::default(),
+                created_at: None,
+                updated_at: None,
             })
             .collect();
 
@@ -269,30 +232,45 @@ impl FilterOp {
     }
 }
 
-fn predicate_matches(_hit: &RetrievalHit, predicate: &Predicate) -> bool {
-    predicate.conditions.iter().all(|c| match c {
-        crate::query::Condition::TypeEquals(ct) => _hit.content_type == Some(*ct),
-        _ => true, // 其他条件在详细实现中处理
-    })
+fn predicate_matches(hit: &RetrievalHit, predicate: &Predicate) -> bool {
+    predicate
+        .conditions
+        .iter()
+        .all(|condition| match condition {
+            Condition::TypeEquals(ct) => hit.content_type == Some(*ct),
+            Condition::ScopeEquals(scope) => scope_matches(&hit.uri, scope),
+            Condition::TimeBetween(start, end) => hit
+                .updated_at
+                .or(hit.created_at)
+                .map(|ts| ts >= *start && ts <= *end)
+                .unwrap_or(false),
+            Condition::TagsContains(tags) => tags
+                .iter()
+                .all(|tag| hit.metadata.tags.iter().any(|existing| existing == tag)),
+            Condition::QualityAbove(min) => hit
+                .metadata
+                .quality_score
+                .map(|score| score >= *min)
+                .unwrap_or(false),
+            Condition::ValidOnly => hit
+                .metadata
+                .validity
+                .as_ref()
+                .map(|validity| validity.invalidated_by.is_none() && validity.valid_until.is_none())
+                .unwrap_or(true),
+        })
 }
 
 /// 排序算子。
 pub struct SortOp;
 
 impl SortOp {
-    async fn apply(mut batch: RecordBatch, key: crate::query::SortKey) -> Result<RecordBatch> {
+    async fn apply(mut batch: RecordBatch, key: SortKey) -> Result<RecordBatch> {
         match key {
-            crate::query::SortKey::Relevance => {
-                batch
-                    .records
-                    .sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
-            }
-            crate::query::SortKey::Natural => {} // 保持原序
-            _ => {
-                batch
-                    .records
-                    .sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
-            }
+            SortKey::Relevance => batch.records.sort_by(compare_relevance),
+            SortKey::Recency => batch.records.sort_by(compare_recency),
+            SortKey::Quality => batch.records.sort_by(compare_quality),
+            SortKey::Natural => {}
         }
         Ok(batch)
     }
@@ -313,35 +291,20 @@ pub struct GraphTraverseOp;
 
 impl GraphTraverseOp {
     async fn execute_traverse(
-        seeds: &[ContextUri],
+        seed_batch: RecordBatch,
         edges: &[crate::query::RelationKind],
         max_hops: usize,
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
         let graph = match &ctx.graph {
             Some(g) => g.clone(),
-            None => {
-                // 无图存储 → 返回 seeds 本身
-                return Ok(RecordBatch {
-                    records: seeds
-                        .iter()
-                        .map(|s| RetrievalHit {
-                            uri: s.clone(),
-                            level: ContentLevel::L0,
-                            content: ContentPayload::Text {
-                                sparse: String::new(),
-                                dense: String::new(),
-                                full: String::new(),
-                            },
-                            relevance: 0.5,
-                            parent_chain: vec![],
-                            content_type: None,
-                        })
-                        .collect(),
-                    stats: ExecStats::default(),
-                });
-            }
+            None => return Ok(seed_batch),
         };
+        let seeds: Vec<ContextUri> = seed_batch
+            .records
+            .iter()
+            .map(|hit| hit.uri.clone())
+            .collect();
 
         // 将 RelationKind 转换为 GraphRelation
         let kinds: Vec<agent_context_db_core::GraphRelation> = edges
@@ -377,7 +340,7 @@ impl GraphTraverseOp {
             })
             .collect();
 
-        match graph.batch_traverse(seeds, &kinds, max_hops).await {
+        match graph.batch_traverse(&seeds, &kinds, max_hops).await {
             Ok(edges_result) => {
                 let hits: Vec<RetrievalHit> = edges_result
                     .into_iter()
@@ -392,6 +355,9 @@ impl GraphTraverseOp {
                         relevance: 0.6,
                         parent_chain: vec![from],
                         content_type: None,
+                        metadata: Default::default(),
+                        created_at: None,
+                        updated_at: None,
                     })
                     .collect();
 
@@ -438,19 +404,18 @@ impl ParallelOp {
             }
         }
 
-        match merge {
-            MergeStrategy::Dedup => {
-                all_hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
-                all_hits.dedup_by(|a, b| a.uri == b.uri);
-            }
+        let merged = match merge {
             MergeStrategy::Union => {
-                all_hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
+                all_hits.sort_by(compare_relevance);
+                all_hits
             }
-            _ => {}
-        }
+            MergeStrategy::Dedup => dedup_best(all_hits),
+            MergeStrategy::Intersect => intersect_hits(all_hits, plans.len()),
+            MergeStrategy::First => all_hits,
+        };
 
         Ok(RecordBatch {
-            records: all_hits,
+            records: merged,
             stats: ExecStats::default(),
         })
     }
@@ -465,59 +430,151 @@ impl FullScanOp {
         limit: usize,
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
-        // 确定扫描范围
-        let prefix = match scope {
-            Some(ScopeFilter::UriPrefix(p)) => p.clone(),
-            Some(ScopeFilter::Agent(a)) => format!("uwu://{a}"),
-            Some(ScopeFilter::Tenant(t)) => format!("uwu://{t}"),
-            None => "uwu://".to_string(),
-        };
+        let prefix = prefix_for_scope(scope);
+        scan_prefix(&prefix, limit, 0.5, ctx).await
+    }
+}
 
-        // 用 FsOps::find 执行扫描
-        let pattern = agent_context_db_core::FindPattern {
-            scope: Some(
-                ContextUri::parse(&prefix).unwrap_or_else(|_| ContextUri::parse("uwu://").unwrap()),
-            ),
+fn prefix_for_scope(scope: &Option<ScopeFilter>) -> String {
+    match scope {
+        Some(ScopeFilter::UriPrefix(prefix)) => prefix.clone(),
+        Some(ScopeFilter::Agent(_)) => "uwu://".to_string(),
+        Some(ScopeFilter::Tenant(tenant)) => format!("uwu://{tenant}"),
+        None => "uwu://".to_string(),
+    }
+}
+
+async fn scan_prefix(
+    prefix: &str,
+    limit: usize,
+    relevance: f32,
+    ctx: &ExecContext,
+) -> Result<RecordBatch> {
+    if let Some(content) = &ctx.content {
+        let entries = content.scan_by_prefix(prefix, limit).await?;
+        let rows_scanned = entries.len();
+        return Ok(RecordBatch {
+            records: entries
+                .into_iter()
+                .map(|entry| hit_from_entry(entry, ContentLevel::L0, relevance))
+                .collect(),
+            stats: ExecStats {
+                rows_scanned,
+                ..Default::default()
+            },
+        });
+    }
+
+    let scope = ContextUri::parse(prefix).map_err(|err| {
+        ContextError::Unsupported(format!(
+            "WQL prefix scan requires ContentStore for non-concrete prefix `{prefix}`: {err}"
+        ))
+    })?;
+    let uris = ctx
+        .fs
+        .find(&agent_context_db_core::FindPattern {
+            scope: Some(scope),
             ..Default::default()
-        };
+        })
+        .await?;
+    let rows_scanned = uris.len().min(limit);
+    let mut records = Vec::with_capacity(rows_scanned);
+    for uri in uris.into_iter().take(limit) {
+        let content = ctx.fs.read(&uri, ContentLevel::L0).await?;
+        records.push(RetrievalHit {
+            uri,
+            level: ContentLevel::L0,
+            content,
+            relevance,
+            parent_chain: Vec::new(),
+            content_type: None,
+            metadata: Default::default(),
+            created_at: None,
+            updated_at: None,
+        });
+    }
+    Ok(RecordBatch {
+        records,
+        stats: ExecStats {
+            rows_scanned,
+            ..Default::default()
+        },
+    })
+}
 
-        match ctx.fs.find(&pattern).await {
-            Ok(uris) => {
-                let count = uris.len().min(limit);
-                let hits: Vec<RetrievalHit> = uris
-                    .into_iter()
-                    .take(limit)
-                    .map(|uri| RetrievalHit {
-                        uri,
-                        level: ContentLevel::L0,
-                        content: ContentPayload::Text {
-                            sparse: String::new(),
-                            dense: String::new(),
-                            full: String::new(),
-                        },
-                        relevance: 0.5,
-                        parent_chain: vec![],
-                        content_type: None,
-                    })
-                    .collect();
+fn hit_from_entry(entry: ContextEntry, level: ContentLevel, relevance: f32) -> RetrievalHit {
+    RetrievalHit {
+        uri: entry.uri,
+        level,
+        content: entry.payload,
+        relevance,
+        parent_chain: Vec::new(),
+        content_type: entry.metadata.content_type,
+        metadata: entry.metadata,
+        created_at: Some(entry.created_at),
+        updated_at: Some(entry.updated_at),
+    }
+}
 
-                Ok(RecordBatch {
-                    records: hits,
-                    stats: ExecStats {
-                        rows_scanned: count,
-                        ..Default::default()
-                    },
-                })
-            }
-            Err(e) => {
-                tracing::warn!(error=%e, "full scan failed");
-                Ok(RecordBatch {
-                    records: vec![],
-                    stats: ExecStats::default(),
-                })
-            }
+fn scope_matches(uri: &ContextUri, scope: &Scope) -> bool {
+    match scope {
+        Scope::All => true,
+        Scope::Tenant(tenant) => uri.tenant() == tenant,
+        Scope::Agent(agent) => {
+            let segments = uri.segments();
+            segments
+                .windows(2)
+                .any(|pair| pair[0] == "agent" && pair[1] == *agent)
         }
     }
+}
+
+fn compare_relevance(a: &RetrievalHit, b: &RetrievalHit) -> std::cmp::Ordering {
+    b.relevance
+        .partial_cmp(&a.relevance)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn compare_recency(a: &RetrievalHit, b: &RetrievalHit) -> std::cmp::Ordering {
+    b.updated_at
+        .or(b.created_at)
+        .cmp(&a.updated_at.or(a.created_at))
+        .then_with(|| compare_relevance(a, b))
+}
+
+fn compare_quality(a: &RetrievalHit, b: &RetrievalHit) -> std::cmp::Ordering {
+    b.metadata
+        .quality_score
+        .partial_cmp(&a.metadata.quality_score)
+        .unwrap_or_else(|| compare_relevance(a, b))
+}
+
+fn dedup_best(mut hits: Vec<RetrievalHit>) -> Vec<RetrievalHit> {
+    hits.sort_by(compare_relevance);
+    hits.dedup_by(|a, b| a.uri == b.uri);
+    hits
+}
+
+fn intersect_hits(hits: Vec<RetrievalHit>, required_count: usize) -> Vec<RetrievalHit> {
+    use std::collections::HashMap;
+    let mut grouped: HashMap<ContextUri, (usize, RetrievalHit)> = HashMap::new();
+    for hit in hits {
+        grouped
+            .entry(hit.uri.clone())
+            .and_modify(|(count, best)| {
+                *count += 1;
+                if hit.relevance > best.relevance {
+                    *best = hit.clone();
+                }
+            })
+            .or_insert((1, hit));
+    }
+    let mut out: Vec<_> = grouped
+        .into_iter()
+        .filter_map(|(_, (count, hit))| (count == required_count).then_some(hit))
+        .collect();
+    out.sort_by(compare_relevance);
+    out
 }
 
 /// 连接算子。
@@ -537,5 +594,111 @@ impl JoinOp {
     async fn nested_loop(l: RecordBatch, r: RecordBatch) -> Result<RecordBatch> {
         // 简单合并 + 去重
         JoinOp::hash_join(l, r).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::query_to_logical;
+    use crate::planner::CboOptimizer;
+    use crate::query::{Condition, MergeStrategy, Predicate, Query, SortKey};
+    use agent_context_db_core::{ContentRepo, TenantId};
+    use agent_context_db_testkit::MemoryContextStore;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn entry(uri: &str, text: &str, content_type: ContentType, quality: f32) -> ContextEntry {
+        let mut entry =
+            ContextEntry::new_text(ContextUri::parse(uri).unwrap(), TenantId(Uuid::nil()), text);
+        entry.metadata.content_type = Some(content_type);
+        entry.metadata.quality_score = Some(quality);
+        entry.metadata.tags = vec!["p2".into()];
+        entry
+    }
+
+    #[tokio::test]
+    async fn wql_executes_filters_sort_and_composite_merge() {
+        let store = Arc::new(MemoryContextStore::new());
+        ContentRepo::write(
+            store.as_ref(),
+            entry(
+                "uwu://t/agent/a/memories/fact/high",
+                "high quality fact",
+                ContentType::Fact,
+                0.95,
+            ),
+        )
+        .await
+        .unwrap();
+        ContentRepo::write(
+            store.as_ref(),
+            entry(
+                "uwu://t/agent/a/memories/fact/low",
+                "low quality fact",
+                ContentType::Fact,
+                0.40,
+            ),
+        )
+        .await
+        .unwrap();
+        ContentRepo::write(
+            store.as_ref(),
+            entry(
+                "uwu://t/agent/a/memories/error/e1",
+                "error evidence",
+                ContentType::Error,
+                0.80,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let fact_query = Query::Find {
+            scope: Some(ContextUri::parse("uwu://t/agent/a/memories").unwrap()),
+            predicate: Predicate::new()
+                .with(Condition::TypeEquals(ContentType::Fact))
+                .with(Condition::QualityAbove(0.9)),
+            budget: 10,
+            order: SortKey::Quality,
+            expand: None,
+        };
+        let error_query = Query::Find {
+            scope: Some(ContextUri::parse("uwu://t/agent/a/memories").unwrap()),
+            predicate: Predicate::new().with(Condition::TypeEquals(ContentType::Error)),
+            budget: 10,
+            order: SortKey::Natural,
+            expand: None,
+        };
+        let composite = Query::Composite {
+            queries: vec![fact_query, error_query],
+            merge: MergeStrategy::Union,
+        };
+
+        let optimizer = CboOptimizer::new(Arc::new(crate::planner::StatisticsCollector::new()));
+        let physical = optimizer.optimize(&query_to_logical(&composite));
+        let ctx = ExecContext {
+            fs: store.clone(),
+            content: Some(store),
+            index: None,
+            graph: None,
+        };
+        let batch = physical.execute(&ctx).await.unwrap();
+        let uris: Vec<_> = batch
+            .records
+            .iter()
+            .map(|hit| hit.uri.to_string())
+            .collect();
+
+        assert_eq!(uris.len(), 2);
+        assert!(uris.contains(&"uwu://t/agent/a/memories/fact/high".to_string()));
+        assert!(uris.contains(&"uwu://t/agent/a/memories/error/e1".to_string()));
+        assert!(!uris.contains(&"uwu://t/agent/a/memories/fact/low".to_string()));
+        assert!(
+            batch
+                .records
+                .iter()
+                .all(|hit| hit.metadata.quality_score.is_some())
+        );
     }
 }

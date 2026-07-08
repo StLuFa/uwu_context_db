@@ -3,7 +3,8 @@
 //! 理论根基：反思的语义梯度 —— 不只是记录"失败了"，
 //! 而是用 LLM 分析"为什么失败"、"应该怎么做"、"涉及哪些认识论类型"。
 
-use agent_context_db_core::{ContentType, ContextUri, EpistemicType, LlmClient, LlmOpts, Result};
+use crate::voting::{EvolutionReport, EvolvableInsight, InsightEvolutionEngine};
+use agent_context_db_core::{ContentType, ContextUri, LlmClient, LlmOpts};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -22,6 +23,25 @@ pub struct SemanticGradient {
     pub source_uri: Option<ContextUri>,
     /// 改进优先级（0-1，越高越紧急）。
     pub priority: f32,
+}
+
+/// 失败轨迹样本，用于 Reflexion loop。
+#[derive(Debug, Clone)]
+pub struct FailureTrace {
+    pub task_description: String,
+    pub failed_step: String,
+    pub error_message: String,
+    pub relevant_knowledge: Vec<String>,
+    pub trace: Vec<String>,
+}
+
+/// Reflexion + ExpeL 的一次闭环结果。
+#[derive(Debug, Clone)]
+pub struct ReflexionEvolutionResult {
+    pub gradients: Vec<SemanticGradient>,
+    pub insights: Vec<EvolvableInsight>,
+    pub report: EvolutionReport,
+    pub training_guidance: Vec<String>,
 }
 
 /// LLM 驱动的反思生成器。
@@ -143,11 +163,53 @@ Output a JSON object with:
         &self,
         failures: &[(String, String, String, Vec<String>, Vec<String>)],
     ) -> Vec<SemanticGradient> {
+        let traces: Vec<FailureTrace> = failures
+            .iter()
+            .map(|(task, step, err, knowledge, trace)| FailureTrace {
+                task_description: task.clone(),
+                failed_step: step.clone(),
+                error_message: err.clone(),
+                relevant_knowledge: knowledge.clone(),
+                trace: trace.clone(),
+            })
+            .collect();
+        self.reflect_failures(&traces).await
+    }
+
+    /// Reflexion：失败轨迹 → 语义梯度。
+    pub async fn reflect_failures(&self, failures: &[FailureTrace]) -> Vec<SemanticGradient> {
         let mut results = Vec::new();
-        for (task, step, err, knowledge, trace) in failures {
-            results.push(self.reflect(task, step, err, knowledge, trace).await);
+        for failure in failures {
+            results.push(
+                self.reflect(
+                    &failure.task_description,
+                    &failure.failed_step,
+                    &failure.error_message,
+                    &failure.relevant_knowledge,
+                    &failure.trace,
+                )
+                .await,
+            );
         }
         results
+    }
+
+    /// Reflexion + ExpeL：失败轨迹 → 语义梯度 → 可投票演化 insight。
+    pub async fn evolve_failures(
+        &self,
+        failures: &[FailureTrace],
+        existing: &mut Vec<EvolvableInsight>,
+        evolution: &InsightEvolutionEngine,
+    ) -> ReflexionEvolutionResult {
+        let gradients = self.reflect_failures(failures).await;
+        let report = evolution.evolve_from_gradients(existing, &gradients);
+        let training_guidance = Self::to_training_guidance(&gradients);
+        ReflexionEvolutionResult {
+            gradients,
+            insights: existing.clone(),
+            report,
+            training_guidance,
+        }
     }
 
     /// 将反思结果编码为改进后的训练轨迹（用于下轮 CDT）。
@@ -169,6 +231,41 @@ Output a JSON object with:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_context_db_core::{JsonSchema, LlmError};
+    use async_trait::async_trait;
+
+    struct FailingLlm;
+
+    #[async_trait]
+    impl LlmClient for FailingLlm {
+        async fn complete(
+            &self,
+            _prompt: &str,
+            _opts: &LlmOpts,
+        ) -> std::result::Result<String, LlmError> {
+            Err(LlmError::Provider("fail".into()))
+        }
+
+        async fn complete_json(
+            &self,
+            _prompt: &str,
+            _schema: &JsonSchema,
+            _opts: &LlmOpts,
+        ) -> std::result::Result<String, LlmError> {
+            Err(LlmError::Provider("fail".into()))
+        }
+
+        async fn embed(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<agent_context_db_core::EmbeddingVector, LlmError> {
+            Ok(agent_context_db_core::EmbeddingVector::new(
+                vec![0.0; 8],
+                "test",
+                1,
+            ))
+        }
+    }
 
     #[test]
     fn heuristic_produces_valid_gradient() {
@@ -199,5 +296,26 @@ mod tests {
         let guidance = ReflectionGenerator::to_training_guidance(&[g]);
         assert!(guidance[0].contains("REFLECTION"));
         assert!(guidance[0].contains("ACTION"));
+    }
+
+    #[tokio::test]
+    async fn evolve_failures_creates_insights_and_guidance() {
+        let generator = ReflectionGenerator::new(Arc::new(FailingLlm));
+        let failures = vec![FailureTrace {
+            task_description: "deploy app".into(),
+            failed_step: "kubectl apply".into(),
+            error_message: "connection timeout".into(),
+            relevant_knowledge: vec!["k8s deploy".into()],
+            trace: vec!["build".into(), "apply".into()],
+        }];
+        let mut insights = Vec::new();
+        let evolution = InsightEvolutionEngine::new();
+        let result = generator
+            .evolve_failures(&failures, &mut insights, &evolution)
+            .await;
+        assert_eq!(result.gradients.len(), 1);
+        assert_eq!(result.report.added, 1);
+        assert_eq!(result.insights.len(), 1);
+        assert_eq!(result.training_guidance.len(), 1);
     }
 }

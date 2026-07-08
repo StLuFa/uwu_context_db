@@ -6,7 +6,7 @@
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
 use agent_context_db_core::{
-    JsonSchema, LlmClient, LlmError, LlmOpts,
+    EmbeddingVector, JsonSchema, LlmClient, LlmError, LlmOpts,
     config::{LlmConfig, UwuConfig},
 };
 use async_trait::async_trait;
@@ -146,7 +146,7 @@ impl LlmClient for OpenAiLlmClient {
         self.inner.complete(prompt, opts).await
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+    async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         self.inner.embed(text).await
     }
 
@@ -192,7 +192,7 @@ impl LlmClient for GenericHttpLlmClient {
         self.inner.complete(prompt, opts).await
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+    async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         self.inner.embed(text).await
     }
 
@@ -253,7 +253,7 @@ impl AnthropicLlmClient {
         .await
     }
 
-    async fn embed_via_configured_endpoint(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+    async fn embed_via_configured_endpoint(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         let base_url = self.config.embedding_base_url.as_ref().ok_or_else(|| {
             LlmError::Provider(
                 "anthropic does not expose a first-party embedding endpoint; set embedding_base_url for an OpenAI-compatible embedding service".into(),
@@ -270,7 +270,7 @@ impl AnthropicLlmClient {
         let headers = bearer_headers(&self.config.headers, self.config.api_key()?.as_deref())?;
         let body = json!({ "model": model, "input": text });
         let value = post_json(&self.client, &join_url(base_url, path), headers, body).await?;
-        extract_embedding(&value)
+        extract_embedding(&value, model)
     }
 }
 
@@ -287,7 +287,7 @@ impl LlmClient for AnthropicLlmClient {
         extract_anthropic_text(&value)
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+    async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         self.embed_via_configured_endpoint(text).await
     }
 
@@ -365,7 +365,7 @@ impl OpenAiCompatibleClient {
         extract_openai_text(&value)
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+    async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         let model = self
             .config
             .embedding_model
@@ -373,7 +373,7 @@ impl OpenAiCompatibleClient {
             .unwrap_or(DEFAULT_OPENAI_EMBEDDING_MODEL);
         let body = json!({ "model": model, "input": text });
         let value = self.post_embeddings(body).await?;
-        extract_embedding(&value)
+        extract_embedding(&value, model)
     }
 
     fn chat_body(&self, prompt: &str, opts: &LlmOpts, response_format: Option<Value>) -> Value {
@@ -553,19 +553,20 @@ fn extract_anthropic_tool_json(value: &Value) -> Result<String, LlmError> {
     Ok(input.to_string())
 }
 
-fn extract_embedding(value: &Value) -> Result<Vec<f32>, LlmError> {
+fn extract_embedding(value: &Value, model_id: &str) -> Result<EmbeddingVector, LlmError> {
     let array = value
         .pointer("/data/0/embedding")
         .and_then(Value::as_array)
         .ok_or_else(|| LlmError::Provider(format!("missing embedding vector: {value}")))?;
-    array
+    let vector: Vec<f32> = array
         .iter()
         .map(|v| {
             v.as_f64()
                 .map(|n| n as f32)
                 .ok_or_else(|| LlmError::Provider(format!("non-number embedding value: {v}")))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(EmbeddingVector::new(vector, model_id, 1))
 }
 
 #[cfg(test)]
@@ -590,6 +591,10 @@ mod tests {
     #[test]
     fn parses_embedding() {
         let value = json!({"data":[{"embedding":[0.5,-1.25]}]});
-        assert_eq!(extract_embedding(&value).unwrap(), vec![0.5, -1.25]);
+        let embedding = extract_embedding(&value, "text-embedding-test").unwrap();
+        assert_eq!(embedding.vector, vec![0.5, -1.25]);
+        assert_eq!(embedding.model_id, "text-embedding-test");
+        assert_eq!(embedding.dim, 2);
+        assert_eq!(embedding.version, 1);
     }
 }

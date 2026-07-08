@@ -1,7 +1,7 @@
 //! ConflictResolver — 多维证据对比 + LLM 仲裁 + Resolution 类型。
 
 use crate::marketplace::types::*;
-use agent_context_db_core::{ContextUri, LlmClient, LlmOpts};
+use agent_context_db_core::{LlmClient, LlmOpts};
 use std::sync::Arc;
 
 /// 冲突 — 两个 MarketEntry 对同一事实给出矛盾结论。

@@ -24,7 +24,7 @@ let idx: Arc<dyn VectorIndex> = service.vector_index();
 
 ```sql
 context_entries (uri PK, tenant_id, l0_abstract, l1_overview, l2_detail_ref,
-                 content_type, memory_class, state_scope, tags JSONB, custom JSONB,
+                 content_type, state_scope, tags JSONB, custom JSONB,
                  mvcc_version, created_at, updated_at)
 context_versions (uri + mvcc_version PK, entry_json JSONB, ...)
 ```

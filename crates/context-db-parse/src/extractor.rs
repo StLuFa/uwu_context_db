@@ -2,7 +2,7 @@
 //!
 //! 依赖 core 的 `LlmClient` 端口进行语义处理。
 
-use agent_context_db_core::{ContextUri, LlmClient, LlmOpts, MemoryClass, Result};
+use agent_context_db_core::{ContentType, ContextUri, LlmClient, LlmOpts, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ impl MemoryExtractor for MemoryExtractorImpl {
 extract structured memories across 8 categories.
 
 Return a JSON array of objects with:
-- "class": one of ["profile", "preferences", "entities", "events", "cases", "patterns", "tools", "skills"]
+- "content_type": one of ["fact", "belief", "hypothesis", "heuristic", "procedure", "preference", "profile", "goal", "skill", "reflection", "evidence", "error", "meta"]
 - "content": a concise description (1-2 sentences)
 - "confidence": a float 0.0-1.0
 
@@ -50,7 +50,7 @@ Only include entries with confidence > 0.5.
         let candidates: Vec<MemoryCandidate> =
             serde_json::from_str(&response).unwrap_or_else(|_| {
                 vec![MemoryCandidate {
-                    class: MemoryClass::Cases,
+                    content_type: ContentType::Error,
                     content: response.chars().take(200).collect(),
                     source_uri: archive.clone(),
                     confidence: 0.5,

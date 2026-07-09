@@ -10,7 +10,7 @@ use agent_context_db_core::{ContentPayload, ContentType, ContextEntry, StateScop
 use agent_context_db_knowledge_network::types::{
     FederatedQueryIntent, FederationReturnMode, MeshDiscoveryOpts,
 };
-use agent_context_db_marketplace_types::{CorroborationLevel, DiscoveryQuery, MarketEntryType};
+use agent_context_db_marketplace::{CorroborationLevel, DiscoveryQuery, MarketEntryType};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -25,11 +25,11 @@ pub enum QualityDim {
     Consensus,
 }
 
-pub struct QualityScorer {
+pub struct ConsolidationQualityScorer {
     weights: HashMap<QualityDim, f32>,
 }
 
-impl QualityScorer {
+impl ConsolidationQualityScorer {
     pub fn new() -> Self {
         let mut w = HashMap::new();
         w.insert(QualityDim::Adoption, 0.20);
@@ -56,7 +56,7 @@ impl QualityScorer {
     }
 }
 
-impl Default for QualityScorer {
+impl Default for ConsolidationQualityScorer {
     fn default() -> Self {
         Self::new()
     }

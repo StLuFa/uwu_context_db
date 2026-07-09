@@ -1,5 +1,5 @@
 use crate::types::{KnowledgeNetworkError, PrivateQuerySketch, Result};
-use agent_context_db_marketplace_types::{AgentId, DiscoveryQuery};
+use agent_context_db_marketplace::{AgentId, DiscoveryQuery};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
@@ -452,8 +452,7 @@ mod tests {
             domains: vec!["rust".into()],
             entry_types: vec![],
             min_quality: 0.5,
-            min_corroboration_level:
-                agent_context_db_marketplace_types::CorroborationLevel::Unverified,
+            min_corroboration_level: agent_context_db_marketplace::CorroborationLevel::Unverified,
             license_compatible: true,
         }
     }

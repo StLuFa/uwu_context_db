@@ -3,7 +3,7 @@
 //! 高影响力 = 被多 Agent 采纳/引用。
 //! 高介数中心性 = 桥梁知识（连接不同领域）。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use std::collections::HashMap;
 
 /// 影响力分数。

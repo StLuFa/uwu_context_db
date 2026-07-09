@@ -10,7 +10,7 @@ members = [
     "crates/context-db-wiki",
     "crates/context-db-testkit",
     "crates/context-db-cdt",
-    "crates/context-db-marketplace-types",
+    "crates/context-db-marketplace",
     "crates/context-db-consolidation",
     "crates/context-db-knowledge-network",
     "crates/context-db-nats",

@@ -1,4 +1,4 @@
-use agent_context_db_marketplace_types::{AgentId, FederatedDiscoveryHit, MarketId};
+use agent_context_db_marketplace::{AgentId, FederatedDiscoveryHit, MarketId};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 

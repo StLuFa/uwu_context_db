@@ -1,5 +1,5 @@
 use crate::types::{FederatedQueryIntent, FederationReturnMode, MeshDiscoveryOpts};
-use agent_context_db_marketplace_types::DiscoveryQuery;
+use agent_context_db_marketplace::DiscoveryQuery;
 
 #[derive(Debug, Clone)]
 pub struct QueryIntentClassifier {

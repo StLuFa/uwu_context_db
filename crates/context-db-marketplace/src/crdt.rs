@@ -2,8 +2,8 @@
 //!
 //! 基于 uwu-crdt 的 LwwMap 原语，加上 LLM 用于 principle 冲突的语义仲裁。
 
-use crate::marketplace::types::*;
-use agent_context_db_core::{LlmClient, LlmOpts};
+use crate::types::*;
+use agent_context_db_core::{LlmClient, LlmOpts, LlmTaskKind, PromptOptimization};
 use std::sync::Arc;
 
 /// Patch 集 — Agent 对 MarketEntry 的修改。
@@ -29,11 +29,11 @@ pub struct MergedPatch {
     pub confidence: f32,
     pub quality_score: f32,
     pub conflicts_resolved: usize,
-    pub strategy: MergeStrategy,
+    pub strategy: CrdtMergeStrategy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeStrategy {
+pub enum CrdtMergeStrategy {
     /// 用 uwu-crdt LwwMap + SetUnion 自动合并。
     AutoCrdt,
     /// LLM 仲裁。
@@ -93,26 +93,26 @@ impl SemanticCrdtMerger {
 
         // 5. principle: 对比冲突
         let (principle, strategy, conflicts) = match (&local.principle, &remote.principle) {
-            (Some(lp), Some(rp)) if lp == rp => (lp.clone(), MergeStrategy::FastForward, 0),
+            (Some(lp), Some(rp)) if lp == rp => (lp.clone(), CrdtMergeStrategy::FastForward, 0),
             (Some(lp), Some(rp)) => {
                 // 冲突 → LLM 仲裁或取高 clock 的
                 if let Some(ref llm) = self.llm {
                     match self.llm_arbitrate(llm, lp, rp, local, remote).await {
-                        Some(merged) => (merged, MergeStrategy::LlmArbitrated, 1),
+                        Some(merged) => (merged, CrdtMergeStrategy::LlmArbitrated, 1),
                         None => {
                             // LLM 仲裁失败 → LWW (高 clock 胜)
                             let winner = if local.clock >= remote.clock { lp } else { rp };
-                            (winner.clone(), MergeStrategy::AutoCrdt, 1)
+                            (winner.clone(), CrdtMergeStrategy::AutoCrdt, 1)
                         }
                     }
                 } else {
                     let winner = if local.clock >= remote.clock { lp } else { rp };
-                    (winner.clone(), MergeStrategy::AutoCrdt, 1)
+                    (winner.clone(), CrdtMergeStrategy::AutoCrdt, 1)
                 }
             }
-            (Some(lp), None) => (lp.clone(), MergeStrategy::FastForward, 0),
-            (None, Some(rp)) => (rp.clone(), MergeStrategy::FastForward, 0),
-            (None, None) => (String::new(), MergeStrategy::FastForward, 0),
+            (Some(lp), None) => (lp.clone(), CrdtMergeStrategy::FastForward, 0),
+            (None, Some(rp)) => (rp.clone(), CrdtMergeStrategy::FastForward, 0),
+            (None, None) => (String::new(), CrdtMergeStrategy::FastForward, 0),
         };
 
         MergedPatch {
@@ -160,6 +160,10 @@ Return ONLY the merged principle text, no JSON, no markup."#,
             &LlmOpts {
                 max_tokens: Some(256),
                 temperature: Some(0.0),
+                task: LlmTaskKind::Merge,
+                prompt: PromptOptimization::default()
+                    .force_cache()
+                    .target_tokens(900),
                 ..Default::default()
             },
         )

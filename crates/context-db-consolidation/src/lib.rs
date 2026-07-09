@@ -18,7 +18,6 @@ pub mod guard;
 pub mod halflife;
 pub mod lineage;
 pub mod loader;
-pub mod marketplace;
 pub mod opportunity;
 pub mod patcher;
 pub mod quality;
@@ -34,8 +33,9 @@ use agent_context_db_core::{
     LlmClient, LlmOpts, Result, StateScope, ValidityRecord,
 };
 use agent_context_db_knowledge_network::identity::IdentityRegistry;
-use agent_context_db_marketplace_types::{
-    AgentId, KnowledgeProvenance, KnowledgeProvenancePayload, evidence_chain_hash,
+use agent_context_db_marketplace::{
+    AgentId, KnowledgeProvenance, KnowledgeProvenancePayload, PublishableProduct,
+    evidence_chain_hash,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub struct ConsolidationProduct {
     pub expected_outcome: Option<String>,
     pub related_policy_uris: Vec<ContextUri>,
     pub provenance: Option<KnowledgeProvenance>,
-    pub metadata: ConsolidationMeta,
+    pub metadata: ConsolidationProductMeta,
 }
 
 impl ConsolidationProduct {
@@ -97,6 +97,40 @@ impl ConsolidationProduct {
     }
 }
 
+impl PublishableProduct for ConsolidationProduct {
+    fn quality_score(&self) -> f32 {
+        self.quality_score
+    }
+
+    fn content(&self) -> &str {
+        &self.content
+    }
+
+    fn content_type(&self) -> ContentType {
+        self.content_type
+    }
+
+    fn evidence_uris(&self) -> &[ContextUri] {
+        &self.evidence_uris
+    }
+
+    fn confidence(&self) -> f32 {
+        self.confidence
+    }
+
+    fn provenance(&self) -> Option<KnowledgeProvenance> {
+        self.provenance.clone()
+    }
+
+    fn epistemic_type(&self) -> EpistemicType {
+        self.epistemic_type
+    }
+
+    fn half_life_days(&self) -> Option<f64> {
+        self.metadata.half_life_days
+    }
+}
+
 /// 假设验证结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HypothesisOutcome {
@@ -107,7 +141,7 @@ pub enum HypothesisOutcome {
 
 /// 巩固元数据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsolidationMeta {
+pub struct ConsolidationProductMeta {
     pub source_session: Option<String>,
     pub generation: usize,
     pub status: ConsolidationStatus,
@@ -531,7 +565,7 @@ Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup).
             expected_outcome: None,
             related_policy_uris: vec![],
             provenance: None,
-            metadata: ConsolidationMeta {
+            metadata: ConsolidationProductMeta {
                 source_session: None,
                 generation: 1,
                 status: ConsolidationStatus::InProgress,
@@ -1132,7 +1166,7 @@ impl SleeptimeExecutor {
                             expected_outcome: None,
                             related_policy_uris: vec![],
                             provenance: None,
-                            metadata: ConsolidationMeta {
+                            metadata: ConsolidationProductMeta {
                                 source_session: None,
                                 generation: 0,
                                 status: ConsolidationStatus::Pending,
@@ -1210,7 +1244,7 @@ impl SleeptimeExecutor {
                             expected_outcome: None,
                             related_policy_uris: vec![],
                             provenance: None,
-                            metadata: ConsolidationMeta {
+                            metadata: ConsolidationProductMeta {
                                 source_session: None,
                                 generation: 0,
                                 status: ConsolidationStatus::Pending,

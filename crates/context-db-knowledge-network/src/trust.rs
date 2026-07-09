@@ -1,5 +1,5 @@
 use crate::capability::PeerCandidate;
-use agent_context_db_marketplace_types::{AgentId, BondLevel};
+use agent_context_db_marketplace::{AgentId, BondLevel};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 

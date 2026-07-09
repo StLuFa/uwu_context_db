@@ -3,7 +3,7 @@
 //! C (Consistency) / A (Availability) / P (Partition tolerance) 的工程化应用：
 //! 不同类型的知识需要不同的一致性保证。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use agent_context_db_core::{ContentType, EpistemicType};
 
 /// 一致性级别。

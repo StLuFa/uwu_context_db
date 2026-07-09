@@ -1,5 +1,5 @@
 use crate::types::{KnowledgeNetworkError, Result};
-use agent_context_db_marketplace_types::AgentId;
+use agent_context_db_marketplace::AgentId;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

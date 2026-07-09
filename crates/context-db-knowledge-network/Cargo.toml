@@ -6,7 +6,7 @@ description = "Privacy-preserving federated KnowledgeNetwork for context-db"
 
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
-agent-context-db-marketplace-types = { path = "../context-db-marketplace-types" }
+agent-context-db-marketplace = { path = "../context-db-marketplace" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = "2"

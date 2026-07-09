@@ -2,7 +2,7 @@ use crate::capability::CapabilitySketch;
 use crate::learning::RouteLearningState;
 use crate::privacy::{BudgetScope, PrivacyCost, PrivacyReceipt};
 use crate::types::{KnowledgeNetworkError, Result};
-use agent_context_db_marketplace_types::AgentId;
+use agent_context_db_marketplace::AgentId;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;

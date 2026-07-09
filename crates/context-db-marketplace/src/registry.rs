@@ -3,19 +3,10 @@
 //! 每个 Agent 维护自己的 registry shard，无中心目录。
 //! 联邦查询通过 EventMesh broadcast + 各 shard 返回匹配结果。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use agent_context_db_core::{EventMesh, Topic, VectorIndex};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// 同伴信息。
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
-    pub agent_id: AgentId,
-    pub domains: Vec<String>,
-    pub bond_level: BondLevel,
-    pub last_seen: chrono::DateTime<chrono::Utc>,
-}
 
 /// 联邦注册表 — 三注册合一，每个 Agent 独立维护。
 pub struct FederatedRegistry {

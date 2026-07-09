@@ -1,5 +1,5 @@
 use crate::types::{FederationRole, PrivateQuerySketch, Result};
-use agent_context_db_marketplace_types::{AgentId, MarketEntryType};
+use agent_context_db_marketplace::{AgentId, MarketEntryType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;

@@ -3,13 +3,14 @@
 //! 流程：Query DSL → LogicalPlan → CBO 优化 → PhysicalPlan → 执行。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentStore, ContentType, ContextError, ContextUri, FsOps,
-    GraphStore, LlmClient, Result, VectorIndex,
+    ContentLevel, ContentStore, ContentType, ContextError, ContextUri, FsOps, GraphStore,
+    LlmClient, Result, VectorIndex,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::Instrument;
 
+use crate::budget::load_hits_within_budget;
 use crate::compiler::query_to_logical;
 use crate::intent::RuleBasedIntentAnalyzer;
 use crate::operators::ExecContext;
@@ -329,45 +330,9 @@ fn plan_cache_key(kind: &str, payload: &[u8]) -> Vec<u8> {
 // Budget loading
 // ===========================================================================
 
-fn load_within_budget(mut hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
-    let mut tokens = 0;
-    let mut result = Vec::new();
-    hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
-    for hit in hits {
-        let cost = estimate_tokens(&hit.content);
-        if tokens + cost <= budget {
-            tokens += cost;
-            result.push(hit);
-        } else {
-            // 降级到 L0
-            let l0_text = hit.content.sparse_text().to_string();
-            let l0_cost = l0_text.len() / 4;
-            if tokens + l0_cost <= budget {
-                tokens += l0_cost;
-                result.push(RetrievalHit {
-                    level: ContentLevel::L0,
-                    content: ContentPayload::Text {
-                        sparse: l0_text.clone(),
-                        dense: l0_text.clone(),
-                        full: l0_text,
-                    },
-                    ..hit
-                });
-            }
-        }
-    }
-    (result, tokens)
-}
-
-fn estimate_tokens(content: &ContentPayload) -> usize {
-    match content {
-        ContentPayload::Text {
-            sparse,
-            dense: _,
-            full: _,
-        } => std::cmp::max(sparse.len() / 4, 100),
-        _ => 100,
-    }
+fn load_within_budget(hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
+    let plan = load_hits_within_budget(hits, budget);
+    (plan.hits, plan.tokens_used)
 }
 
 // ===========================================================================

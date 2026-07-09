@@ -20,8 +20,8 @@ pub mod vector_index;
 
 // Re-export core vector types（来源统一）
 pub use agent_context_db_core::{
-    AclProtectedStore, IndexHit, IndexPoint, PathAcl, Principal, VectorIndex, WatchHub,
-    WatchSource, WatchableStore,
+    AclProtectedStore, IndexHit, IndexPoint, PathAcl, Principal, SemanticWriteDedupStore,
+    VectorIndex, WatchHub, WatchSource, WatchableStore,
 };
 
 pub use migrations::context_db_migrations;
@@ -105,7 +105,9 @@ pub async fn service_from_uwu_db(
     db: uwu_database::Database,
     acl: Arc<PathAcl>,
     principal: Principal,
-) -> Result<ContextDbService<WatchableStore<AclProtectedStore<PgContextStore>>>> {
+) -> Result<
+    ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<PgContextStore>>>>,
+> {
     // 1. 应用迁移
     let mut migrator = uwu_database::Migrator::new();
     for m in context_db_migrations() {
@@ -115,9 +117,13 @@ pub async fn service_from_uwu_db(
         agent_context_db_core::ContextError::Storage(format!("migration failed: {e}"))
     })?;
 
-    // 2. 构造带 ACL 的内容层适配器
+    // 2. 构造内容层适配器：ACL 后先做写入前语义去重，再发布 watch 事件。
     let content = Arc::new(WatchableStore::new(
-        AclProtectedStore::new(PgContextStore::new(Arc::new(db.pool)), acl, principal),
+        SemanticWriteDedupStore::new(AclProtectedStore::new(
+            PgContextStore::new(Arc::new(db.pool)),
+            acl,
+            principal,
+        )),
         Arc::new(WatchHub::default()),
     ));
 

@@ -401,64 +401,54 @@ impl ParallelGenerator {
         results
     }
 
-    /// 并行生成多个 embedding，并按 blake3(content) 缓存去重。
+    /// 批量生成 embedding，并按 blake3(content) 缓存去重。
     pub async fn batch_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        let mut misses: HashMap<String, String> = HashMap::new();
+        let mut missing_hashes = Vec::new();
+        let mut missing_texts = Vec::new();
+        let mut missing_index_by_hash = HashMap::new();
 
         for (idx, text) in texts.iter().enumerate() {
             let hash = embedding_content_hash(text);
             if let Some(embedding) = self.embed_cache.get(&hash).await {
                 results[idx] = Some(embedding);
+            } else if let Some(first_missing_idx) = missing_index_by_hash.get(&hash).copied() {
+                missing_hashes.push((idx, hash, first_missing_idx));
             } else {
-                misses.entry(hash).or_insert_with(|| text.clone());
+                let first_missing_idx = missing_texts.len();
+                missing_index_by_hash.insert(hash.clone(), first_missing_idx);
+                missing_hashes.push((idx, hash, first_missing_idx));
+                missing_texts.push(text.clone());
             }
         }
 
-        if !misses.is_empty() {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrency));
-            let handles: Vec<_> = misses
-                .into_iter()
-                .map(|(hash, text)| {
-                    let llm = self.llm.clone();
-                    let cache = self.embed_cache.clone();
-                    let sem = semaphore.clone();
-                    let ttl = self.embed_cache_ttl;
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire().await;
-                        let embedding = llm.embed(&text).await?.vector;
-                        cache.put(&hash, embedding.clone(), ttl).await;
-                        Ok::<_, agent_context_db_core::LlmError>((hash, embedding))
-                    })
+        if !missing_texts.is_empty() {
+            let loaded = self.llm.embed_batch(&missing_texts).await?;
+            if loaded.len() != missing_texts.len() {
+                return Err(agent_context_db_core::ContextError::Storage(format!(
+                    "embedding provider returned {} vectors for {} inputs",
+                    loaded.len(),
+                    missing_texts.len()
+                )));
+            }
+
+            for (idx, hash, first_missing_idx) in missing_hashes {
+                let embedding = loaded[first_missing_idx].vector.clone();
+                self.embed_cache
+                    .put(&hash, embedding.clone(), self.embed_cache_ttl)
+                    .await;
+                results[idx] = Some(embedding);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|item| {
+                item.ok_or_else(|| {
+                    agent_context_db_core::ContextError::Storage("missing embedding result".into())
                 })
-                .collect();
-
-            let mut loaded = HashMap::new();
-            for h in handles {
-                match h.await {
-                    Ok(Ok((hash, embedding))) => {
-                        loaded.insert(hash, embedding);
-                    }
-                    Ok(Err(err)) => return Err(err.into()),
-                    Err(err) => {
-                        return Err(agent_context_db_core::ContextError::Storage(format!(
-                            "embedding task join: {err}"
-                        )));
-                    }
-                }
-            }
-
-            for (idx, text) in texts.iter().enumerate() {
-                if results[idx].is_none() {
-                    let hash = embedding_content_hash(text);
-                    if let Some(embedding) = loaded.get(&hash) {
-                        results[idx] = Some(embedding.clone());
-                    }
-                }
-            }
-        }
-
-        Ok(results.into_iter().flatten().collect())
+            })
+            .collect()
     }
 }
 

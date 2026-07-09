@@ -1,6 +1,7 @@
 use crate::types::{KnowledgeNetworkError, Result};
-use agent_context_db_marketplace_types::{
-    AgentId, KnowledgeProvenance, KnowledgeProvenancePayload, provenance_payload_hash,
+use agent_context_db_marketplace::{
+    AgentId, KnowledgeProvenance, KnowledgeProvenancePayload, KnowledgeSigner,
+    provenance_payload_hash,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -146,6 +147,15 @@ impl IdentityRegistry {
     }
 }
 
+impl KnowledgeSigner for IdentityRegistry {
+    fn sign_knowledge_provenance(
+        &self,
+        payload: &KnowledgeProvenancePayload,
+    ) -> std::result::Result<KnowledgeProvenance, String> {
+        IdentityRegistry::sign_knowledge_provenance(self, payload).map_err(|err| err.to_string())
+    }
+}
+
 fn mesh_signing_bytes<T: Serialize>(
     signer: &AgentId,
     issued_at: DateTime<Utc>,
@@ -194,7 +204,7 @@ fn verify_ed25519(verifying_key: &VerifyingKey, bytes: &[u8], signature: &str) -
 mod tests {
     use super::*;
     use agent_context_db_core::{ContentType, ContextUri, EpistemicType};
-    use agent_context_db_marketplace_types::evidence_chain_hash;
+    use agent_context_db_marketplace::evidence_chain_hash;
 
     #[test]
     fn ed25519_mesh_payload_rejects_tampering() {

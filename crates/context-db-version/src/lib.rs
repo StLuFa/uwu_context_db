@@ -28,16 +28,17 @@ pub use innovation::{
 };
 pub use model::{
     Author, Branch, BranchLifecycle, BranchName, BranchType, CausalDag, ChangeSet, ChangeType,
-    Commit, CommitId, CommitMeta, CommitTrigger, ConflictResolver, ContentHash, CorrectionType,
-    EntityChange, FactCorrection, KnowledgeMergeStrategy, ProvenanceLink, ProvenanceRelation,
-    RelationChange, RelationChangeType, RelationKind, RenameOp, Resolution, SemanticCondition,
-    SemanticConflict, StructuredDiff, Tag, TagName, TagType, TemporalIndex, TemporalVersion,
-    UriChange, VersionRef,
+    Commit, CommitId, CommitMeta, CommitTrigger, ConflictResolver, CorrectionType, EntityChange,
+    FactCorrection, KnowledgeMergeStrategy, ProvenanceLink, ProvenanceRelation, RelationChange,
+    RelationChangeType, RelationKind, RenameOp, Resolution, SemanticCondition, SemanticConflict,
+    StructuredDiff, Tag, TagName, TagType, TemporalIndex, TemporalVersion, UriChange, VersionRef,
 };
 pub use reasoning::{
     ChangeCategory, DiffChangeType, DiffImpact, DiffReasoner, SemanticChange, SemanticDiff,
     TemporalPattern, TemporalReasoner, TimelineEvent,
 };
+
+pub use agent_context_db_core::ContentHash;
 
 use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri};
 use async_trait::async_trait;

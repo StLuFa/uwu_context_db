@@ -6,8 +6,8 @@
 
 - 输入：`ContextEntry` / 观测流 / 反馈
 - 输出：`ConsolidationProduct` + 决策动作（ADD / UPDATE / INVALIDATE / NOOP）+ 血缘 / 质量 / 校准信号
-- 是 CDT 训练的上游数据源，也是 Marketplace 联邦流通的数据源
-- 依赖 `retrieve` 做语义检索，`knowledge-network` 做联邦发现，`version` 做时序版本管理
+- 是 CDT 训练的上游数据源，也是 Marketplace 联邦流通的生产者
+- 依赖 `retrieve` 做语义检索，`marketplace` 提供发布 DTO/端口，`knowledge-network` 提供身份签名，`version` 做时序版本管理
 
 ## 主要模块
 
@@ -30,21 +30,9 @@
 | `security.rs` / `guard.rs` | 写入前安全检查与免疫记忆 |
 | `explainable.rs` | 决策可解释性溯源 |
 
-### Marketplace 子模块（`src/marketplace/*.rs`）
+### Marketplace 边界
 
-| 模块 | 作用 |
-| --- | --- |
-| `publish.rs` | `PublishGate`：发布决策与门控 |
-| `discovery.rs` | `DiscoveryEngine`：本地 → 缓存 → 联邦的三级搜索 |
-| `registry.rs` | `FederatedRegistry`：联邦注册表 + 向量索引 |
-| `feedback.rs` | `ReputationEngine`：反馈驱动的声誉计算 |
-| `consensus.rs` | 共识与投票聚合 |
-| `crdt.rs` | `SemanticCrdtMerger`：语义感知 CRDT 合并 |
-| `voting.rs` | `SocialVoter`：社会投票 |
-| `conflict.rs` | 冲突解决 |
-| `cap.rs` | `CapPolicyEngine`：一致性级别策略 |
-| `immune.rs` | `ImmuneProtocol`：抗体记忆与免疫防护 |
-| `influence.rs` / `phylogeny.rs` / `community.rs` | 影响力、演化谱系、社区检测 |
+Marketplace 已拆分到独立 crate `agent-context-db-marketplace`。本 crate 只保留单 Agent 巩固产物，并为 `ConsolidationProduct` 实现 marketplace 的 `PublishableProduct` 端口。
 
 ## 关键导出
 
@@ -55,15 +43,14 @@
 - `ConfidenceCalibrator`
 - `HorizonAwareQualityScorer`、`QualityRoute`
 - `SleeptimeExecutor`、`SleeptimeTask`、`SleeptimeReport`
-- Marketplace：`PublishGate`、`DiscoveryEngine`、`FederatedRegistry`、`ReputationEngine`、`SemanticCrdtMerger`、`SocialVoter` 等
 
 ## 依赖
 
 - `agent-context-db-core`
 - `agent-context-db-retrieve` — 语义检索 / 三轴查询
-- `agent-context-db-knowledge-network` — 联邦发现
+- `agent-context-db-knowledge-network` — 身份签名 / 联邦网络能力
+- `agent-context-db-marketplace` — 发布 DTO / PublishableProduct 端口 / 联邦市场边界
 - `agent-context-db-version` — 版本状态
-- `agent-context-db-marketplace-types` — 与联邦网络共享的窄边界 DTO
 - `moka`（异步 LRU）、`parking_lot`、`tokio`、`chrono`、`serde`、`tracing`
 
 ## 用法
@@ -90,6 +77,6 @@ let report = sleep.run_once(&engine, &scope).await;
 
 ## 与其他 crate 的关系
 
-- **上游**：`core`（类型 / 存储 trait）、`retrieve`（检索）、`knowledge-network`（联邦）
-- **下游**：`cdt`（用巩固产物提取梯度和 Skill）
-- **共享边界**：`marketplace-types`（跨 crate DTO 不放在这里）
+- **上游**：`core`（类型 / 存储 trait）、`retrieve`（检索）
+- **下游**：`cdt`（用巩固产物提取梯度和 Skill）、`marketplace`（发布巩固产物到联邦流通层）
+- **共享边界**：`marketplace`（跨 Agent DTO 与发布端口）

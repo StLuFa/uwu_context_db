@@ -1,34 +1,10 @@
 //! DiscoveryEngine — 三级搜索 + 声誉排序。
 
-use crate::marketplace::registry::FederatedRegistry;
-use crate::marketplace::types::*;
-use agent_context_db_core::{ContextError, Result};
+use crate::registry::FederatedRegistry;
+use crate::types::*;
+use agent_context_db_core::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
-
-/// 发现查询。
-#[derive(Debug, Clone)]
-pub struct DiscoveryQuery {
-    pub query_embedding: Vec<f32>,
-    pub domains: Vec<String>,
-    pub entry_types: Vec<MarketEntryType>,
-    pub min_quality: f32,
-    pub min_corroboration_level: CorroborationLevel,
-    pub license_compatible: bool,
-}
-
-impl Default for DiscoveryQuery {
-    fn default() -> Self {
-        Self {
-            query_embedding: vec![],
-            domains: vec![],
-            entry_types: vec![],
-            min_quality: 0.7,
-            min_corroboration_level: CorroborationLevel::CrossSession,
-            license_compatible: true,
-        }
-    }
-}
 
 /// 发现结果。
 #[derive(Debug, Clone)]
@@ -38,13 +14,6 @@ pub struct DiscoveryResult {
     pub domains_covered: Vec<String>,
     pub avg_quality: f32,
     pub search_tier: SearchTier,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchTier {
-    Local,
-    Cache,
-    Federation,
 }
 
 #[derive(Debug, Clone)]
@@ -59,26 +28,9 @@ pub struct MarketHit {
 pub trait FederatedDiscoveryBackend: Send + Sync {
     async fn discover_federated(
         &self,
-        query: agent_context_db_marketplace_types::DiscoveryQuery,
+        query: DiscoveryQuery,
         limit: usize,
-    ) -> Result<agent_context_db_marketplace_types::FederatedDiscoveryResult>;
-}
-
-#[async_trait]
-impl FederatedDiscoveryBackend for agent_context_db_knowledge_network::FederatedKnowledgeFabric {
-    async fn discover_federated(
-        &self,
-        query: agent_context_db_marketplace_types::DiscoveryQuery,
-        limit: usize,
-    ) -> Result<agent_context_db_marketplace_types::FederatedDiscoveryResult> {
-        let opts = agent_context_db_knowledge_network::MeshDiscoveryOpts {
-            final_top_k: limit,
-            ..Default::default()
-        };
-        self.discover_result(query, opts)
-            .await
-            .map_err(|e| ContextError::Unsupported(format!("knowledge network: {e}")))
-    }
+    ) -> Result<FederatedDiscoveryResult>;
 }
 
 /// 发现引擎 — 三级搜索策略。
@@ -139,15 +91,7 @@ impl DiscoveryEngine {
         // === Tier 3: 联邦查询 ===
         let mut all_results = local;
         if let Some(federation) = &self.federation {
-            let federated_query = agent_context_db_marketplace_types::DiscoveryQuery {
-                query_embedding: query.query_embedding.clone(),
-                domains: query.domains.clone(),
-                entry_types: query.entry_types.clone(),
-                min_quality: query.min_quality,
-                min_corroboration_level: query.min_corroboration_level,
-                license_compatible: query.license_compatible,
-            };
-            if let Ok(remote) = federation.discover_federated(federated_query, limit).await {
+            if let Ok(remote) = federation.discover_federated(query.clone(), limit).await {
                 all_results.extend(
                     remote
                         .hits

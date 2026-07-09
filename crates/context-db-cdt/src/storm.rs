@@ -5,9 +5,10 @@
 
 use crate::consolidation::{CdtConsolidationSignal, CdtSignalSource};
 use crate::multi_perspective::{MultiPerspectiveConsolidator, Perspective};
-use agent_context_db_core::{ContentType, ContextEntry, ContextUri, EpistemicType};
+use agent_context_db_core::{ContentType, ContextEntry, ContextUri, EpistemicType, LlmClient};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StormQuestion {
@@ -40,6 +41,7 @@ pub struct StormReport {
 pub struct StormSynthesizer {
     perspectives: Vec<Perspective>,
     max_questions_per_perspective: usize,
+    llm: Option<Arc<dyn LlmClient>>,
 }
 
 impl StormSynthesizer {
@@ -47,6 +49,7 @@ impl StormSynthesizer {
         Self {
             perspectives: Perspective::all(),
             max_questions_per_perspective: 2,
+            llm: None,
         }
     }
 
@@ -57,6 +60,11 @@ impl StormSynthesizer {
 
     pub fn with_max_questions(mut self, max_questions_per_perspective: usize) -> Self {
         self.max_questions_per_perspective = max_questions_per_perspective.max(1);
+        self
+    }
+
+    pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
+        self.llm = Some(llm);
         self
     }
 
@@ -77,10 +85,11 @@ impl StormSynthesizer {
             sections.push(self.build_section(*perspective, &selected));
         }
 
-        let multi = MultiPerspectiveConsolidator::new()
-            .with_perspectives(self.perspectives.clone())
-            .consolidate(topic_uri, topic, evidence)
-            .await;
+        let mut multi = MultiPerspectiveConsolidator::new().with_perspectives(self.perspectives.clone());
+        if let Some(llm) = &self.llm {
+            multi = multi.with_llm(llm.clone());
+        }
+        let multi = multi.consolidate(topic_uri, topic, evidence).await;
         let unresolved_questions = multi
             .discovered_gaps
             .iter()

@@ -1,6 +1,6 @@
 use crate::learning::RouteOutcomeLearning;
 use crate::types::FederatedQueryIntent;
-use agent_context_db_marketplace_types::AgentId;
+use agent_context_db_marketplace::AgentId;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]

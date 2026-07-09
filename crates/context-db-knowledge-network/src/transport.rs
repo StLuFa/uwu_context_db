@@ -1,6 +1,6 @@
 use crate::planner::MeshQueryPlan;
 use crate::types::{FetchResponse, PrivateQuerySketch, ProbeResponse, Result};
-use agent_context_db_marketplace_types::{AgentId, FederatedDiscoveryHit, PublicationMetadata};
+use agent_context_db_marketplace::{AgentId, FederatedDiscoveryHit, PublicationMetadata};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;

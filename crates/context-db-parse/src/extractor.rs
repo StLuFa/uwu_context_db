@@ -2,7 +2,9 @@
 //!
 //! 依赖 core 的 `LlmClient` 端口进行语义处理。
 
-use agent_context_db_core::{ContentType, ContextUri, LlmClient, LlmOpts, Result};
+use agent_context_db_core::{
+    ContentType, ContextUri, LlmClient, LlmOpts, LlmTaskKind, PromptOptimization, Result,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -39,6 +41,10 @@ Only include entries with confidence > 0.5.
         let opts = LlmOpts {
             max_tokens: Some(2048),
             temperature: Some(0.1),
+            task: LlmTaskKind::Extraction,
+            prompt: PromptOptimization::default()
+                .force_cache()
+                .target_tokens(2_500),
             ..Default::default()
         };
 
@@ -89,6 +95,10 @@ Return a JSON array of objects with: "candidate_index", "action", "reason", "mer
         let opts = LlmOpts {
             max_tokens: Some(1024),
             temperature: Some(0.0),
+            task: LlmTaskKind::Deduplication,
+            prompt: PromptOptimization::default()
+                .force_cache()
+                .target_tokens(1_800),
             ..Default::default()
         };
 

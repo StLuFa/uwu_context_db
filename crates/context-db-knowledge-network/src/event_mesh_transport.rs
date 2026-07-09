@@ -3,7 +3,7 @@ use crate::transport::MeshTransport;
 use crate::types::{
     FetchResponse, KnowledgeNetworkError, PrivateQuerySketch, ProbeResponse, Result,
 };
-use agent_context_db_marketplace_types::AgentId;
+use agent_context_db_marketplace::AgentId;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;

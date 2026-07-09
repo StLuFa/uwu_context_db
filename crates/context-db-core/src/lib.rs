@@ -3,13 +3,12 @@
 //! Agent 上下文数据库的**通用核心**最小内核：
 //!
 //! - `uwu://` URI 强类型寻址（[`uri`]）
-//! - 三层信息模型 + 8 种记忆分类 + 内容载荷（[`model`]）
+//! - 三层信息模型 + 多种记忆分类 + 内容载荷（[`model`]）
 //! - 存储窄端口 `FsOps` / `ContentRepo` / `VersionOps` / `TenantOps`（[`store`]）
 //! - LLM 客户端端口（[`llm`]）
 //!
 //! ## 设计约束（见 ARCHITECTURE.md §0.5 / §2.0）
 //!
-//! - **无 uwu 依赖**：核心与具体 Agent 框架无关，可独立发布。
 //! - **端口/适配器**：全部存储/LLM 能力以 trait 暴露，实现由宿主注入（零实现）。
 //! - **接口隔离**：上层只依赖用到的窄端口，禁止依赖聚合 `ContextStore`。
 //!
@@ -27,15 +26,18 @@ pub mod lsh;
 pub mod model;
 pub mod observability;
 pub mod pack;
+pub mod prompt;
 pub mod rate_limiter;
 pub mod read_cache;
 #[cfg(feature = "redis-backend")]
 pub mod redis_backend;
 pub mod similarity;
 pub mod store;
+pub mod tokenizer;
 pub mod uri;
 pub mod vector;
 pub mod watch;
+pub mod write_dedup;
 pub mod write_security;
 pub mod zerocopy;
 
@@ -60,7 +62,10 @@ pub use lifecycle::{
     AccessEvent, AccessOutcome, EbbinghausModel, ForgettingModel, ImportanceScore,
     ImportanceWeights, LifecycleAction, LifecycleEngine, LifecycleRule, TokenBudget,
 };
-pub use llm::{EmbeddingVector, JsonSchema, LlmClient, LlmError, LlmOpts, LlmStream};
+pub use llm::{
+    CachingLlmClient, CachingLlmClientConfig, CascadeLlmClient, CascadeLlmConfig, EmbeddingVector,
+    JsonSchema, LlmClient, LlmError, LlmOpts, LlmStream, PromptOptimizingLlmClient,
+};
 pub use lsh::LshIndex;
 pub use model::{
     BlobRef, ConsolidationMeta, ConsolidationStatus, ContentHash, ContentLevel, ContentPart,
@@ -69,12 +74,17 @@ pub use model::{
     MediaType, MvccVersion, StateScope, TenantId, TreeNode, ValidityRecord, VersionEntry,
 };
 pub use observability::{
-    ProvenanceEdge, ProvenanceGraph, ProvenanceNode, ProvenanceRelationType, QualityDimension,
-    QualityScore, QualityScorer,
+    MetricsExporter, MetricsExporterConfig, ProvenanceEdge, ProvenanceGraph, ProvenanceNode,
+    ProvenanceRelationType, QualityDimension, QualityScore, QualityScorer,
+    install_metrics_exporter, install_metrics_recorder,
 };
 pub use pack::{
     AclProtectedStore, AclRule, ContextPack, PackMeta, PackSignature, PackTrustPolicy, PathAcl,
     Permissions, Principal,
+};
+pub use prompt::{
+    LlmTaskKind, OptimizedPrompt, PromptCacheMode, PromptCompressionMode, PromptOptimization,
+    optimize_prompt,
 };
 pub use rate_limiter::{MemoryRateLimiter, RateLimiter};
 pub use read_cache::{MemoryReadCache, ReadCache};
@@ -86,12 +96,14 @@ pub use store::{
     BlobStore, BrowsingOps, ContentRepo, ContentStore, ContextStore, FsOps, GraphRelation,
     GraphStore, StorageEngine, TenantOps, VersionOps,
 };
-pub use uri::{ContextUri, SCHEME, UriCategory};
+pub use tokenizer::{count_tokens, count_tokens_with_floor};
+pub use uri::{AsOfTime, ContextUri, QueryParams, SCHEME, UriCategory};
 pub use vector::{IndexHit, IndexPoint, VectorIndex};
 pub use watch::{
     ChangeEvent, ChangeKind, WatchCheckpoint, WatchHub, WatchOptions, WatchSource, WatchStream,
     WatchableStore,
 };
+pub use write_dedup::{SemanticWriteDedupConfig, SemanticWriteDedupStore, WriteDedupDecision};
 pub use write_security::{
     SensitiveFinding, SensitiveKind, redact_sensitive_entry, sanitize_entry_for_write,
     scan_sensitive_entry,

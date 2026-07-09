@@ -1,12 +1,8 @@
 //! 版本 DAG 模型（M2）：Commit / Branch / Tag。见 ARCHITECTURE.md §1.2-1.4。
 
-use agent_context_db_core::ContextUri;
+use agent_context_db_core::{ContentHash, ContextUri};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-/// 内容寻址哈希（类 Git SHA，blake3）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ContentHash(pub String);
 
 /// 版本号（替代 M0 的 MvccVersion）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

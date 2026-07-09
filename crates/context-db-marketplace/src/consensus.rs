@@ -3,7 +3,7 @@
 //! 两个独立 session/agent 蒸馏出语义相似的晶体 = Schelling 点 = "知识被确认"。
 //! 达到 N 个独立源 = Established（已确立）。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use agent_context_db_core::VectorIndex;
 use std::sync::Arc;
 

@@ -1,7 +1,7 @@
 use crate::planner::MeshQueryPlan;
 use crate::privacy::DpPolicy;
 use crate::types::{FederatedQueryIntent, KnowledgeNetworkError, Result};
-use agent_context_db_marketplace_types::{AgentId, DiscoveryQuery, FederatedDiscoveryHit};
+use agent_context_db_marketplace::{AgentId, DiscoveryQuery, FederatedDiscoveryHit};
 
 #[derive(Debug, Clone)]
 pub struct GovernancePolicy {

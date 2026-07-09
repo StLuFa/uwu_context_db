@@ -11,6 +11,8 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
+blake3 = "1"
+moka = { version = "0.12", features = ["future"] }
 
 [features]
 default = []

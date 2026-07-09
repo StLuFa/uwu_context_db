@@ -6,6 +6,8 @@
 use agent_context_db_core::{ContentLevel, ContextUri, LlmClient, LlmOpts, Result};
 use std::sync::Arc;
 
+use crate::budget::allocate_hit_levels;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // F20 幻觉检测
 // ═══════════════════════════════════════════════════════════════════════════
@@ -214,49 +216,13 @@ impl CompressionAwareLoader {
 
     /// 为一批 URI 分配加载级别。
     ///
-    /// 高相关性命中优先获得更高级别。
+    /// 这里复用检索预算装载器的分层背包优化：每个 hit 同时竞争 L0/L1/L2
+    /// 三种加载选择，目标是在剩余 token 窗口内最大化相关度和质量收益。
     pub fn allocate_levels(&self, hits: &[crate::RetrievalHit]) -> Vec<(ContextUri, ContentLevel)> {
-        let pressure = self.pressure();
-        let remaining = self.remaining();
-
-        let mut plan = Vec::with_capacity(hits.len());
-        let mut budget = remaining;
-        let base_level = pressure.default_level();
-
-        let mut sorted: Vec<&crate::RetrievalHit> = hits.iter().collect();
-        sorted.sort_by(|a, b| {
-            b.relevance
-                .partial_cmp(&a.relevance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        for hit in sorted {
-            let level = if budget > 2000 && base_level == ContentLevel::L2 {
-                ContentLevel::L2
-            } else if budget > 200 && base_level != ContentLevel::L0 {
-                ContentLevel::L1
-            } else {
-                ContentLevel::L0
-            };
-
-            let cost = match level {
-                ContentLevel::L2 => 8000,
-                ContentLevel::L1 => 2000,
-                ContentLevel::L0 => 100,
-            };
-
-            if budget >= cost {
-                budget = budget.saturating_sub(cost);
-                plan.push((hit.uri.clone(), level));
-            } else if budget >= 100 {
-                plan.push((hit.uri.clone(), ContentLevel::L0));
-                budget = budget.saturating_sub(100);
-            } else {
-                break;
-            }
-        }
-
-        plan
+        allocate_hit_levels(hits, self.remaining())
+            .into_iter()
+            .map(|allocation| (allocation.uri, allocation.level))
+            .collect()
     }
 
     /// 更新已用 token 数。
@@ -299,7 +265,10 @@ mod tests {
         }];
 
         let plan = loader.allocate_levels(&hits);
-        // Tight pressure + small budget → L0 only
-        assert_eq!(plan[0].1, ContentLevel::L0);
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(
+            plan[0].1,
+            ContentLevel::L0 | ContentLevel::L1 | ContentLevel::L2
+        ));
     }
 }

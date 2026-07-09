@@ -159,6 +159,9 @@ where
         F: FnMut(&ContextUri) -> Option<String> + Send,
     {
         let mut report = EmbeddingMigrationReport::default();
+        let mut pending = Vec::new();
+        let mut texts = Vec::new();
+
         for point in points {
             report.scanned += 1;
             match self.plan.action_for_point(point) {
@@ -166,28 +169,73 @@ where
                 EmbeddingMigrationAction::Reembed {
                     target_collection, ..
                 } => {
-                    self.reembed(point, &target_collection, &mut text_for_uri)
-                        .await?;
+                    let text =
+                        text_for_uri(&point.uri).unwrap_or_else(|| point.payload.to_string());
+                    texts.push(text);
+                    pending.push(PendingEmbeddingWrite {
+                        point,
+                        target_collection,
+                        write_source_collection: None,
+                        delete_source_after_write: matches!(
+                            self.plan.phase,
+                            EmbeddingMigrationPhase::Cutover | EmbeddingMigrationPhase::Complete
+                        ),
+                    });
                     report.reembedded += 1;
-                    if matches!(
-                        self.plan.phase,
-                        EmbeddingMigrationPhase::Cutover | EmbeddingMigrationPhase::Complete
-                    ) {
-                        self.index
-                            .delete(&self.plan.source_collection, &point.uri)
-                            .await?;
-                        report.deleted_from_source += 1;
-                    }
                 }
                 EmbeddingMigrationAction::DualWrite {
-                    target_collection, ..
+                    source_collection,
+                    target_collection,
+                    ..
                 } => {
-                    self.reembed(point, &target_collection, &mut text_for_uri)
-                        .await?;
+                    let text =
+                        text_for_uri(&point.uri).unwrap_or_else(|| point.payload.to_string());
+                    texts.push(text);
+                    pending.push(PendingEmbeddingWrite {
+                        point,
+                        target_collection,
+                        write_source_collection: Some(source_collection),
+                        delete_source_after_write: false,
+                    });
                     report.dual_written += 1;
                 }
             }
         }
+
+        let embeddings = self.llm.embed_batch(&texts).await?;
+        if embeddings.len() != pending.len() {
+            return Err(crate::ContextError::Storage(format!(
+                "embedding provider returned {} vectors for {} migration writes",
+                embeddings.len(),
+                pending.len()
+            )));
+        }
+
+        for (write, embedding) in pending.into_iter().zip(embeddings) {
+            let migrated = IndexPoint::from_embedding(
+                write.point.uri.clone(),
+                embedding.clone(),
+                write.point.payload.clone(),
+            );
+            self.index
+                .upsert(&write.target_collection, migrated)
+                .await?;
+            if let Some(source_collection) = write.write_source_collection {
+                let source_point = IndexPoint::from_embedding(
+                    write.point.uri.clone(),
+                    embedding,
+                    write.point.payload.clone(),
+                );
+                self.index.upsert(&source_collection, source_point).await?;
+            }
+            if write.delete_source_after_write {
+                self.index
+                    .delete(&self.plan.source_collection, &write.point.uri)
+                    .await?;
+                report.deleted_from_source += 1;
+            }
+        }
+
         Ok(report)
     }
 
@@ -212,22 +260,13 @@ where
         }
         Ok(())
     }
+}
 
-    async fn reembed<F>(
-        &self,
-        point: &IndexPoint,
-        target_collection: &str,
-        text_for_uri: &mut F,
-    ) -> Result<()>
-    where
-        F: FnMut(&ContextUri) -> Option<String> + Send,
-    {
-        let text = text_for_uri(&point.uri).unwrap_or_else(|| point.payload.to_string());
-        let embedding = self.llm.embed(&text).await?;
-        let migrated =
-            IndexPoint::from_embedding(point.uri.clone(), embedding, point.payload.clone());
-        self.index.upsert(target_collection, migrated).await
-    }
+struct PendingEmbeddingWrite<'p> {
+    point: &'p IndexPoint,
+    target_collection: String,
+    write_source_collection: Option<String>,
+    delete_source_after_write: bool,
 }
 
 fn collection_name(prefix: &str, version: &EmbeddingModelVersion) -> String {

@@ -1,6 +1,6 @@
 //! ReputationEngine + MarketFeedback — 采纳反馈→声誉更新（KPI 驱动）。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use std::collections::HashMap;
 
 /// 采纳结果。

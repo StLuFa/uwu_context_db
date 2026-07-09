@@ -1,6 +1,6 @@
 //! Social Voting — 市场条目的众包投票。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use std::collections::HashMap;
 
 /// 投票操作。

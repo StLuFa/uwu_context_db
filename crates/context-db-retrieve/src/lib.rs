@@ -13,6 +13,7 @@
 //! - 仅依赖 core 的 `FsOps` 窄端口和可选的 `VectorIndex`，不依赖具体后端。
 
 pub mod associative;
+pub mod budget;
 pub mod cache;
 pub mod compiler;
 pub mod graph_rag;
@@ -26,6 +27,7 @@ pub mod query;
 pub mod retriever;
 
 pub use associative::AssociativeExpander;
+pub use budget::{BudgetLoadPlan, LevelAllocation, allocate_hit_levels, load_hits_within_budget};
 pub use graph_rag::{
     GraphRagCommunity, GraphRagEngine, GraphRagIndex, GraphRagIndexConfig, GraphRagIndexStats,
     GraphRagIndexer, GraphRagRequest,
@@ -50,7 +52,7 @@ pub use planner::{
     CboOptimizer, IntentPlannerHint, LogicalPlan, PhysicalPlan, StatisticsCollector, VectorFilter,
 };
 pub use quality::{CompressionAwareLoader, HallucinationDetector, PressureLevel, QualityReport};
-pub use query::{Condition, MergeStrategy, Predicate, Query, SortKey};
+pub use query::{Condition, Predicate, Query, QueryMergeStrategy, SortKey};
 pub use retriever::{ContextRetriever, ContextRetrieverBuilder, RuleBasedPlanner};
 
 use agent_context_db_core::{

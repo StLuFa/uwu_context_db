@@ -4,7 +4,9 @@
 
 use crate::{ContentPayload, ContextEntry, ContextUri};
 use chrono::{DateTime, Utc};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // F13 质量评分
@@ -167,8 +169,49 @@ impl Default for ProvenanceGraph {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// I.2: 可观测性 — metrics crate 真实集成
+// I.2: 可观测性 — metrics crate 真实集成 + Prometheus exporter
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MetricsExporterConfig {
+    pub endpoint: SocketAddr,
+}
+
+impl Default for MetricsExporterConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: SocketAddr::from(([0, 0, 0, 0], 9898)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MetricsExporter {
+    handle: PrometheusHandle,
+}
+
+impl MetricsExporter {
+    pub fn render(&self) -> String {
+        self.handle.render()
+    }
+}
+
+/// Install a Prometheus recorder and HTTP listener for `/metrics` scraping.
+pub fn install_metrics_exporter(
+    config: MetricsExporterConfig,
+) -> Result<MetricsExporter, metrics_exporter_prometheus::BuildError> {
+    let handle = PrometheusBuilder::new()
+        .with_http_listener(config.endpoint)
+        .install_recorder()?;
+    Ok(MetricsExporter { handle })
+}
+
+/// Install an in-process Prometheus recorder. Call `render()` from any HTTP stack.
+pub fn install_metrics_recorder() -> Result<MetricsExporter, metrics_exporter_prometheus::BuildError>
+{
+    let handle = PrometheusBuilder::new().install_recorder()?;
+    Ok(MetricsExporter { handle })
+}
 
 /// 记录一次检索操作。
 pub fn record_retrieval(hits: usize, duration_ms: u64, tokens: usize, cache_hit: bool) {

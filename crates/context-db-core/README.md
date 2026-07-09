@@ -4,19 +4,19 @@ Agent 上下文数据库最小内核，零 uwu 依赖，可独立发布。
 
 ## 模块
 
-| 模块 | 内容 |
-|------|------|
-| `uri` | `uwu://` URI 强类型寻址 + `UriCategory` 分类 |
-| `model` | 三层信息模型(L0/L1/L2) + 8 种记忆分类 + ContextEntry/DirEntry/TreeNode |
-| `store` | 四个窄端口：`FsOps`(只读寻址) + `ContentRepo`(写入) + `VersionOps`(版本) + `TenantOps`(租户) |
+| 模块 | 内容                                                                                  |
+|------|-------------------------------------------------------------------------------------|
+| `uri` | `uwu://` URI 强类型寻址 + `UriCategory` 分类                                               |
+| `model` | 三层信息模型(L0/L1/L2) + 多种记忆分类 + ContextEntry/DirEntry/TreeNode                          |
+| `store` | 四个窄端口：`FsOps`(只读寻址) + `ContentRepo`(写入) + `VersionOps`(版本) + `TenantOps`(租户)        |
 | `llm` | `LlmClient` 端口(complete/embed/complete_json/stream/batch/speculative) + `LlmStream` |
-| `vector` | `VectorIndex` 端口(upsert/search/delete) + IndexPoint/IndexHit |
-| `lifecycle` | F22 遗忘曲线 + F26 Token 预算经济模型 |
-| `pack` | F7 ContextPack 导出导入 + F8 路径级 ACL |
-| `observability` | F9 订阅推送 + F13 质量评分 + F15 血缘图 |
-| `event` | F5 事件流因果链 + F11 上下文继承 + F12 上下文模板 |
-| `similarity` | F14 跨 Agent 去重与相似度聚类 |
-| `error` | `ContextError` 统一错误类型 |
+| `vector` | `VectorIndex` 端口(upsert/search/delete) + IndexPoint/IndexHit                        |
+| `lifecycle` | F22 遗忘曲线 + F26 Token 预算经济模型                                                         |
+| `pack` | F7 ContextPack 导出导入 + F8 路径级 ACL                                                    |
+| `observability` | F9 订阅推送 + F13 质量评分 + F15 血缘图                                                        |
+| `event` | F5 事件流因果链 + F11 上下文继承 + F12 上下文模板                                                   |
+| `similarity` | F14 跨 Agent 去重与相似度聚类                                                                |
+| `error` | `ContextError` 统一错误类型                                                               |
 
 ## 窄端口
 

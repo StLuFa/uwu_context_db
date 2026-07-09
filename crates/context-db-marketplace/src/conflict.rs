@@ -1,7 +1,7 @@
-//! ConflictResolver — 多维证据对比 + LLM 仲裁 + Resolution 类型。
+//! ConflictResolver — 多维证据对比 + LLM 仲裁 + MarketConflictResolution 类型。
 
-use crate::marketplace::types::*;
-use agent_context_db_core::{LlmClient, LlmOpts};
+use crate::types::*;
+use agent_context_db_core::{LlmClient, LlmOpts, LlmTaskKind, PromptOptimization};
 use std::sync::Arc;
 
 /// 冲突 — 两个 MarketEntry 对同一事实给出矛盾结论。
@@ -25,7 +25,7 @@ pub enum ConflictType {
 
 /// 仲裁结果。
 #[derive(Debug, Clone)]
-pub enum Resolution {
+pub enum MarketConflictResolution {
     /// 保留 A，让 B 过期。
     KeepA { reason: String },
     /// 保留 B，让 A 过期。
@@ -119,7 +119,7 @@ impl ConflictResolver {
     }
 
     /// 仲裁冲突 — 基于多维证据对比。
-    pub async fn arbitrate(&self, conflict: &MarketConflict) -> Resolution {
+    pub async fn arbitrate(&self, conflict: &MarketConflict) -> MarketConflictResolution {
         // 1. 多维对比
         let a = &conflict.entry_a;
         let b = &conflict.entry_b;
@@ -140,7 +140,7 @@ impl ConflictResolver {
 
         // 2. 如果一方显著优势 → 直接裁决
         if a_corrob > b_corrob * 2 && a_quality > b_quality + 0.2 {
-            return Resolution::KeepA {
+            return MarketConflictResolution::KeepA {
                 reason: format!(
                     "{} corroborators vs {}, quality {:.2} vs {:.2}",
                     a_corrob, b_corrob, a_quality, b_quality
@@ -148,7 +148,7 @@ impl ConflictResolver {
             };
         }
         if b_corrob > a_corrob * 2 && b_quality > a_quality + 0.2 {
-            return Resolution::KeepB {
+            return MarketConflictResolution::KeepB {
                 reason: format!(
                     "{} corroborators vs {}, quality {:.2} vs {:.2}",
                     b_corrob, a_corrob, b_quality, a_quality
@@ -190,6 +190,10 @@ Respond with JSON:
                     &LlmOpts {
                         max_tokens: Some(512),
                         temperature: Some(0.0),
+                        task: LlmTaskKind::Arbitration,
+                        prompt: PromptOptimization::default()
+                            .force_cache()
+                            .target_tokens(1_200),
                         ..Default::default()
                     },
                 )
@@ -197,20 +201,20 @@ Respond with JSON:
             {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
                     return match json["resolution"].as_str() {
-                        Some("keep_a") => Resolution::KeepA {
+                        Some("keep_a") => MarketConflictResolution::KeepA {
                             reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into(),
                         },
-                        Some("keep_b") => Resolution::KeepB {
+                        Some("keep_b") => MarketConflictResolution::KeepB {
                             reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into(),
                         },
-                        Some("fuse") => Resolution::Fuse {
+                        Some("fuse") => MarketConflictResolution::Fuse {
                             merged_content: json["merged"].as_str().unwrap_or("").into(),
                             reason: json["reason"].as_str().unwrap_or("").into(),
                         },
-                        Some("keep_both") => Resolution::KeepBoth {
+                        Some("keep_both") => MarketConflictResolution::KeepBoth {
                             reason: json["reason"].as_str().unwrap_or("").into(),
                         },
-                        _ => Resolution::DeferToHuman {
+                        _ => MarketConflictResolution::DeferToHuman {
                             reason: "LLM response unclear".into(),
                         },
                     };
@@ -219,7 +223,7 @@ Respond with JSON:
         }
 
         // 4. 无法自动裁决 → 人工
-        Resolution::DeferToHuman {
+        MarketConflictResolution::DeferToHuman {
             reason: format!(
                 "Evidence tie: A({}ev,{}cor,{:.2}q) vs B({}ev,{}cor,{:.2}q)",
                 a_evidence, a_corrob, a_quality, b_evidence, b_corrob, b_quality

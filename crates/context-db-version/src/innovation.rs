@@ -1,6 +1,8 @@
 //! 版本层创新功能（F19 知识晶体 + F21 自修复 + F23 梦境巩固 + F27 因果推断）。
 
-use agent_context_db_core::{ContentLevel, ContextUri, FsOps, LlmClient, LlmOpts};
+use agent_context_db_core::{
+    ContentLevel, ContextUri, FsOps, LlmClient, LlmOpts, LlmTaskKind, PromptOptimization,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -242,6 +244,12 @@ pub struct DreamConsolidator<V: VersionStore> {
     fs: Arc<dyn FsOps>,
 }
 
+struct DreamClusterPrompt {
+    key: String,
+    count: usize,
+    prompt: String,
+}
+
 impl<V: VersionStore> DreamConsolidator<V> {
     pub fn new(store: Arc<V>, llm: Arc<dyn LlmClient>, fs: Arc<dyn FsOps>) -> Self {
         Self { store, llm, fs }
@@ -284,12 +292,12 @@ impl<V: VersionStore> DreamConsolidator<V> {
             clusters.entry(key).or_default().push(uri.clone());
         }
 
-        // 高频聚类 → 收集内容 → LLM 合成
+        // 高频聚类先收集 prompt，再一次批量补全，避免每个 cluster 串行打 LLM。
         let mut insights: Vec<String> = Vec::new();
+        let mut batch = Vec::new();
 
         for (key, uris) in clusters {
             if uris.len() < 3 {
-                // 低频聚类：仅记录统计信息
                 if uris.len() >= 2 {
                     insights.push(format!(
                         "cluster '{}' with {} related changes",
@@ -300,7 +308,6 @@ impl<V: VersionStore> DreamConsolidator<V> {
                 continue;
             }
 
-            // 读取聚类中各条目的 L0 摘要
             let mut summaries = Vec::new();
             for uri in &uris {
                 if let Ok(content) = self.fs.read(uri, ContentLevel::L0).await {
@@ -320,50 +327,66 @@ impl<V: VersionStore> DreamConsolidator<V> {
                 continue;
             }
 
-            // 调用 LLM 合成模式洞察
-            let nl = "\n";
-            let prompt = format!(
-                "Analyze this cluster of {count} context changes under '{key}':{nl}{nl}{summaries}{nl}{nl}\
-                 Identify the underlying pattern: what do these changes have in common? \
-                 Is there a reusable insight or principle? \
-                 Respond with a single concise paragraph (2-4 sentences).",
-                count = uris.len(),
-                key = key,
-                nl = nl,
-                summaries = summaries.join("\n"),
-            );
+            batch.push(DreamClusterPrompt {
+                key,
+                count: uris.len(),
+                prompt: dream_cluster_prompt(uris.len(), summaries),
+            });
+        }
 
-            match self.llm.complete(&prompt, &LlmOpts::default()).await {
-                Ok(response) => {
-                    let trimmed = response.trim().to_string();
-                    if !trimmed.is_empty() {
-                        insights.push(format!(
-                            "cluster '{key}' ({count} changes): {trimmed}",
-                            key = key,
-                            count = uris.len(),
-                            trimmed = trimmed
-                        ));
-                    } else {
-                        insights.push(format!(
-                            "cluster '{}' with {} related changes",
-                            key,
-                            uris.len()
-                        ));
-                    }
-                }
-                Err(_) => {
-                    // LLM 失败时降级为统计描述
-                    insights.push(format!(
-                        "cluster '{}' with {} related changes",
-                        key,
-                        uris.len()
-                    ));
-                }
+        let prompts = batch
+            .iter()
+            .map(|item| item.prompt.clone())
+            .collect::<Vec<_>>();
+        let responses = if prompts.is_empty() {
+            Vec::new()
+        } else {
+            self.llm
+                .batch_complete(
+                    &prompts,
+                    &LlmOpts {
+                        task: LlmTaskKind::Synthesis,
+                        prompt: PromptOptimization::default()
+                            .force_cache()
+                            .target_tokens(2_000),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| Vec::new())
+        };
+
+        for (idx, item) in batch.into_iter().enumerate() {
+            let trimmed = responses
+                .get(idx)
+                .map(|response| response.trim())
+                .filter(|response| !response.is_empty());
+            match trimmed {
+                Some(response) => insights.push(format!(
+                    "cluster '{key}' ({count} changes): {response}",
+                    key = item.key,
+                    count = item.count,
+                    response = response
+                )),
+                None => insights.push(format!(
+                    "cluster '{}' with {} related changes",
+                    item.key, item.count
+                )),
             }
         }
 
         Ok(insights)
     }
+}
+
+fn dream_cluster_prompt(count: usize, summaries: Vec<String>) -> String {
+    format!(
+        "Analyze this cluster of {count} context changes:\n\n{summaries}\n\n\
+         Identify the underlying pattern: what do these changes have in common? \
+         Is there a reusable insight or principle? \
+         Respond with a single concise paragraph (2-4 sentences).",
+        summaries = summaries.join("\n"),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -14,9 +14,10 @@ use crate::topology::TopologyOptimizer;
 use crate::transport::MeshTransport;
 use crate::trust::TrustRouter;
 use crate::types::{MeshDiscoveryOpts, MeshResultPhase, ProgressiveMeshResult, Result};
-use agent_context_db_marketplace_types::{
-    AgentId, DiscoveryQuery, FederatedDiscoveryResult, SearchTier,
+use agent_context_db_marketplace::{
+    AgentId, DiscoveryQuery, FederatedDiscoveryBackend, FederatedDiscoveryResult, SearchTier,
 };
+use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 
@@ -288,6 +289,23 @@ impl FederatedKnowledgeFabric {
             domains_covered,
             avg_quality,
             search_tier: SearchTier::Federation,
+        })
+    }
+}
+
+#[async_trait]
+impl FederatedDiscoveryBackend for FederatedKnowledgeFabric {
+    async fn discover_federated(
+        &self,
+        query: DiscoveryQuery,
+        limit: usize,
+    ) -> agent_context_db_core::Result<FederatedDiscoveryResult> {
+        let opts = MeshDiscoveryOpts {
+            final_top_k: limit,
+            ..Default::default()
+        };
+        self.discover_result(query, opts).await.map_err(|err| {
+            agent_context_db_core::ContextError::Unsupported(format!("knowledge network: {err}"))
         })
     }
 }

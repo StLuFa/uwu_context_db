@@ -1,6 +1,6 @@
 //! Immune Memory Protocol — 只共享攻击签名，不共享原始数据。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use agent_context_db_core::{EventMesh, Topic};
 
 /// 抗体 — 攻击模式的特征签名（不是原始 prompt）。

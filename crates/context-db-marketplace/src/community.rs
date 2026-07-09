@@ -3,7 +3,7 @@
 //! 当多个 Agent 在相同领域发布 → 隐性的知识社区。
 //! 某晶体 80%+ 命中来自同一 Agent/场景 → fork 特化版。
 
-use crate::marketplace::types::*;
+use crate::types::*;
 use std::collections::{HashMap, HashSet};
 
 /// 知识社区。

@@ -7,7 +7,7 @@ use crate::reflection::SemanticGradient;
 use crate::voting::EvolvableInsight;
 use crate::{CognitiveGradient, GradientType, HypothesisOutcome};
 use agent_context_db_consolidation::{
-    ConsolidationMeta as ProductConsolidationMeta, ConsolidationProduct,
+    ConsolidationProduct, ConsolidationProductMeta as ProductConsolidationMeta,
     HypothesisOutcome as ProductHypothesisOutcome,
 };
 use agent_context_db_core::{

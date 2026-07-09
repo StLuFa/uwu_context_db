@@ -1,4 +1,4 @@
-use agent_context_db_marketplace_types::{AgentId, FederatedDiscoveryHit, PublicationMetadata};
+use agent_context_db_marketplace::{AgentId, FederatedDiscoveryHit, PublicationMetadata};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

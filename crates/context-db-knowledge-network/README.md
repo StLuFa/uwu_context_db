@@ -5,7 +5,7 @@
 ## 定位
 
 - 只做**联邦网络与治理**：能力索引、隐私预算、访问授权、路由、聚合、拓扑
-- **不承载业务 payload**：与 Marketplace / Consolidation 通信只通过 `agent-context-db-marketplace-types` 的窄边界 DTO
+- **不承载业务 payload**：与 Marketplace / Consolidation 通信只通过 `agent-context-db-marketplace` 的窄边界 DTO
 - 传输解耦：`MeshTransport` trait 是唯一网络出口，配合 `uwu_event_mesh`
 
 ## 主要模块
@@ -42,7 +42,7 @@
 ## 依赖
 
 - `agent-context-db-core`
-- `agent-context-db-marketplace-types` — 与 marketplace 共享的窄边界 DTO
+- `agent-context-db-marketplace` — 与 marketplace 共享的窄边界 DTO
 - `uwu_event_mesh` — 底层事件网络（uwu 生态）
 - `parking_lot`、`chrono`、`serde`、`uuid`、`thiserror`
 
@@ -68,6 +68,6 @@ let result = fabric.query(&intent, &authz).await?;
 
 ## 与其他 crate 的关系
 
-- **依赖**：`core`、`marketplace-types`、`uwu_event_mesh`
-- **被依赖**：`consolidation`（marketplace 子模块用它做联邦发现）
+- **依赖**：`core`、`marketplace`、`uwu_event_mesh`
+- **被依赖**：`consolidation`（身份签名）、`marketplace` 的上层装配（联邦发现后端）
 - **不依赖**：`retrieve`、`consolidation`——这个 crate 是它们的下游支撑，避免反向依赖

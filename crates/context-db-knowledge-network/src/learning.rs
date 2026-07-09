@@ -1,4 +1,4 @@
-use agent_context_db_marketplace_types::AgentId;
+use agent_context_db_marketplace::AgentId;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

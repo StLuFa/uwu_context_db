@@ -6,28 +6,71 @@ use agent_context_db_core::{
     ContentLevel, ContentPayload, ContextUri, FsOps, LlmClient, LlmOpts, Result,
 };
 use async_trait::async_trait;
+use moka::future::Cache;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::SemanticProcessor;
+
+#[derive(Debug, Clone)]
+pub struct SemanticProcessorCacheConfig {
+    pub capacity: u64,
+    pub ttl: Duration,
+}
+
+impl Default for SemanticProcessorCacheConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 100_000,
+            ttl: Duration::from_secs(60 * 60 * 24 * 7),
+        }
+    }
+}
 
 /// 基于 `LlmClient` 的语义处理器实现。
 pub struct SemanticProcessorImpl {
     llm: Arc<dyn LlmClient>,
     fs: Arc<dyn FsOps>,
+    summaries: Cache<String, String>,
 }
 
 impl SemanticProcessorImpl {
     pub fn new(llm: Arc<dyn LlmClient>, fs: Arc<dyn FsOps>) -> Self {
-        Self { llm, fs }
+        Self::with_cache_config(llm, fs, SemanticProcessorCacheConfig::default())
+    }
+
+    pub fn with_cache_config(
+        llm: Arc<dyn LlmClient>,
+        fs: Arc<dyn FsOps>,
+        config: SemanticProcessorCacheConfig,
+    ) -> Self {
+        Self {
+            llm,
+            fs,
+            summaries: Cache::builder()
+                .max_capacity(config.capacity.max(1))
+                .time_to_live(config.ttl)
+                .build(),
+        }
     }
 }
 
 #[async_trait]
 impl SemanticProcessor for SemanticProcessorImpl {
     async fn generate_abstract(&self, uri: &ContextUri) -> Result<String> {
+        let payload = self.fs.read(uri, ContentLevel::L2).await?;
+        let content = strongest_text(&payload);
+        let key = summary_cache_key("abstract", uri, &content);
+        if let Some(cached) = self.summaries.get(&key).await {
+            return Ok(cached);
+        }
+
         let prompt = format!(
             r#"You are a context summarizer. Write a concise L0 abstract (~100 tokens) for:
 URI: {uri}
+
+Content:
+{content}
 
 An abstract should capture: what this entry is about, its category, and key information.
 Respond with ONLY the abstract text, no additional commentary.
@@ -40,19 +83,32 @@ Respond with ONLY the abstract text, no additional commentary.
             ..Default::default()
         };
 
-        self.llm
+        let summary = self
+            .llm
             .complete(&prompt, &opts)
             .await
             .map(|s| s.trim().to_string())
             .map_err(|e| {
                 agent_context_db_core::ContextError::Storage(format!("llm generate_abstract: {e}"))
-            })
+            })?;
+        self.summaries.insert(key, summary.clone()).await;
+        Ok(summary)
     }
 
     async fn generate_overview(&self, uri: &ContextUri) -> Result<String> {
+        let payload = self.fs.read(uri, ContentLevel::L2).await?;
+        let content = strongest_text(&payload);
+        let key = summary_cache_key("overview", uri, &content);
+        if let Some(cached) = self.summaries.get(&key).await {
+            return Ok(cached);
+        }
+
         let prompt = format!(
             r#"You are a context organizer. Write an L1 overview (~1000 tokens) for:
 URI: {uri}
+
+Content:
+{content}
 
 An overview should include:
 1. A structured table of contents with sections
@@ -70,13 +126,16 @@ Respond with ONLY the overview text.
             ..Default::default()
         };
 
-        self.llm
+        let overview = self
+            .llm
             .complete(&prompt, &opts)
             .await
             .map(|s| s.trim().to_string())
             .map_err(|e| {
                 agent_context_db_core::ContextError::Storage(format!("llm generate_overview: {e}"))
-            })
+            })?;
+        self.summaries.insert(key, overview.clone()).await;
+        Ok(overview)
     }
 
     async fn aggregate_upward(&self, root: &ContextUri) -> Result<String> {
@@ -125,6 +184,10 @@ Respond with ONLY the overview text.
             .map(|(uri, abs)| format!("- {uri}: {abs}"))
             .collect();
         let joined = children_text.join("\n");
+        let key = summary_cache_key("aggregate", root, &joined);
+        if let Some(cached) = self.summaries.get(&key).await {
+            return Ok(cached);
+        }
 
         let prompt = format!(
             r#"You are a context aggregator. Synthesize an L1 overview for directory:
@@ -148,13 +211,16 @@ Format as Markdown. Respond with ONLY the overview text.
             ..Default::default()
         };
 
-        self.llm
+        let overview = self
+            .llm
             .complete(&prompt, &opts)
             .await
             .map(|s| s.trim().to_string())
             .map_err(|e| {
                 agent_context_db_core::ContextError::Storage(format!("llm aggregate_upward: {e}"))
-            })
+            })?;
+        self.summaries.insert(key, overview.clone()).await;
+        Ok(overview)
     }
 
     async fn multimodal_to_text(&self, uri: &ContextUri) -> Result<(String, String)> {
@@ -225,6 +291,38 @@ Return your response as a JSON object:
 // ===========================================================================
 // 辅助函数
 // ===========================================================================
+
+fn summary_cache_key(kind: &str, uri: &ContextUri, content: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(uri.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(content.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn strongest_text(payload: &ContentPayload) -> String {
+    match payload {
+        ContentPayload::Text {
+            sparse,
+            dense,
+            full,
+        } => {
+            if !full.trim().is_empty() {
+                full.clone()
+            } else if !dense.trim().is_empty() {
+                dense.clone()
+            } else {
+                sparse.clone()
+            }
+        }
+        ContentPayload::Image { .. } => "[image]".into(),
+        ContentPayload::Audio { transcript, .. } => transcript.clone(),
+        ContentPayload::Structured { summary, data, .. } => format!("{summary}\n{data}"),
+        ContentPayload::Composite { summary, .. } => summary.clone(),
+    }
+}
 
 /// 检测字节内容的基本类型提示。
 fn detect_content_type(bytes: &[u8]) -> &'static str {
@@ -306,6 +404,25 @@ mod tests {
     #[test]
     fn detect_text_fallback() {
         assert_eq!(detect_content_type(b"hello world"), "text");
+    }
+
+    #[test]
+    fn summary_cache_key_changes_when_content_changes() {
+        let uri = ContextUri::parse("uwu://t/agent/a/fact/x").unwrap();
+        assert_ne!(
+            summary_cache_key("abstract", &uri, "old content"),
+            summary_cache_key("abstract", &uri, "new content")
+        );
+    }
+
+    #[test]
+    fn strongest_text_prefers_full_payload() {
+        let payload = ContentPayload::Text {
+            sparse: "sparse".into(),
+            dense: "dense".into(),
+            full: "full".into(),
+        };
+        assert_eq!(strongest_text(&payload), "full");
     }
 
     #[test]

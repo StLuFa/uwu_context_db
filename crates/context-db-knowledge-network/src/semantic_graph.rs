@@ -1,6 +1,6 @@
 use crate::capability::{CapabilitySketch, PeerCandidate};
 use crate::types::PrivateQuerySketch;
-use agent_context_db_marketplace_types::AgentId;
+use agent_context_db_marketplace::AgentId;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 

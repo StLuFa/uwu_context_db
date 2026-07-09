@@ -1,7 +1,7 @@
 use crate::privacy::{DpPolicy, PrivacyCost};
 use crate::trust::PeerRouteScore;
 use crate::types::{MeshDiscoveryOpts, PrivateQuerySketch, Result};
-use agent_context_db_marketplace_types::AgentId;
+use agent_context_db_marketplace::AgentId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

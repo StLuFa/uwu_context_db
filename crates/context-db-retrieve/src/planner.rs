@@ -6,7 +6,7 @@
 //! 3. PhysicalPlan 交由物理算子执行
 
 use crate::intent::{IntentDecision, IntentExecutionNodeKind, IntentRoute};
-use crate::query::{Condition, MergeStrategy, Predicate, SortKey};
+use crate::query::{Condition, Predicate, QueryMergeStrategy, SortKey};
 use agent_context_db_core::{ContentLevel, ContentType, ContextUri};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -26,7 +26,7 @@ pub enum LogicalPlan {
     /// 并行组合查询。
     Parallel {
         plans: Vec<LogicalPlan>,
-        merge: MergeStrategy,
+        merge: QueryMergeStrategy,
     },
     /// 向量语义搜索。
     VectorSearch {
@@ -59,13 +59,13 @@ pub enum LogicalPlan {
     /// 图遍历扩展。
     Traverse {
         input: Box<LogicalPlan>,
-        edges: Vec<crate::query::RelationKind>,
+        edges: Vec<agent_context_db_core::GraphRelation>,
         max_hops: usize,
     },
     /// 时态扫描。
     TemporalScan {
         uri: ContextUri,
-        at: crate::query::AsOfTime,
+        at: agent_context_db_core::AsOfTime,
     },
 }
 
@@ -126,13 +126,13 @@ pub enum PhysicalPlan {
     /// 图遍历。
     GraphTraverse {
         input: Box<PhysicalPlan>,
-        edges: Vec<crate::query::RelationKind>,
+        edges: Vec<agent_context_db_core::GraphRelation>,
         max_hops: usize,
     },
     /// 并行执行（多计划 + 合并）。
     Parallel {
         plans: Vec<PhysicalPlan>,
-        merge: MergeStrategy,
+        merge: QueryMergeStrategy,
     },
     /// 全表扫描（fallback）。
     FullScan {
@@ -563,7 +563,7 @@ mod tests {
         IntentExecutionNode, IntentExecutionNodeKind, IntentExplanation, IntentKind,
         IntentPolicyRef, IntentScoreBreakdown,
     };
-    use crate::query::RelationKind;
+    use agent_context_db_core::GraphRelation;
 
     #[test]
     fn intent_hint_limits_graph_depth() {
@@ -573,7 +573,7 @@ mod tests {
                 scope: Some(ContextUri::parse("uwu://u/agent/a/memories").unwrap()),
                 level: ContentLevel::L0,
             }),
-            edges: vec![RelationKind::DerivedFrom],
+            edges: vec![GraphRelation::DerivedFrom],
             max_hops: 5,
         };
         let decision = IntentDecision {

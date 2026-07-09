@@ -2,8 +2,11 @@
 //!
 //! 对同一主题从 4 个认知视角分别收集证据，再合成为高质量巩固产物。
 
-use agent_context_db_core::{ContextEntry, ContextUri, EpistemicType};
+use agent_context_db_core::{
+    ContextEntry, ContextUri, EpistemicType, LlmClient, LlmOpts, LlmTaskKind, PromptOptimization,
+};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // ===========================================================================
 // 视角定义
@@ -100,6 +103,7 @@ pub struct KnowledgeGap {
 pub struct MultiPerspectiveConsolidator {
     perspectives: Vec<Perspective>,
     min_confidence: f32,
+    llm: Option<Arc<dyn LlmClient>>,
 }
 
 impl MultiPerspectiveConsolidator {
@@ -107,11 +111,17 @@ impl MultiPerspectiveConsolidator {
         Self {
             perspectives: Perspective::all(),
             min_confidence: 0.3,
+            llm: None,
         }
     }
 
     pub fn with_perspectives(mut self, perspectives: Vec<Perspective>) -> Self {
         self.perspectives = perspectives;
+        self
+    }
+
+    pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
+        self.llm = Some(llm);
         self
     }
 
@@ -122,18 +132,26 @@ impl MultiPerspectiveConsolidator {
         topic: &str,
         evidence: &[ContextEntry],
     ) -> MultiPerspectiveProduct {
-        // 1. 每个视角分别分析
-        let mut views = Vec::new();
-        for perspective in &self.perspectives {
-            let view = self.analyze_from(*perspective, topic, evidence);
-            views.push(view);
-        }
+        // 1. 多视角分析：有 LLM 时使用 batch_complete 一次提交全部视角 prompt。
+        let views = match &self.llm {
+            Some(llm) => self
+                .analyze_batch_with_llm(llm.as_ref(), topic, evidence)
+                .await
+                .unwrap_or_else(|| self.analyze_batch_locally(topic, evidence)),
+            None => self.analyze_batch_locally(topic, evidence),
+        };
 
         // 2. 发现知识缺口
         let gaps = self.identify_gaps(&views);
 
         // 3. 多视角合成
-        let synthesized = self.synthesize(topic, &views, &gaps);
+        let synthesized = match &self.llm {
+            Some(llm) => self
+                .synthesize_with_llm(llm.as_ref(), topic, &views, &gaps)
+                .await
+                .unwrap_or_else(|| self.synthesize(topic, &views, &gaps)),
+            None => self.synthesize(topic, &views, &gaps),
+        };
 
         // 4. 计算综合置信度
         let overall_confidence =
@@ -147,6 +165,86 @@ impl MultiPerspectiveConsolidator {
             discovered_gaps: gaps,
             overall_confidence,
             epistemic_type: EpistemicType::Fact,
+        }
+    }
+
+    fn analyze_batch_locally(
+        &self,
+        topic: &str,
+        evidence: &[ContextEntry],
+    ) -> Vec<PerspectiveView> {
+        self.perspectives
+            .iter()
+            .map(|perspective| self.analyze_from(*perspective, topic, evidence))
+            .collect()
+    }
+
+    async fn analyze_batch_with_llm(
+        &self,
+        llm: &dyn LlmClient,
+        topic: &str,
+        evidence: &[ContextEntry],
+    ) -> Option<Vec<PerspectiveView>> {
+        let evidence_text = evidence_prompt(evidence);
+        let prompts = self
+            .perspectives
+            .iter()
+            .map(|perspective| perspective_prompt(*perspective, topic, &evidence_text))
+            .collect::<Vec<_>>();
+        let opts = LlmOpts {
+            max_tokens: Some(700),
+            temperature: Some(0.2),
+            task: LlmTaskKind::Synthesis,
+            prompt: PromptOptimization::default()
+                .force_cache()
+                .target_tokens(1_500),
+            ..Default::default()
+        };
+        let responses = llm.batch_complete(&prompts, &opts).await.ok()?;
+        if responses.len() != self.perspectives.len() {
+            return None;
+        }
+
+        Some(
+            self.perspectives
+                .iter()
+                .zip(responses)
+                .map(|(perspective, response)| {
+                    self.view_from_llm_response(*perspective, topic, evidence, &response)
+                })
+                .collect(),
+        )
+    }
+
+    fn view_from_llm_response(
+        &self,
+        perspective: Perspective,
+        topic: &str,
+        evidence: &[ContextEntry],
+        response: &str,
+    ) -> PerspectiveView {
+        let fallback = self.analyze_from(perspective, topic, evidence);
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            return fallback;
+        }
+
+        PerspectiveView {
+            summary: trimmed.lines().next().unwrap_or(trimmed).trim().to_string(),
+            key_insights: trimmed
+                .lines()
+                .skip(1)
+                .map(|line| {
+                    line.trim()
+                        .trim_start_matches(['-', '*'])
+                        .trim()
+                        .to_string()
+                })
+                .filter(|line| !line.is_empty())
+                .take(5)
+                .collect(),
+            confidence: (fallback.confidence + 0.2).clamp(self.min_confidence, 1.0),
+            ..fallback
         }
     }
 
@@ -245,6 +343,30 @@ impl MultiPerspectiveConsolidator {
         gaps
     }
 
+    async fn synthesize_with_llm(
+        &self,
+        llm: &dyn LlmClient,
+        topic: &str,
+        views: &[PerspectiveView],
+        gaps: &[KnowledgeGap],
+    ) -> Option<String> {
+        let prompt = synthesis_prompt(topic, views, gaps);
+        let opts = LlmOpts {
+            max_tokens: Some(1200),
+            temperature: Some(0.2),
+            task: LlmTaskKind::Synthesis,
+            prompt: PromptOptimization::default()
+                .force_cache()
+                .target_tokens(2_500),
+            ..Default::default()
+        };
+        llm.complete(&prompt, &opts)
+            .await
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
     /// 多视角合成 — 从多个视角结果生成统一摘要。
     fn synthesize(&self, topic: &str, views: &[PerspectiveView], gaps: &[KnowledgeGap]) -> String {
         let mut synthesis = format!("# Multi-Perspective Analysis: {topic}\n\n");
@@ -290,6 +412,58 @@ impl MultiPerspectiveConsolidator {
 
         synthesis
     }
+}
+
+fn evidence_prompt(evidence: &[ContextEntry]) -> String {
+    if evidence.is_empty() {
+        return "(no evidence)".into();
+    }
+    evidence
+        .iter()
+        .take(12)
+        .map(|entry| format!("- {}: {}", entry.uri, entry.l0_text()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn perspective_prompt(perspective: Perspective, topic: &str, evidence_text: &str) -> String {
+    format!(
+        "{}\nTopic: {topic}\nEvidence:\n{evidence_text}\n\n\
+         Return a concise perspective analysis. First line: summary. \
+         Remaining lines: 3-5 key insights or gaps.",
+        perspective.prompt_prefix()
+    )
+}
+
+fn synthesis_prompt(topic: &str, views: &[PerspectiveView], gaps: &[KnowledgeGap]) -> String {
+    let views_text = views
+        .iter()
+        .map(|view| {
+            format!(
+                "## {} confidence {:.2}\n{}\n{}",
+                view.perspective.name(),
+                view.confidence,
+                view.summary,
+                view.key_insights
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let gaps_text = gaps
+        .iter()
+        .take(8)
+        .map(|gap| format!("- {:.2}: {}", gap.severity, gap.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Synthesize these STORM-style perspectives for topic `{topic}` into a coherent report.\n\n\
+         Perspectives:\n{views_text}\n\nKnowledge gaps:\n{gaps_text}\n\n\
+         Return markdown with integrated claims, tensions, confidence, and next exploration steps."
+    )
 }
 
 #[cfg(test)]

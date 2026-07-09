@@ -3,7 +3,7 @@
 use crate::{RetrievalHit, RetrievalResult, RetrievalTrace, RetrieveContext, TraceStep};
 use agent_context_db_core::{
     ContentLevel, ContentPayload, ContextUri, FsOps, GraphRelation, GraphStore, LlmClient, LlmOpts,
-    Result,
+    Result, count_tokens,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -148,7 +148,7 @@ impl GraphRagIndex {
         }
         let tokens_used = hits
             .iter()
-            .map(|hit| hit.content.sparse_text().len() / 4)
+            .map(|hit| count_tokens(hit.content.sparse_text()))
             .sum::<usize>();
         Ok(RetrievalResult {
             hits,

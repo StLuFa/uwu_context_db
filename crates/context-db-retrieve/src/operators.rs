@@ -4,7 +4,7 @@
 
 use crate::RetrievalHit;
 use crate::planner::{PhysicalPlan, ScopeFilter, VectorFilter};
-use crate::query::{Condition, MergeStrategy, Predicate, Scope, SortKey};
+use crate::query::{Condition, Predicate, QueryMergeStrategy, Scope, SortKey};
 use agent_context_db_core::{
     ContentLevel, ContentPayload, ContentStore, ContentType, ContextEntry, ContextError,
     ContextUri, FsOps, Result, VectorIndex,
@@ -292,7 +292,7 @@ pub struct GraphTraverseOp;
 impl GraphTraverseOp {
     async fn execute_traverse(
         seed_batch: RecordBatch,
-        edges: &[crate::query::RelationKind],
+        edges: &[agent_context_db_core::GraphRelation],
         max_hops: usize,
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
@@ -306,41 +306,7 @@ impl GraphTraverseOp {
             .map(|hit| hit.uri.clone())
             .collect();
 
-        // 将 RelationKind 转换为 GraphRelation
-        let kinds: Vec<agent_context_db_core::GraphRelation> = edges
-            .iter()
-            .map(|e| match e {
-                crate::query::RelationKind::EvolvedFrom => {
-                    agent_context_db_core::GraphRelation::EvolvedFrom
-                }
-                crate::query::RelationKind::EvolvedTo => {
-                    agent_context_db_core::GraphRelation::EvolvedTo
-                }
-                crate::query::RelationKind::EvidenceOf => {
-                    agent_context_db_core::GraphRelation::EvidenceOf
-                }
-                crate::query::RelationKind::EntangledWith => {
-                    agent_context_db_core::GraphRelation::EntangledWith
-                }
-                crate::query::RelationKind::Contradicts => {
-                    agent_context_db_core::GraphRelation::Contradicts
-                }
-                crate::query::RelationKind::Corroborates => {
-                    agent_context_db_core::GraphRelation::Corroborates
-                }
-                crate::query::RelationKind::DerivedFrom => {
-                    agent_context_db_core::GraphRelation::DerivedFrom
-                }
-                crate::query::RelationKind::Supersedes => {
-                    agent_context_db_core::GraphRelation::Supersedes
-                }
-                crate::query::RelationKind::DrivesPolicy => {
-                    agent_context_db_core::GraphRelation::DrivesPolicy
-                }
-            })
-            .collect();
-
-        match graph.batch_traverse(&seeds, &kinds, max_hops).await {
+        match graph.batch_traverse(&seeds, edges, max_hops).await {
             Ok(edges_result) => {
                 let hits: Vec<RetrievalHit> = edges_result
                     .into_iter()
@@ -387,7 +353,7 @@ pub struct ParallelOp;
 impl ParallelOp {
     async fn execute_parallel(
         plans: &[PhysicalPlan],
-        merge: MergeStrategy,
+        merge: QueryMergeStrategy,
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
         let mut handles = Vec::new();
@@ -405,13 +371,13 @@ impl ParallelOp {
         }
 
         let merged = match merge {
-            MergeStrategy::Union => {
+            QueryMergeStrategy::Union => {
                 all_hits.sort_by(compare_relevance);
                 all_hits
             }
-            MergeStrategy::Dedup => dedup_best(all_hits),
-            MergeStrategy::Intersect => intersect_hits(all_hits, plans.len()),
-            MergeStrategy::First => all_hits,
+            QueryMergeStrategy::Dedup => dedup_best(all_hits),
+            QueryMergeStrategy::Intersect => intersect_hits(all_hits, plans.len()),
+            QueryMergeStrategy::First => all_hits,
         };
 
         Ok(RecordBatch {
@@ -602,7 +568,7 @@ mod tests {
     use super::*;
     use crate::compiler::query_to_logical;
     use crate::planner::CboOptimizer;
-    use crate::query::{Condition, MergeStrategy, Predicate, Query, SortKey};
+    use crate::query::{Condition, Predicate, Query, QueryMergeStrategy, SortKey};
     use agent_context_db_core::{ContentRepo, TenantId};
     use agent_context_db_testkit::MemoryContextStore;
     use std::sync::Arc;
@@ -672,7 +638,7 @@ mod tests {
         };
         let composite = Query::Composite {
             queries: vec![fact_query, error_query],
-            merge: MergeStrategy::Union,
+            merge: QueryMergeStrategy::Union,
         };
 
         let optimizer = CboOptimizer::new(Arc::new(crate::planner::StatisticsCollector::new()));

@@ -2,7 +2,7 @@
 //!
 //! 声明式上下文查询，编译为 LogicalPlan → CBO 优化 → PhysicalPlan 执行。
 
-use agent_context_db_core::{ContentLevel, ContentType, ContextUri};
+use agent_context_db_core::{AsOfTime, ContentLevel, ContentType, ContextUri, GraphRelation};
 
 // ===========================================================================
 // 查询 AST
@@ -38,14 +38,14 @@ pub enum Query {
     /// 图遍历查询。
     Traverse {
         start: ContextUri,
-        edges: Vec<RelationKind>,
+        edges: Vec<GraphRelation>,
         max_hops: usize,
         predicate: Predicate,
     },
     /// 组合查询（多查询并行 + 合并策略）。
     Composite {
         queries: Vec<Query>,
-        merge: MergeStrategy,
+        merge: QueryMergeStrategy,
     },
 }
 
@@ -113,34 +113,8 @@ pub enum SortKey {
 /// 关系扩展 — 沿关系图 N 跳扩展。
 #[derive(Debug, Clone)]
 pub struct RelationExpand {
-    pub kinds: Vec<RelationKind>,
+    pub kinds: Vec<GraphRelation>,
     pub max_hops: usize,
-}
-
-/// 关系类型（用于图遍历查询）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RelationKind {
-    EvolvedFrom,
-    EvolvedTo,
-    EvidenceOf,
-    EntangledWith,
-    Contradicts,
-    Corroborates,
-    DerivedFrom,
-    Supersedes,
-    DrivesPolicy,
-}
-
-// ===========================================================================
-// 时态查询
-// ===========================================================================
-
-/// 时态查询时间点。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AsOfTime {
-    Commit(String),
-    Timestamp(chrono::DateTime<chrono::Utc>),
-    Latest,
 }
 
 // ===========================================================================
@@ -149,7 +123,7 @@ pub enum AsOfTime {
 
 /// 多查询结果合并策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MergeStrategy {
+pub enum QueryMergeStrategy {
     /// 取并集，按 relevance 排序。
     Union,
     /// 取交集。

@@ -6,7 +6,8 @@
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
 use agent_context_db_core::{
-    EmbeddingVector, JsonSchema, LlmClient, LlmError, LlmOpts,
+    CachingLlmClient, CascadeLlmClient, CascadeLlmConfig, EmbeddingVector, JsonSchema, LlmClient,
+    LlmError, LlmOpts, PromptCacheMode, PromptOptimizingLlmClient,
     config::{LlmConfig, UwuConfig},
 };
 use async_trait::async_trait;
@@ -110,10 +111,37 @@ pub fn from_uwu_config(config: &UwuConfig) -> Result<Arc<dyn LlmClient>, LlmErro
 
 pub fn from_llm_config(config: &LlmConfig) -> Result<Arc<dyn LlmClient>, LlmError> {
     let provider_config = LlmProviderConfig::from_llm_config(config)?;
-    match provider_config.provider {
-        LlmProviderKind::OpenAi => Ok(Arc::new(OpenAiLlmClient::new(provider_config)?)),
-        LlmProviderKind::Anthropic => Ok(Arc::new(AnthropicLlmClient::new(provider_config)?)),
-        LlmProviderKind::GenericHttp => Ok(Arc::new(GenericHttpLlmClient::new(provider_config)?)),
+    let route_config = cascade_config_from_provider(&provider_config);
+    let inner: Arc<dyn LlmClient> = match provider_config.provider {
+        LlmProviderKind::OpenAi => Arc::new(OpenAiLlmClient::new(provider_config)?),
+        LlmProviderKind::Anthropic => Arc::new(AnthropicLlmClient::new(provider_config)?),
+        LlmProviderKind::GenericHttp => Arc::new(GenericHttpLlmClient::new(provider_config)?),
+    };
+    let optimized = PromptOptimizingLlmClient::new(inner).into_arc();
+    let routed = CascadeLlmClient::new(optimized, route_config).into_arc();
+    Ok(CachingLlmClient::new(routed).into_arc())
+}
+
+fn cascade_config_from_provider(config: &LlmProviderConfig) -> CascadeLlmConfig {
+    let cheap_model = config
+        .headers
+        .get("x-context-db-cheap-model")
+        .cloned()
+        .or_else(|| Some(config.model.clone()));
+    let strong_model = config
+        .headers
+        .get("x-context-db-strong-model")
+        .cloned()
+        .or_else(|| Some(config.model.clone()));
+    let upgrade_token_threshold = config
+        .headers
+        .get("x-context-db-upgrade-token-threshold")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4_000);
+    CascadeLlmConfig {
+        cheap_model,
+        strong_model,
+        upgrade_token_threshold,
     }
 }
 
@@ -148,6 +176,10 @@ impl LlmClient for OpenAiLlmClient {
 
     async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         self.inner.embed(text).await
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingVector>, LlmError> {
+        self.inner.embed_batch(texts).await
     }
 
     async fn complete_json(
@@ -194,6 +226,10 @@ impl LlmClient for GenericHttpLlmClient {
 
     async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         self.inner.embed(text).await
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingVector>, LlmError> {
+        self.inner.embed_batch(texts).await
     }
 
     async fn complete_json(
@@ -254,6 +290,18 @@ impl AnthropicLlmClient {
     }
 
     async fn embed_via_configured_endpoint(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
+        let mut embeddings = self
+            .embed_batch_via_configured_endpoint(&[text.to_string()])
+            .await?;
+        embeddings
+            .pop()
+            .ok_or_else(|| LlmError::Provider("embedding provider returned no vectors".into()))
+    }
+
+    async fn embed_batch_via_configured_endpoint(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<EmbeddingVector>, LlmError> {
         let base_url = self.config.embedding_base_url.as_ref().ok_or_else(|| {
             LlmError::Provider(
                 "anthropic does not expose a first-party embedding endpoint; set embedding_base_url for an OpenAI-compatible embedding service".into(),
@@ -268,9 +316,9 @@ impl AnthropicLlmClient {
             .as_deref()
             .unwrap_or(OPENAI_EMBEDDINGS_PATH);
         let headers = bearer_headers(&self.config.headers, self.config.api_key()?.as_deref())?;
-        let body = json!({ "model": model, "input": text });
+        let body = json!({ "model": model, "input": texts });
         let value = post_json(&self.client, &join_url(base_url, path), headers, body).await?;
-        extract_embedding(&value, model)
+        extract_embeddings(&value, model, texts.len())
     }
 }
 
@@ -281,7 +329,7 @@ impl LlmClient for AnthropicLlmClient {
             "model": model(&self.config.model, opts),
             "max_tokens": opts.max_tokens.unwrap_or(1024),
             "temperature": opts.temperature.unwrap_or(0.2),
-            "messages": [{ "role": "user", "content": prompt }],
+            "messages": anthropic_messages(prompt, opts),
         });
         let value = self.post_messages(body).await?;
         extract_anthropic_text(&value)
@@ -289,6 +337,10 @@ impl LlmClient for AnthropicLlmClient {
 
     async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
         self.embed_via_configured_endpoint(text).await
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingVector>, LlmError> {
+        self.embed_batch_via_configured_endpoint(texts).await
     }
 
     async fn complete_json(
@@ -301,7 +353,7 @@ impl LlmClient for AnthropicLlmClient {
             "model": model(&self.config.model, opts),
             "max_tokens": opts.max_tokens.unwrap_or(1024),
             "temperature": opts.temperature.unwrap_or(0.2),
-            "messages": [{ "role": "user", "content": prompt }],
+            "messages": anthropic_messages(prompt, opts),
             "tools": [{
                 "name": "emit_json",
                 "description": "Return the requested result as JSON.",
@@ -366,20 +418,27 @@ impl OpenAiCompatibleClient {
     }
 
     async fn embed(&self, text: &str) -> Result<EmbeddingVector, LlmError> {
+        let mut embeddings = self.embed_batch(&[text.to_string()]).await?;
+        embeddings
+            .pop()
+            .ok_or_else(|| LlmError::Provider("embedding provider returned no vectors".into()))
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingVector>, LlmError> {
         let model = self
             .config
             .embedding_model
             .as_deref()
             .unwrap_or(DEFAULT_OPENAI_EMBEDDING_MODEL);
-        let body = json!({ "model": model, "input": text });
+        let body = json!({ "model": model, "input": texts });
         let value = self.post_embeddings(body).await?;
-        extract_embedding(&value, model)
+        extract_embeddings(&value, model, texts.len())
     }
 
     fn chat_body(&self, prompt: &str, opts: &LlmOpts, response_format: Option<Value>) -> Value {
         let mut body = json!({
             "model": model(&self.config.model, opts),
-            "messages": [{ "role": "user", "content": prompt }],
+            "messages": openai_messages(prompt, opts),
         });
         if let Some(max_tokens) = opts.max_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -421,6 +480,61 @@ impl OpenAiCompatibleClient {
     }
 }
 
+fn openai_messages(prompt: &str, opts: &LlmOpts) -> Value {
+    let (prefix, body) = split_cacheable_prompt(prompt, opts);
+    if let Some(prefix) = prefix {
+        json!([
+            {
+                "role": "system",
+                "content": prefix,
+                "cache_control": { "type": "ephemeral" }
+            },
+            { "role": "user", "content": body }
+        ])
+    } else {
+        json!([{ "role": "user", "content": prompt }])
+    }
+}
+
+fn anthropic_messages(prompt: &str, opts: &LlmOpts) -> Value {
+    let (prefix, body) = split_cacheable_prompt(prompt, opts);
+    if let Some(prefix) = prefix {
+        json!([{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prefix,
+                    "cache_control": { "type": "ephemeral" }
+                },
+                { "type": "text", "text": body }
+            ]
+        }])
+    } else {
+        json!([{ "role": "user", "content": prompt }])
+    }
+}
+
+fn split_cacheable_prompt(prompt: &str, opts: &LlmOpts) -> (Option<String>, String) {
+    if opts.prompt.cache_mode == PromptCacheMode::Off {
+        return (None, prompt.to_string());
+    }
+    let min_tokens = opts.prompt.cache_prefix_tokens;
+    if min_tokens == 0 || agent_context_db_core::count_tokens(prompt) < min_tokens {
+        return (None, prompt.to_string());
+    }
+
+    let split_at = prompt
+        .find("\n\n")
+        .filter(|idx| *idx > 0)
+        .unwrap_or_else(|| prompt.len().min(2048));
+    let (prefix, rest) = prompt.split_at(split_at);
+    if agent_context_db_core::count_tokens(prefix) < min_tokens / 2 {
+        return (None, prompt.to_string());
+    }
+    (Some(prefix.to_string()), rest.trim_start().to_string())
+}
+
 fn model(default_model: &str, opts: &LlmOpts) -> String {
     opts.model.clone().unwrap_or_else(|| default_model.into())
 }
@@ -447,6 +561,9 @@ fn provider_headers(
         insert_header(&mut headers, name, value)?;
     }
     for (name, value) in custom {
+        if name.starts_with("x-context-db-") {
+            continue;
+        }
         insert_header(&mut headers, name, value)?;
     }
     Ok(headers)
@@ -553,25 +670,89 @@ fn extract_anthropic_tool_json(value: &Value) -> Result<String, LlmError> {
     Ok(input.to_string())
 }
 
+#[cfg(test)]
 fn extract_embedding(value: &Value, model_id: &str) -> Result<EmbeddingVector, LlmError> {
-    let array = value
-        .pointer("/data/0/embedding")
+    let mut embeddings = extract_embeddings(value, model_id, 1)?;
+    embeddings
+        .pop()
+        .ok_or_else(|| LlmError::Provider("embedding provider returned no vectors".into()))
+}
+
+fn extract_embeddings(
+    value: &Value,
+    model_id: &str,
+    expected_len: usize,
+) -> Result<Vec<EmbeddingVector>, LlmError> {
+    let data = value
+        .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| LlmError::Provider(format!("missing embedding vector: {value}")))?;
-    let vector: Vec<f32> = array
-        .iter()
-        .map(|v| {
-            v.as_f64()
-                .map(|n| n as f32)
-                .ok_or_else(|| LlmError::Provider(format!("non-number embedding value: {v}")))
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(EmbeddingVector::new(vector, model_id, 1))
+        .ok_or_else(|| LlmError::Provider(format!("missing embedding data: {value}")))?;
+    if data.len() != expected_len {
+        return Err(LlmError::Provider(format!(
+            "embedding provider returned {} vectors for {expected_len} inputs: {value}",
+            data.len()
+        )));
+    }
+
+    let mut indexed = Vec::with_capacity(data.len());
+    for (fallback_index, item) in data.iter().enumerate() {
+        let index = item
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(fallback_index);
+        let array = item
+            .get("embedding")
+            .and_then(Value::as_array)
+            .ok_or_else(|| LlmError::Provider(format!("missing embedding vector: {item}")))?;
+        let vector: Vec<f32> = array
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .map(|n| n as f32)
+                    .ok_or_else(|| LlmError::Provider(format!("non-number embedding value: {v}")))
+            })
+            .collect::<Result<_, _>>()?;
+        indexed.push((index, EmbeddingVector::new(vector, model_id, 1)));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed
+        .into_iter()
+        .map(|(_, embedding)| embedding)
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_messages_marks_cacheable_prefix() {
+        let opts = LlmOpts {
+            prompt: agent_context_db_core::PromptOptimization::default()
+                .force_cache()
+                .target_tokens(1_000),
+            ..Default::default()
+        };
+        let prompt = format!("{}\n\nuser evidence", "stable instruction ".repeat(400));
+        let messages = openai_messages(&prompt, &opts);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_messages_marks_cacheable_prefix() {
+        let opts = LlmOpts {
+            prompt: agent_context_db_core::PromptOptimization::default().force_cache(),
+            ..Default::default()
+        };
+        let prompt = format!("{}\n\nbody", "stable instruction ".repeat(400));
+        let messages = anthropic_messages(&prompt, &opts);
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
 
     #[test]
     fn parses_openai_text() {
@@ -596,5 +777,22 @@ mod tests {
         assert_eq!(embedding.model_id, "text-embedding-test");
         assert_eq!(embedding.dim, 2);
         assert_eq!(embedding.version, 1);
+    }
+
+    #[test]
+    fn parses_batch_embeddings_in_input_order() {
+        let value = json!({"data":[
+            {"index":1,"embedding":[2.0]},
+            {"index":0,"embedding":[1.0]}
+        ]});
+        let embeddings = extract_embeddings(&value, "text-embedding-test", 2).unwrap();
+        assert_eq!(embeddings[0].vector, vec![1.0]);
+        assert_eq!(embeddings[1].vector, vec![2.0]);
+    }
+
+    #[test]
+    fn rejects_partial_batch_embedding_response() {
+        let value = json!({"data":[{"index":0,"embedding":[1.0]}]});
+        assert!(extract_embeddings(&value, "text-embedding-test", 2).is_err());
     }
 }

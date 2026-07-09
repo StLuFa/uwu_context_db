@@ -17,6 +17,7 @@
 //! let batch = plan.execute(&exec_ctx).await?;
 //! ```
 
+use crate::budget::load_hits_within_budget;
 use crate::operators::ExecContext;
 use crate::planner::{CboOptimizer, LogicalPlan, PhysicalPlan, StatisticsCollector};
 use crate::query::Query;
@@ -355,26 +356,9 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
 // 工具函数
 // ===========================================================================
 
-fn load_within_budget(mut hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
-    use agent_context_db_core::ContentPayload;
-    let mut tokens = 0usize;
-    let mut result = Vec::new();
-    hits.sort_by(|a, b| {
-        b.relevance
-            .partial_cmp(&a.relevance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    for hit in hits {
-        let cost = match &hit.content {
-            ContentPayload::Text { sparse, .. } => (sparse.len() / 4).max(50),
-            _ => 50,
-        };
-        if tokens + cost <= budget {
-            tokens += cost;
-            result.push(hit);
-        }
-    }
-    (result, tokens)
+fn load_within_budget(hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
+    let plan = load_hits_within_budget(hits, budget);
+    (plan.hits, plan.tokens_used)
 }
 
 fn simple_hash(s: &str) -> u64 {

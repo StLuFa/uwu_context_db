@@ -15,8 +15,10 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["sync"] }
 moka = { version = "0.12", features = ["future"] }
 metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
 arc-swap = { workspace = true }
 blake3 = "1"
+tiktoken-rs = "0.6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 redis = { version = "0.25", features = ["aio", "tokio-comp", "streams"], optional = true }

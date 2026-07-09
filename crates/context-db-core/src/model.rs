@@ -151,7 +151,6 @@ impl ContentPayload {
 
     /// 按 token 预算逐层解码。
     pub fn decode_within_budget(&self, budget: usize) -> DecodedContent {
-        let estimate = |s: &str| s.len() / 4;
         match self {
             ContentPayload::Text {
                 sparse,
@@ -159,12 +158,12 @@ impl ContentPayload {
                 full,
             } => {
                 let l0 = sparse.clone();
-                let l1 = if budget >= estimate(dense) {
+                let l1 = if budget >= crate::tokenizer::count_tokens(dense) {
                     Some(dense.clone())
                 } else {
                     None
                 };
-                let l2 = if budget >= estimate(full) {
+                let l2 = if budget >= crate::tokenizer::count_tokens(full) {
                     Some(full.clone())
                 } else {
                     None

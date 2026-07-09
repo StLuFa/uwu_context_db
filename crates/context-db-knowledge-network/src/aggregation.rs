@@ -1,4 +1,4 @@
-use agent_context_db_marketplace_types::FederatedDiscoveryHit;
+use agent_context_db_marketplace::FederatedDiscoveryHit;
 
 #[derive(Debug, Clone)]
 pub struct StreamingTopKAggregator {

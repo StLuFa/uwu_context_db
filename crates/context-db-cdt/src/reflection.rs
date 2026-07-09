@@ -4,9 +4,14 @@
 //! 而是用 LLM 分析"为什么失败"、"应该怎么做"、"涉及哪些认识论类型"。
 
 use crate::voting::{EvolutionReport, EvolvableInsight, InsightEvolutionEngine};
-use agent_context_db_core::{ContentType, ContextUri, LlmClient, LlmOpts};
+use agent_context_db_core::{
+    ConsolidationMeta, ConsolidationStatus, ContentPayload, ContentType, ContextEntry, ContextUri,
+    EpistemicType, FindPattern, LlmClient, LlmOpts, MvccVersion, StateScope, TenantId,
+};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// 语义梯度 — 失败轨迹的可操作改进建议。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +40,30 @@ pub struct FailureTrace {
     pub trace: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReflectionWritebackConfig {
+    pub agent_scope: String,
+    pub tenant: TenantId,
+    pub min_priority: f32,
+}
+
+impl ReflectionWritebackConfig {
+    pub fn for_agent(agent_scope: impl Into<String>) -> Self {
+        Self {
+            agent_scope: agent_scope.into(),
+            tenant: TenantId(Uuid::new_v4()),
+            min_priority: 0.35,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReflectionRecallHint {
+    pub pattern: FindPattern,
+    pub query_text: String,
+    pub min_priority: f32,
+}
+
 /// Reflexion + ExpeL 的一次闭环结果。
 #[derive(Debug, Clone)]
 pub struct ReflexionEvolutionResult {
@@ -56,6 +85,145 @@ struct LlmReflectionResponse {
     action_improvement: String,
     epistemic_tags: Vec<String>,
     priority: f32,
+}
+
+impl SemanticGradient {
+    pub fn to_memory_entries(
+        &self,
+        config: &ReflectionWritebackConfig,
+        index: usize,
+    ) -> Vec<ContextEntry> {
+        if self.priority < config.min_priority {
+            return Vec::new();
+        }
+        let hash = blake3::hash(
+            format!(
+                "{}:{}:{}",
+                self.reflection_text, self.action_improvement, index
+            )
+            .as_bytes(),
+        )
+        .to_hex();
+        let short = &hash[..8];
+        let error_uri = ContextUri::parse(&format!(
+            "uwu://{}/memory/error/reflection/{:02}-{}",
+            config.agent_scope, index, short
+        ))
+        .expect("reflection error URI must be valid");
+        let heuristic_uri = ContextUri::parse(&format!(
+            "uwu://{}/memory/heuristic/reflection/{:02}-{}",
+            config.agent_scope, index, short
+        ))
+        .expect("reflection heuristic URI must be valid");
+
+        let mut error_entry = ContextEntry::new_text(
+            error_uri,
+            config.tenant,
+            format!(
+                "FAILURE: {}\nACTION: {}",
+                self.reflection_text, self.action_improvement
+            ),
+        );
+        error_entry.metadata.content_type = Some(ContentType::Error);
+        error_entry.metadata.epistemic_type = Some(EpistemicType::Heuristic);
+        error_entry.metadata.quality_score = Some(self.priority.clamp(0.0, 1.0));
+        error_entry.metadata.state_scope = Some(StateScope::Long);
+        error_entry.metadata.tags = self.prefixed_tags("reflection:error");
+        error_entry.metadata.consolidation = Some(reflection_meta(self, self.source_uri.clone()));
+
+        let mut heuristic_entry = ContextEntry::new_text(
+            heuristic_uri,
+            config.tenant,
+            format!("WHEN SIMILAR FAILURE: {}", self.action_improvement),
+        );
+        heuristic_entry.payload = ContentPayload::Text {
+            sparse: format!("Avoid repeated failure: {}", self.action_improvement),
+            dense: format!(
+                "Reflection lesson\nFailure: {}\nImprovement: {}\nTags: {}",
+                self.reflection_text,
+                self.action_improvement,
+                self.epistemic_tags.join(", ")
+            ),
+            full: format!(
+                "Reflection lesson\nFailure: {}\nImprovement: {}\nSource: {:?}\nTags: {}",
+                self.reflection_text,
+                self.action_improvement,
+                self.source_uri,
+                self.epistemic_tags.join(", ")
+            ),
+        };
+        heuristic_entry.metadata.content_type = Some(ContentType::Heuristic);
+        heuristic_entry.metadata.epistemic_type = Some(EpistemicType::Heuristic);
+        heuristic_entry.metadata.quality_score = Some(self.priority.clamp(0.0, 1.0));
+        heuristic_entry.metadata.state_scope = Some(StateScope::Long);
+        heuristic_entry.metadata.tags = self.prefixed_tags("reflection:heuristic");
+        heuristic_entry.metadata.consolidation =
+            Some(reflection_meta(self, Some(error_entry.uri.clone())));
+
+        vec![error_entry, heuristic_entry]
+    }
+
+    pub fn recall_hint(&self, agent_scope: &str) -> ReflectionRecallHint {
+        let scope = ContextUri::parse(&format!("uwu://{agent_scope}/memory/error/reflection"))
+            .expect("reflection recall scope must be valid");
+        ReflectionRecallHint {
+            pattern: FindPattern {
+                scope: Some(scope),
+                name_glob: Some(format!(
+                    "*{}*",
+                    recall_token(&self.reflection_text, &self.action_improvement)
+                )),
+                content_type: Some(ContentType::Error),
+                max_depth: Some(3),
+            },
+            query_text: format!("{} {}", self.reflection_text, self.action_improvement),
+            min_priority: self.priority,
+        }
+    }
+
+    fn prefixed_tags(&self, prefix: &str) -> Vec<String> {
+        let mut tags = vec![prefix.to_string()];
+        tags.extend(
+            self.epistemic_tags
+                .iter()
+                .map(|tag| format!("epistemic:{tag}")),
+        );
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+}
+
+fn reflection_meta(
+    gradient: &SemanticGradient,
+    evidence_uri: Option<ContextUri>,
+) -> ConsolidationMeta {
+    ConsolidationMeta {
+        source: "reflection-writeback".to_string(),
+        generation: 1,
+        status: ConsolidationStatus::Converged,
+        patch_count: 1,
+        lineage: vec![agent_context_db_core::LineageEntry {
+            version: MvccVersion(0),
+            timestamp: Utc::now(),
+            change_summary: format!("semantic gradient priority {:.2}", gradient.priority),
+        }],
+        evidence_uris: evidence_uri.into_iter().collect(),
+        corroboration: 1,
+        half_life_days: Some(120.0),
+        entangled_with: gradient.source_uri.iter().cloned().collect(),
+    }
+}
+
+fn recall_token(reflection: &str, action: &str) -> String {
+    reflection
+        .split_whitespace()
+        .chain(action.split_whitespace())
+        .find(|token| token.chars().filter(|c| c.is_alphanumeric()).count() >= 5)
+        .unwrap_or("reflection")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect::<String>()
 }
 
 impl ReflectionGenerator {

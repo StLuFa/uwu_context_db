@@ -22,6 +22,7 @@ pub enum LogicalPlan {
     Scan {
         scope: Option<ContextUri>,
         level: ContentLevel,
+        limit: Option<usize>,
     },
     /// 并行组合查询。
     Parallel {
@@ -299,10 +300,22 @@ impl CboOptimizer {
         logical: &LogicalPlan,
         hint: Option<&IntentPlannerHint>,
     ) -> PhysicalPlan {
+        self.optimize_with_budget(logical, usize::MAX, hint)
+    }
+
+    fn optimize_with_budget(
+        &self,
+        logical: &LogicalPlan,
+        budget: usize,
+        hint: Option<&IntentPlannerHint>,
+    ) -> PhysicalPlan {
         match logical {
-            LogicalPlan::Scan { scope, level: _ } => {
-                let limit = 1000;
-                // 快路径：如果有 scope，用前缀扫描
+            LogicalPlan::Scan {
+                scope,
+                level: _,
+                limit,
+            } => {
+                let limit = limit.unwrap_or(1000).min(budget);
                 if let Some(uri) = scope {
                     PhysicalPlan::PgPrefixScan {
                         uri_prefix: uri.to_string(),
@@ -316,7 +329,7 @@ impl CboOptimizer {
             LogicalPlan::Parallel { plans, merge } => PhysicalPlan::Parallel {
                 plans: plans
                     .iter()
-                    .map(|plan| self.optimize_inner(plan, hint))
+                    .map(|plan| self.optimize_with_budget(plan, budget, hint))
                     .collect(),
                 merge: *merge,
             },
@@ -344,17 +357,30 @@ impl CboOptimizer {
             }
 
             LogicalPlan::Filter { input, predicate } => {
-                // 优化：如果谓词只含 TypeEquals，下推到 TypeScan
                 if let Some(ct) = predicate_type_only(predicate) {
-                    let scope = extract_scope(input);
                     return PhysicalPlan::TypeScan {
                         content_type: ct,
-                        scope,
-                        limit: 100,
+                        scope: extract_scope(input),
+                        limit: extract_limit(input).unwrap_or_else(|| self.type_limit(&ct)),
                     };
                 }
-                // 否则：先执行 input，再 filter
-                let inner = self.optimize_inner(input, hint);
+                if let LogicalPlan::VectorSearch { query, top_k, .. } = input.as_ref() {
+                    let (filter, residual) = vector_filter_from_predicate(predicate);
+                    let search = PhysicalPlan::VectorSearch {
+                        embedding: query.clone(),
+                        filter,
+                        limit: *top_k,
+                    };
+                    return if residual.is_empty() {
+                        search
+                    } else {
+                        PhysicalPlan::Filter {
+                            input: Box::new(search),
+                            predicate: residual,
+                        }
+                    };
+                }
+                let inner = self.optimize_with_budget(input, budget, hint);
                 PhysicalPlan::Filter {
                     input: Box::new(inner),
                     predicate: predicate.clone(),
@@ -366,7 +392,7 @@ impl CboOptimizer {
                 key,
                 desc: _,
             } => {
-                let inner = self.optimize_inner(input, hint);
+                let inner = self.optimize_with_budget(input, budget, hint);
                 PhysicalPlan::Sort {
                     input: Box::new(inner),
                     key: *key,
@@ -374,10 +400,16 @@ impl CboOptimizer {
             }
 
             LogicalPlan::Limit { input, budget } => {
-                let inner = self.optimize_inner(input, hint);
-                PhysicalPlan::Limit {
-                    input: Box::new(inner),
-                    budget: *budget,
+                let inner = self.optimize_with_budget(input, *budget, hint);
+                match inner {
+                    PhysicalPlan::TypeScan { .. }
+                    | PhysicalPlan::PgPrefixScan { .. }
+                    | PhysicalPlan::VectorSearch { .. }
+                    | PhysicalPlan::FullScan { .. } => inner,
+                    _ => PhysicalPlan::Limit {
+                        input: Box::new(inner),
+                        budget: *budget,
+                    },
                 }
             }
 
@@ -386,7 +418,7 @@ impl CboOptimizer {
                 edges,
                 max_hops,
             } => {
-                let input = self.optimize_inner(input, hint);
+                let input = self.optimize_with_budget(input, budget, hint);
                 let max_hops = hint
                     .filter(|hint| {
                         hint.prefer_graph || matches!(hint.route, IntentRoute::GraphTraversal)
@@ -419,14 +451,20 @@ impl CboOptimizer {
             }
 
             LogicalPlan::Join { left, right, on: _ } => {
-                let l = self.optimize_inner(left, hint);
-                let r = self.optimize_inner(right, hint);
+                let l = self.optimize_with_budget(left, budget, hint);
+                let r = self.optimize_with_budget(right, budget, hint);
                 PhysicalPlan::HashJoin {
                     left: Box::new(l),
                     right: Box::new(r),
                 }
             }
         }
+    }
+
+    fn type_limit(&self, content_type: &ContentType) -> usize {
+        self.stats
+            .estimate_rows_by_type(content_type)
+            .clamp(1, 4096)
     }
 
     /// 估算物理计划的执行成本。
@@ -545,6 +583,44 @@ fn predicate_type_only(predicate: &Predicate) -> Option<ContentType> {
     None
 }
 
+fn vector_filter_from_predicate(predicate: &Predicate) -> (VectorFilter, Predicate) {
+    let mut filter = VectorFilter::default();
+    let mut residual = Predicate::new();
+    for condition in &predicate.conditions {
+        match condition {
+            Condition::TypeEquals(ct) => filter.content_type = Some(*ct),
+            Condition::ScopeEquals(scope) => {
+                if let Some(prefix) = scope_prefix(scope) {
+                    filter.uri_prefix = Some(prefix);
+                } else {
+                    residual.conditions.push(condition.clone());
+                }
+            }
+            Condition::ValidOnly => filter.only_valid = true,
+            other => residual.conditions.push(other.clone()),
+        }
+    }
+    (filter, residual)
+}
+
+fn scope_prefix(scope: &crate::query::Scope) -> Option<String> {
+    match scope {
+        crate::query::Scope::Tenant(tenant) => Some(format!("uwu://{tenant}")),
+        crate::query::Scope::Agent(_) | crate::query::Scope::All => None,
+    }
+}
+
+fn extract_limit(plan: &LogicalPlan) -> Option<usize> {
+    match plan {
+        LogicalPlan::Scan { limit, .. } => *limit,
+        LogicalPlan::Limit { budget, .. } => Some(*budget),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Traverse { input, .. } => extract_limit(input),
+        _ => None,
+    }
+}
+
 /// 从逻辑计划中提取 scope。
 fn extract_scope(plan: &LogicalPlan) -> Option<ScopeFilter> {
     match plan {
@@ -572,6 +648,7 @@ mod tests {
             input: Box::new(LogicalPlan::Scan {
                 scope: Some(ContextUri::parse("uwu://u/agent/a/memories").unwrap()),
                 level: ContentLevel::L0,
+                limit: Some(100),
             }),
             edges: vec![GraphRelation::DerivedFrom],
             max_hops: 5,

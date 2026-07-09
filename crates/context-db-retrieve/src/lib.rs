@@ -24,6 +24,7 @@ pub mod perf;
 pub mod planner;
 pub mod quality;
 pub mod query;
+pub mod rag;
 pub mod retriever;
 
 pub use associative::AssociativeExpander;
@@ -53,6 +54,10 @@ pub use planner::{
 };
 pub use quality::{CompressionAwareLoader, HallucinationDetector, PressureLevel, QualityReport};
 pub use query::{Condition, Predicate, Query, QueryMergeStrategy, SortKey};
+pub use rag::{
+    AnswerCitation, AnswerConfidence, AnswerDecision, AnswerSynthesisConfig, CalibratedAnswer,
+    CalibratedAnswerSynthesizer,
+};
 pub use retriever::{ContextRetriever, ContextRetrieverBuilder, RuleBasedPlanner};
 
 use agent_context_db_core::{

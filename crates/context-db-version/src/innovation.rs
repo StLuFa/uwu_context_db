@@ -1,10 +1,13 @@
 //! 版本层创新功能（F19 知识晶体 + F21 自修复 + F23 梦境巩固 + F27 因果推断）。
 
 use agent_context_db_core::{
-    ContentLevel, ContextUri, FsOps, LlmClient, LlmOpts, LlmTaskKind, PromptOptimization,
+    ConsolidationMeta, ConsolidationStatus, ContentLevel, ContentPayload, ContentStore,
+    ContentType, ContextEntry, ContextUri, FsOps, LineageEntry, LlmClient, LlmOpts, LlmTaskKind,
+    MediaType, MvccVersion, PromptOptimization, StateScope, TenantId,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::{CommitId, TemporalReasoner, VersionStore};
 
@@ -13,7 +16,7 @@ use crate::{CommitId, TemporalReasoner, VersionStore};
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// 知识晶体 —— 从大量经验中蒸馏出的紧凑知识单元。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KnowledgeCrystal {
     /// 晶体标识
     pub id: String,
@@ -33,6 +36,241 @@ pub struct KnowledgeCrystal {
 pub struct CrystalDistiller {
     llm: Arc<dyn LlmClient>,
     fs: Arc<dyn FsOps>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CrystalWritebackConfig {
+    pub tenant: TenantId,
+    pub agent_scope: String,
+    pub min_confidence: f32,
+    pub write_dream_insights: bool,
+}
+
+impl CrystalWritebackConfig {
+    pub fn for_agent(agent_scope: impl Into<String>) -> Self {
+        Self {
+            tenant: TenantId(Uuid::new_v4()),
+            agent_scope: agent_scope.into(),
+            min_confidence: 0.35,
+            write_dream_insights: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CrystalWritebackReport {
+    pub entries: Vec<ContextEntry>,
+    pub skipped_low_confidence: usize,
+    pub written: usize,
+}
+
+pub struct CrystalMemoryWriter {
+    store: Option<Arc<dyn ContentStore>>,
+    config: CrystalWritebackConfig,
+}
+
+impl CrystalMemoryWriter {
+    pub fn new(config: CrystalWritebackConfig) -> Self {
+        Self {
+            store: None,
+            config,
+        }
+    }
+
+    pub fn with_store(mut self, store: Arc<dyn ContentStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    pub fn entries_from_crystals(&self, crystals: &[KnowledgeCrystal]) -> CrystalWritebackReport {
+        let mut report = CrystalWritebackReport::default();
+        for (index, crystal) in crystals.iter().enumerate() {
+            if crystal.confidence < self.config.min_confidence {
+                report.skipped_low_confidence += 1;
+                continue;
+            }
+            report
+                .entries
+                .push(entry_from_crystal(&self.config, crystal, index));
+        }
+        report
+    }
+
+    pub fn entries_from_dream_insights(&self, insights: &[String]) -> CrystalWritebackReport {
+        let mut report = CrystalWritebackReport::default();
+        if !self.config.write_dream_insights {
+            return report;
+        }
+        for (index, insight) in insights.iter().enumerate() {
+            let trimmed = insight.trim();
+            if trimmed.is_empty() {
+                report.skipped_low_confidence += 1;
+                continue;
+            }
+            report
+                .entries
+                .push(entry_from_dream_insight(&self.config, trimmed, index));
+        }
+        report
+    }
+
+    pub async fn write_crystals(&self, crystals: &[KnowledgeCrystal]) -> CrystalWritebackReport {
+        let mut report = self.entries_from_crystals(crystals);
+        report.written = self.write_entries(&report.entries).await;
+        report
+    }
+
+    pub async fn write_dream_insights(&self, insights: &[String]) -> CrystalWritebackReport {
+        let mut report = self.entries_from_dream_insights(insights);
+        report.written = self.write_entries(&report.entries).await;
+        report
+    }
+
+    async fn write_entries(&self, entries: &[ContextEntry]) -> usize {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        store
+            .batch_write(entries)
+            .await
+            .map(|versions| versions.len())
+            .unwrap_or(0)
+    }
+}
+
+fn entry_from_crystal(
+    config: &CrystalWritebackConfig,
+    crystal: &KnowledgeCrystal,
+    index: usize,
+) -> ContextEntry {
+    let now = chrono::Utc::now();
+    let slug = stable_slug(&format!("{}-{}", crystal.id, crystal.principle));
+    let uri = ContextUri::parse(format!(
+        "uwu://{}/memory/skill/crystal/{:02}-{}",
+        config.agent_scope, index, slug
+    ))
+    .unwrap_or_else(|_| ContextUri::parse("uwu://t/a/memory/skill/crystal/fallback").unwrap());
+    let mut entry = ContextEntry {
+        uri,
+        tenant: config.tenant,
+        payload: ContentPayload::Text {
+            sparse: crystal.principle.clone(),
+            dense: format!(
+                "Principle: {}\nPreconditions: {}\nExpected outcome: {}",
+                crystal.principle,
+                crystal.preconditions.join("; "),
+                crystal.expected_outcome
+            ),
+            full: format!(
+                "Knowledge crystal {}\n\nPrinciple: {}\n\nPreconditions:\n{}\n\nExpected outcome:\n{}\n\nEvidence:\n{}",
+                crystal.id,
+                crystal.principle,
+                crystal
+                    .preconditions
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                crystal.expected_outcome,
+                crystal
+                    .evidence
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        },
+        media_type: MediaType::Text,
+        metadata: Default::default(),
+        mvcc_version: MvccVersion(0),
+        created_at: now,
+        updated_at: now,
+        derivation: None,
+    };
+    entry.metadata.content_type = Some(ContentType::Skill);
+    entry.metadata.state_scope = Some(StateScope::Long);
+    entry.metadata.quality_score = Some(crystal.confidence.clamp(0.0, 1.0));
+    entry.metadata.tags = vec!["crystal:distilled".into(), "training:candidate".into()];
+    entry.metadata.consolidation = Some(ConsolidationMeta {
+        source: "crystal-distiller".into(),
+        generation: 1,
+        status: ConsolidationStatus::InProgress,
+        patch_count: 0,
+        lineage: vec![LineageEntry {
+            version: MvccVersion(0),
+            timestamp: now,
+            change_summary: "distilled experience crystal into long-term skill memory".into(),
+        }],
+        evidence_uris: crystal.evidence.clone(),
+        corroboration: crystal.evidence.len(),
+        half_life_days: Some(180.0),
+        entangled_with: crystal.evidence.clone(),
+    });
+    let _ = entry
+        .metadata
+        .set_custom_field("knowledge_crystal", crystal);
+    entry
+}
+
+fn entry_from_dream_insight(
+    config: &CrystalWritebackConfig,
+    insight: &str,
+    index: usize,
+) -> ContextEntry {
+    let now = chrono::Utc::now();
+    let slug = stable_slug(insight);
+    let uri = ContextUri::parse(format!(
+        "uwu://{}/memory/heuristic/dream/{:02}-{}",
+        config.agent_scope, index, slug
+    ))
+    .unwrap_or_else(|_| ContextUri::parse("uwu://t/a/memory/heuristic/dream/fallback").unwrap());
+    let mut entry = ContextEntry::new_text(uri, config.tenant, insight.to_string());
+    entry.metadata.content_type = Some(ContentType::Heuristic);
+    entry.metadata.state_scope = Some(StateScope::Long);
+    entry.metadata.quality_score = Some(0.62);
+    entry.metadata.tags = vec!["dream:insight".into(), "crystal:replay".into()];
+    entry.metadata.consolidation = Some(ConsolidationMeta {
+        source: "dream-consolidator".into(),
+        generation: 1,
+        status: ConsolidationStatus::InProgress,
+        patch_count: 0,
+        lineage: vec![LineageEntry {
+            version: MvccVersion(0),
+            timestamp: now,
+            change_summary: "converted dream replay insight into heuristic memory".into(),
+        }],
+        evidence_uris: vec![],
+        corroboration: 1,
+        half_life_days: Some(90.0),
+        entangled_with: vec![],
+    });
+    let _ = entry.metadata.set_custom_field("dream_insight", &insight);
+    entry
+}
+
+fn stable_slug(text: &str) -> String {
+    let hash = blake3_like(text);
+    let prefix = text
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|token| !token.is_empty())
+        .take(4)
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("-");
+    if prefix.is_empty() {
+        hash
+    } else {
+        format!("{}-{}", prefix, hash)
+    }
+}
+
+fn blake3_like(text: &str) -> String {
+    let mut acc: u64 = 0xcbf29ce484222325;
+    for byte in text.as_bytes() {
+        acc ^= *byte as u64;
+        acc = acc.wrapping_mul(0x100000001b3);
+    }
+    format!("{:x}", acc)[..8].to_string()
 }
 
 impl CrystalDistiller {
@@ -586,7 +824,6 @@ impl InterventionResult {
 #[derive(Debug, Clone)]
 struct CausalSamples {
     variables: Vec<ContextUri>,
-    variable_index: HashMap<ContextUri, usize>,
     rows: Vec<Vec<bool>>,
 }
 
@@ -700,11 +937,7 @@ fn build_causal_samples(
         })
         .collect();
 
-    CausalSamples {
-        variables,
-        variable_index,
-        rows,
-    }
+    CausalSamples { variables, rows }
 }
 
 fn touched_uris(commit: &crate::Commit) -> HashSet<ContextUri> {
@@ -1172,6 +1405,52 @@ mod tests {
     }
 
     #[test]
+    fn crystal_writer_turns_crystals_into_long_term_skill_entries() {
+        let evidence = ContextUri::parse("uwu://t/a/memory/error/e1").unwrap();
+        let crystal = KnowledgeCrystal {
+            id: "c1".into(),
+            principle: "verify migrations before deploy".into(),
+            evidence: vec![evidence.clone()],
+            confidence: 0.82,
+            preconditions: vec!["schema changed".into()],
+            expected_outcome: "fewer rollout failures".into(),
+        };
+        let writer = CrystalMemoryWriter::new(CrystalWritebackConfig {
+            tenant: TenantId(Uuid::new_v4()),
+            agent_scope: "t/a".into(),
+            min_confidence: 0.35,
+            write_dream_insights: true,
+        });
+        let report = writer.entries_from_crystals(&[crystal]);
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.metadata.content_type, Some(ContentType::Skill));
+        assert_eq!(entry.metadata.state_scope, Some(StateScope::Long));
+        assert!(entry.uri.to_string().contains("/memory/skill/crystal/"));
+        assert!(
+            entry
+                .metadata
+                .consolidation
+                .as_ref()
+                .unwrap()
+                .evidence_uris
+                .contains(&evidence)
+        );
+    }
+
+    #[test]
+    fn crystal_writer_turns_dream_insights_into_heuristics() {
+        let writer = CrystalMemoryWriter::new(CrystalWritebackConfig::for_agent("t/a"));
+        let report = writer
+            .entries_from_dream_insights(&["cluster auth failures into retry heuristic".into()]);
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.metadata.content_type, Some(ContentType::Heuristic));
+        assert!(entry.uri.to_string().contains("/memory/heuristic/dream/"));
+        assert!(entry.metadata.tags.contains(&"dream:insight".to_string()));
+    }
+
+    #[test]
     fn causal_hypothesis_sorts_by_confidence() {
         let h1 = CausalHypothesis {
             cause_uri: ContextUri::parse("uwu://t/agent/a/memories/events/cause-a").unwrap(),
@@ -1308,10 +1587,6 @@ mod tests {
                 row
             })
             .collect();
-        CausalSamples {
-            variables,
-            variable_index,
-            rows,
-        }
+        CausalSamples { variables, rows }
     }
 }

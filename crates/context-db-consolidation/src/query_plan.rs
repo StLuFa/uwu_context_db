@@ -83,7 +83,7 @@ pub struct RetrievalHit {
 #[derive(Debug, Clone)]
 pub enum QueryPlan {
     /// 快路径 1：纯类型扫描（~80% 的查询）。
-    /// 引擎：PG WHERE uri LIKE 'uwu://t/a/x/{type}/%'
+    /// 引擎：PG WHERE uri LIKE 'uwu://t/a/memory/{type}/%'
     TypeScan {
         content_type: ContentType,
         scope: Option<QueryScope>,
@@ -291,8 +291,8 @@ impl QueryExecutor {
         let hits = raw_hits
             .into_iter()
             .filter(|h| {
-                // 类型轴内联过滤：URI 路径含 /x/{type}/
-                h.uri.as_str().contains(&format!("/x/{type_seg}/"))
+                // 类型轴内联过滤：URI 路径含 /memory/{type}/
+                h.uri.as_str().contains(&format!("/memory/{type_seg}/"))
             })
             .filter_map(|h| {
                 if !lifecycle_filter_by_uri(&h.uri, lifecycle) { return None; }
@@ -331,7 +331,7 @@ impl QueryExecutor {
                 raw.into_iter()
                     .filter(|h| {
                         if let Some(ct) = content_type {
-                            h.uri.as_str().contains(&format!("/x/{}/", ct.as_path_segment()))
+                            h.uri.as_str().contains(&format!("/memory/{}/", ct.as_path_segment()))
                         } else {
                             true
                         }
@@ -405,7 +405,7 @@ impl QueryExecutor {
             _ => "default/default".to_string(),
         };
         match content_type {
-            Some(ct) => format!("uwu://t/{agent_part}/x/{}/", ct.as_path_segment()),
+            Some(ct) => format!("uwu://t/{agent_part}/memory/{}/", ct.as_path_segment()),
             None => format!("uwu://t/{agent_part}/"),
         }
     }

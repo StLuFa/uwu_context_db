@@ -88,7 +88,7 @@ impl ExplainableLineage {
     /// 异步版：注入 `fs` 后，从存储加载每条证据的 L0 摘要。
     ///
     /// - 加载 evidence L0 payload
-    /// - 从 URI 中提取 session_id（`uwu://.../s/{session}/x/...`）
+    /// - 从 URI 中提取 session_id（`uwu://.../s/{session}/memory/...`）
     /// - 从 payload 中提取 sparse text 作为 content_summary
     /// - 若 fs 未注入 → 退化为 `explain()`
     pub async fn explain_async(

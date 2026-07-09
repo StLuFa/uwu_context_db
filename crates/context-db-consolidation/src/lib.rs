@@ -16,6 +16,7 @@ pub mod entanglement;
 pub mod explainable;
 pub mod guard;
 pub mod halflife;
+pub mod health;
 pub mod lineage;
 pub mod loader;
 pub mod opportunity;
@@ -27,6 +28,11 @@ pub mod security;
 pub mod semantic_axis;
 pub mod tiered_cache;
 
+use crate::halflife::SpacedRepetitionScheduler;
+use crate::health::{
+    ActiveConsistencyGuardian, ActiveLearningLoop, CuriosityExplorer, EmbeddingDriftMonitor,
+    KnowledgeHealthDiagnostician,
+};
 use crate::quality::{HorizonAwareQualityScorer, HorizonQualitySignals, QualityRoute};
 use agent_context_db_core::{
     ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType, LineageEntry,
@@ -934,6 +940,13 @@ pub enum SleeptimeTask {
     CalibrationUpdate,
     ContextRotPrune,
     BackwardEvolve,
+    SpacedRepetitionReview,
+    CascadeInvalidation,
+    KnowledgeHealthDiagnosis,
+    ActiveConsistencyGuard,
+    ActiveLearningLoop,
+    EmbeddingDriftDetection,
+    CuriosityExploration,
 }
 
 /// Sleeptime 执行器 — 空闲时执行后台整理，支持从存储加载数据。
@@ -962,6 +975,13 @@ impl SleeptimeExecutor {
                 SleeptimeTask::CalibrationUpdate,
                 SleeptimeTask::ContextRotPrune,
                 SleeptimeTask::BackwardEvolve,
+                SleeptimeTask::SpacedRepetitionReview,
+                SleeptimeTask::CascadeInvalidation,
+                SleeptimeTask::KnowledgeHealthDiagnosis,
+                SleeptimeTask::ActiveConsistencyGuard,
+                SleeptimeTask::ActiveLearningLoop,
+                SleeptimeTask::EmbeddingDriftDetection,
+                SleeptimeTask::CuriosityExploration,
             ],
             interval: std::time::Duration::from_secs(3600),
             checker: ConsistencyChecker::new(),
@@ -1265,6 +1285,207 @@ impl SleeptimeExecutor {
                     }
                     report.tasks_executed += 1;
                 }
+                SleeptimeTask::SpacedRepetitionReview => {
+                    let scheduler = SpacedRepetitionScheduler::default();
+                    let tasks = scheduler.plan(&entries, Utc::now());
+                    report.review_tasks = tasks.len();
+                    if let Some(store) = self.store.as_ref() {
+                        let by_uri = tasks
+                            .iter()
+                            .map(|task| (task.uri.clone(), task))
+                            .collect::<std::collections::HashMap<_, _>>();
+                        for entry in &entries {
+                            let Some(task) = by_uri.get(&entry.uri) else {
+                                continue;
+                            };
+                            let mut updated = entry.clone();
+                            updated.metadata.tags.push(format!(
+                                "quality:review:{}",
+                                match task.action {
+                                    crate::halflife::ReviewAction::Rehearse => "rehearse",
+                                    crate::halflife::ReviewAction::Revalidate => "revalidate",
+                                    crate::halflife::ReviewAction::ForgetCandidate =>
+                                        "forget-candidate",
+                                }
+                            ));
+                            if store.write(updated).await.is_ok() {
+                                report.review_tasks_written += 1;
+                            }
+                        }
+                    }
+                    report.tasks_executed += 1;
+                }
+                SleeptimeTask::CascadeInvalidation => {
+                    let invalidated = entries
+                        .iter()
+                        .filter(|entry| {
+                            entry
+                                .metadata
+                                .validity
+                                .as_ref()
+                                .and_then(|validity| validity.valid_until)
+                                .is_some()
+                        })
+                        .collect::<Vec<_>>();
+                    let detector = Arc::new(crate::entanglement::EntanglementDetector::new(0.3));
+                    for entry in &entries {
+                        if let Some(meta) = &entry.metadata.consolidation {
+                            for partner in &meta.entangled_with {
+                                detector.record_co_patch(&entry.uri, partner);
+                            }
+                        }
+                    }
+                    let mut invalidator = crate::entanglement::CascadeInvalidator::new(detector);
+                    if let Some(graph) = &self.graph {
+                        invalidator = invalidator.with_graph(graph.clone());
+                    }
+                    let mut mutable = entries.clone();
+                    for entry in invalidated {
+                        let plan = invalidator.plan_from_invalidated(&entry.uri).await;
+                        report.cascade_revalidation_tasks += plan
+                            .tasks
+                            .iter()
+                            .filter(|task| {
+                                matches!(
+                                    task.action,
+                                    crate::entanglement::CascadeInvalidationAction::Revalidate
+                                )
+                            })
+                            .count();
+                        report.cascade_invalidations += plan
+                            .tasks
+                            .iter()
+                            .filter(|task| {
+                                matches!(
+                                    task.action,
+                                    crate::entanglement::CascadeInvalidationAction::Invalidate
+                                )
+                            })
+                            .count();
+                        invalidator.apply_to_entries(&mut mutable, &plan);
+                    }
+                    if let Some(store) = self.store.as_ref() {
+                        for updated in mutable {
+                            if updated
+                                .metadata
+                                .tags
+                                .iter()
+                                .any(|tag| tag.starts_with("cascade:"))
+                            {
+                                let _ = store.write(updated).await;
+                            }
+                        }
+                    }
+                    report.tasks_executed += 1;
+                }
+                SleeptimeTask::KnowledgeHealthDiagnosis => {
+                    let mut diagnostician = KnowledgeHealthDiagnostician::default();
+                    if let Some(graph) = &self.graph {
+                        diagnostician = diagnostician.with_graph(graph.clone());
+                    }
+                    let report_health = diagnostician.diagnose(&entries, Utc::now()).await;
+                    report.health_issues = report_health.issues.len();
+                    let mut mutable = entries.clone();
+                    report.health_repairs_written =
+                        diagnostician.apply_repairs(&mut mutable, &report_health);
+                    if let Some(store) = self.store.as_ref() {
+                        for updated in mutable {
+                            if updated
+                                .metadata
+                                .tags
+                                .iter()
+                                .any(|tag| tag.starts_with("health:"))
+                            {
+                                let _ = store.write(updated).await;
+                            }
+                        }
+                    }
+                    report.tasks_executed += 1;
+                }
+                SleeptimeTask::ActiveConsistencyGuard => {
+                    let guardian = ActiveConsistencyGuardian::default();
+                    let plan = guardian.plan(&entries, Utc::now());
+                    report.consistency_guard_tasks = plan.tasks.len();
+                    let mut mutable = entries.clone();
+                    report.consistency_guard_repairs =
+                        guardian.apply(&mut mutable, &plan, Utc::now());
+                    if let Some(store) = self.store.as_ref() {
+                        for updated in mutable {
+                            if updated.metadata.tags.iter().any(|tag| {
+                                tag.starts_with("consistency:")
+                                    || tag.starts_with("cascade:")
+                                    || tag.starts_with("health:")
+                            }) || updated.metadata.validity.is_some()
+                            {
+                                let _ = store.write(updated).await;
+                            }
+                        }
+                    }
+                    report.tasks_executed += 1;
+                }
+                SleeptimeTask::ActiveLearningLoop => {
+                    let active_learning = ActiveLearningLoop::default();
+                    let tasks = active_learning.plan(&entries, Utc::now());
+                    report.active_learning_tasks = tasks.len();
+                    let mut mutable = entries.clone();
+                    report.active_learning_tasks_written =
+                        active_learning.apply_tasks(&mut mutable, &tasks);
+                    if let Some(store) = self.store.as_ref() {
+                        for updated in mutable {
+                            if updated
+                                .metadata
+                                .tags
+                                .iter()
+                                .any(|tag| tag.starts_with("active-learning:"))
+                            {
+                                let _ = store.write(updated).await;
+                            }
+                        }
+                    }
+                    report.tasks_executed += 1;
+                }
+                SleeptimeTask::EmbeddingDriftDetection => {
+                    let monitor = EmbeddingDriftMonitor::default();
+                    let drift = monitor.analyze(&entries, Utc::now());
+                    report.embedding_drift_samples = drift.sample_size;
+                    report.embedding_drift_score =
+                        drift.psi.max(drift.centroid_shift).max(drift.norm_kl);
+                    let mut mutable = entries.clone();
+                    report.embedding_drift_updates = monitor.apply(&mut mutable, &drift);
+                    if let Some(store) = self.store.as_ref() {
+                        for updated in mutable {
+                            if updated
+                                .metadata
+                                .tags
+                                .iter()
+                                .any(|tag| tag.starts_with("embedding-drift:"))
+                            {
+                                let _ = store.write(updated).await;
+                            }
+                        }
+                    }
+                    report.tasks_executed += 1;
+                }
+                SleeptimeTask::CuriosityExploration => {
+                    let explorer = CuriosityExplorer::default();
+                    let tasks = explorer.plan(&entries, Utc::now());
+                    report.curiosity_tasks = tasks.len();
+                    let mut mutable = entries.clone();
+                    report.curiosity_tasks_written = explorer.apply_tasks(&mut mutable, &tasks);
+                    if let Some(store) = self.store.as_ref() {
+                        for updated in mutable {
+                            if updated
+                                .metadata
+                                .tags
+                                .iter()
+                                .any(|tag| tag.starts_with("curiosity:"))
+                            {
+                                let _ = store.write(updated).await;
+                            }
+                        }
+                    }
+                    report.tasks_executed += 1;
+                }
             }
         }
         report
@@ -1285,6 +1506,21 @@ pub struct SleeptimeReport {
     pub quality_promoted_long: usize,
     pub quality_archived: usize,
     pub training_candidates: usize,
+    pub review_tasks: usize,
+    pub review_tasks_written: usize,
+    pub cascade_revalidation_tasks: usize,
+    pub cascade_invalidations: usize,
+    pub health_issues: usize,
+    pub health_repairs_written: usize,
+    pub consistency_guard_tasks: usize,
+    pub consistency_guard_repairs: usize,
+    pub active_learning_tasks: usize,
+    pub active_learning_tasks_written: usize,
+    pub embedding_drift_samples: usize,
+    pub embedding_drift_score: f32,
+    pub embedding_drift_updates: usize,
+    pub curiosity_tasks: usize,
+    pub curiosity_tasks_written: usize,
 }
 
 // ===========================================================================

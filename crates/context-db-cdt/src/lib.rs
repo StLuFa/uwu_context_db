@@ -184,7 +184,7 @@ impl CurriculumGenerator {
     /// 生成下一个训练目标（骨架：返回 placeholder）。
     pub async fn next_goal(&self) -> Result<TrainingGoal> {
         Ok(TrainingGoal {
-            target_node: ContextUri::parse("uwu://t/a/x/skill/next")?,
+            target_node: ContextUri::parse("uwu://t/a/memory/skill/next")?,
             difficulty: 0.5,
             prerequisite_skills: vec![],
             expected_new_knowledge: String::new(),
@@ -545,13 +545,13 @@ pub fn feedback_evaluation_to_memories(eval: &EvalResult, agent_scope: &str) -> 
     // 成功 case → Skill 记忆
     for success in &eval.successes {
         let uri = ContextUri::parse(&format!(
-            "uwu://{}/x/skill/epoch-{}/{:x}",
+            "uwu://{}/memory/skill/epoch-{}/{:x}",
             agent_scope,
             eval.epoch,
             success.skill_extracted.len()
         ))
         .unwrap_or_else(|_| {
-            ContextUri::parse(&format!("uwu://{}/x/skill/fallback", agent_scope)).unwrap()
+            ContextUri::parse(&format!("uwu://{}/memory/skill/fallback", agent_scope)).unwrap()
         });
 
         let entry = ContextEntry::new_text(
@@ -565,13 +565,13 @@ pub fn feedback_evaluation_to_memories(eval: &EvalResult, agent_scope: &str) -> 
     // 失败 case → Error 记忆
     for failure in &eval.failures {
         let uri = ContextUri::parse(&format!(
-            "uwu://{}/x/error/epoch-{}/{:x}",
+            "uwu://{}/memory/error/epoch-{}/{:x}",
             agent_scope,
             eval.epoch,
             failure.description.len()
         ))
         .unwrap_or_else(|_| {
-            ContextUri::parse(&format!("uwu://{}/x/error/fallback", agent_scope)).unwrap()
+            ContextUri::parse(&format!("uwu://{}/memory/error/fallback", agent_scope)).unwrap()
         });
 
         let entry = ContextEntry::new_text(

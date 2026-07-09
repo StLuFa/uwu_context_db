@@ -582,10 +582,43 @@ pub enum Resolution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalVersion {
     pub commit_id: CommitId,
+    /// 事务时间：版本何时进入系统。
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub content_hash: ContentHash,
+    /// 有效时间：知识在现实世界何时开始成立。
     pub valid_from: chrono::DateTime<chrono::Utc>,
+    /// 有效时间结束点；None 表示仍持续有效。
     pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// 双时态查询窗口，同时约束现实有效时间和系统事务时间。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BitemporalQuery {
+    pub valid_at: chrono::DateTime<chrono::Utc>,
+    pub transaction_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// 双时态区间查询窗口。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BitemporalRange {
+    pub valid_from: chrono::DateTime<chrono::Utc>,
+    pub valid_to: chrono::DateTime<chrono::Utc>,
+    pub transaction_from: chrono::DateTime<chrono::Utc>,
+    pub transaction_to: chrono::DateTime<chrono::Utc>,
+}
+
+impl TemporalVersion {
+    pub fn valid_at(&self, at: chrono::DateTime<chrono::Utc>) -> bool {
+        self.valid_from <= at && self.valid_until.map(|until| until > at).unwrap_or(true)
+    }
+
+    pub fn valid_overlaps(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.valid_from <= to && self.valid_until.map(|until| until >= from).unwrap_or(true)
+    }
 }
 
 /// 时态索引 — URI → 有序版本时间线，O(log n) 查询。
@@ -612,20 +645,40 @@ impl TemporalIndex {
         timeline.insert(pos, version);
     }
 
-    /// AS OF 查询：某时间点的版本。二分查找 O(log n)。
+    /// AS OF 查询：事务时间点的版本。二分查找 O(log n)。
     pub fn as_of(
         &self,
         uri: &ContextUri,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Option<&TemporalVersion> {
-        let timeline = self.timelines.get(&uri.to_string())?;
-        let pos = timeline
-            .binary_search_by(|v| v.timestamp.cmp(&at))
-            .unwrap_or_else(|e| e.saturating_sub(1));
-        timeline.get(pos)
+        self.transaction_as_of(uri, at)
     }
 
-    /// BETWEEN 查询：时间范围内的版本。
+    pub fn transaction_as_of(
+        &self,
+        uri: &ContextUri,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<&TemporalVersion> {
+        let timeline = self.timelines.get(&uri.to_string())?;
+        let pos = timeline.partition_point(|v| v.timestamp <= at);
+        pos.checked_sub(1).and_then(|idx| timeline.get(idx))
+    }
+
+    /// 双时态 AS OF：在某个事务时间点已知、且在现实有效时间点成立的版本。
+    pub fn bitemporal_as_of(
+        &self,
+        uri: &ContextUri,
+        query: BitemporalQuery,
+    ) -> Option<&TemporalVersion> {
+        let timeline = self.timelines.get(&uri.to_string())?;
+        let pos = timeline.partition_point(|v| v.timestamp <= query.transaction_at);
+        timeline[..pos]
+            .iter()
+            .rev()
+            .find(|version| version.valid_at(query.valid_at))
+    }
+
+    /// BETWEEN 查询：事务时间范围内的版本。
     pub fn between(
         &self,
         uri: &ContextUri,
@@ -642,11 +695,116 @@ impl TemporalIndex {
             .collect()
     }
 
+    /// 双时态区间查询：事务时间落入窗口，且现实有效期与窗口有交集。
+    pub fn bitemporal_between(
+        &self,
+        uri: &ContextUri,
+        range: BitemporalRange,
+    ) -> Vec<&TemporalVersion> {
+        let timeline = match self.timelines.get(&uri.to_string()) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let start = timeline.partition_point(|v| v.timestamp < range.transaction_from);
+        timeline[start..]
+            .iter()
+            .take_while(|v| v.timestamp <= range.transaction_to)
+            .filter(|v| v.valid_overlaps(range.valid_from, range.valid_to))
+            .collect()
+    }
+
     /// EVOLUTION OF：完整演化历史。
     pub fn evolution(&self, uri: &ContextUri) -> Vec<&TemporalVersion> {
         self.timelines
             .get(&uri.to_string())
             .map(|t| t.iter().collect())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporal_version(
+        tx_days: i64,
+        valid_from_days: i64,
+        valid_until_days: Option<i64>,
+    ) -> TemporalVersion {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        TemporalVersion {
+            commit_id: CommitId::new(),
+            timestamp: base + chrono::Duration::days(tx_days),
+            content_hash: ContentHash(format!("h-{tx_days}")),
+            valid_from: base + chrono::Duration::days(valid_from_days),
+            valid_until: valid_until_days.map(|days| base + chrono::Duration::days(days)),
+        }
+    }
+
+    #[test]
+    fn bitemporal_as_of_uses_valid_and_transaction_axes() {
+        let uri = ContextUri::parse("uwu://t/agent/a/memory/fact/policy").unwrap();
+        let mut index = TemporalIndex::new();
+        index.record(&uri, temporal_version(1, -30, Some(10)));
+        index.record(&uri, temporal_version(20, 10, None));
+        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let old_reality_known_late = index
+            .bitemporal_as_of(
+                &uri,
+                BitemporalQuery {
+                    valid_at: base,
+                    transaction_at: base + chrono::Duration::days(30),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            old_reality_known_late.timestamp,
+            base + chrono::Duration::days(1)
+        );
+
+        assert!(
+            index
+                .bitemporal_as_of(
+                    &uri,
+                    BitemporalQuery {
+                        valid_at: base + chrono::Duration::days(15),
+                        transaction_at: base + chrono::Duration::days(5),
+                    },
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bitemporal_between_filters_both_ranges() {
+        let uri = ContextUri::parse("uwu://t/agent/a/memory/fact/policy").unwrap();
+        let mut index = TemporalIndex::new();
+        index.record(&uri, temporal_version(1, -10, Some(5)));
+        index.record(&uri, temporal_version(8, 6, Some(12)));
+        index.record(&uri, temporal_version(30, 20, None));
+        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let hits = index.bitemporal_between(
+            &uri,
+            BitemporalRange {
+                valid_from: base + chrono::Duration::days(4),
+                valid_to: base + chrono::Duration::days(9),
+                transaction_from: base,
+                transaction_to: base + chrono::Duration::days(10),
+            },
+        );
+
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter()
+                .all(|v| v.timestamp <= base + chrono::Duration::days(10))
+        );
     }
 }

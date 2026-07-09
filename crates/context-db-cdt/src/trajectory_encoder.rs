@@ -250,7 +250,7 @@ impl TrajectoryEncoder {
         let hash = blake3::hash(content.as_bytes()).to_hex();
         let short = &hash[..8];
         ContextUri::parse(&format!(
-            "uwu://{}/x/{}/{}/{:02}-{}",
+            "uwu://{}/memory/{}/{}/{:02}-{}",
             self.agent_scope,
             ctype,
             Utc::now().format("%Y%m%d"),
@@ -259,7 +259,7 @@ impl TrajectoryEncoder {
         ))
         .unwrap_or_else(|_| {
             ContextUri::parse(&format!(
-                "uwu://{}/x/{}/fallback-{}",
+                "uwu://{}/memory/{}/fallback-{}",
                 self.agent_scope,
                 ctype,
                 Uuid::new_v4()

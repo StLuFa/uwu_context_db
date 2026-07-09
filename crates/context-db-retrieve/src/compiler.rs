@@ -20,7 +20,7 @@
 use crate::budget::load_hits_within_budget;
 use crate::operators::ExecContext;
 use crate::planner::{CboOptimizer, LogicalPlan, PhysicalPlan, StatisticsCollector};
-use crate::query::Query;
+use crate::query::{Condition, Predicate, Query};
 use crate::{
     QueryPlanner, RetrievalHit, RetrievalResult, RetrievalTrace, RetrieveContext, TraceStep,
     operators::RecordBatch,
@@ -252,6 +252,7 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
             let scan = LogicalPlan::Scan {
                 scope: scope.clone(),
                 level: ContentLevel::L0,
+                limit: Some(scan_budget(predicate, *budget)),
             };
             let plan = if predicate.is_empty() {
                 scan
@@ -293,7 +294,7 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
             let vs = LogicalPlan::VectorSearch {
                 collection: "memories".into(),
                 query: query_embedding.clone(),
-                top_k: 50,
+                top_k: vector_budget(predicate, *budget),
             };
             let plan = if predicate.is_empty() {
                 vs
@@ -330,6 +331,7 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
             let scan = LogicalPlan::Scan {
                 scope: Some(start.clone()),
                 level: ContentLevel::L0,
+                limit: Some(1),
             };
             let input = if predicate.is_empty() {
                 scan
@@ -359,6 +361,31 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
 fn load_within_budget(hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
     let plan = load_hits_within_budget(hits, budget);
     (plan.hits, plan.tokens_used)
+}
+
+fn scan_budget(predicate: &Predicate, budget: usize) -> usize {
+    let selectivity_multiplier = if predicate.conditions.iter().any(|condition| {
+        matches!(
+            condition,
+            Condition::QualityAbove(_)
+                | Condition::TagsContains(_)
+                | Condition::ValidOnly
+                | Condition::TransactionTimeBetween(_, _)
+                | Condition::ValidTimeContains(_)
+                | Condition::ValidTimeOverlaps(_, _)
+                | Condition::Bitemporal { .. }
+        )
+    }) {
+        4
+    } else {
+        2
+    };
+    budget.saturating_mul(selectivity_multiplier).clamp(1, 4096)
+}
+
+fn vector_budget(predicate: &Predicate, budget: usize) -> usize {
+    let multiplier = if predicate.is_empty() { 2 } else { 5 };
+    budget.saturating_mul(multiplier).clamp(10, 512)
 }
 
 fn simple_hash(s: &str) -> u64 {

@@ -12,8 +12,9 @@ pub use version::MemoryVersionStore;
 
 use agent_context_db_core::{
     ContentLevel, ContentPayload, ContentRepo, ContentStore, ContextDiff, ContextEntry,
-    ContextError, ContextUri, DirEntry, FindPattern, FsOps, GrepHit, MvccVersion, Result, TenantId,
-    TenantOps, TreeNode, VersionEntry, VersionOps, sanitize_entry_for_write,
+    ContextError, ContextUri, DirEntry, FindPattern, FsOps, GraphRelation, GraphStore, GrepHit,
+    MvccVersion, Result, TenantId, TenantOps, TreeNode, VersionEntry, VersionOps,
+    sanitize_entry_for_write,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -26,6 +27,8 @@ pub struct MemoryContextStore {
     entries: Mutex<HashMap<String, Vec<ContextEntry>>>,
     // uri -> L2 原始字节（模拟 AGFS blob 存储）
     l2_blobs: Mutex<HashMap<String, Vec<u8>>>,
+    // from uri -> typed outgoing edges
+    graph_edges: Mutex<HashMap<String, Vec<(String, GraphRelation)>>>,
 }
 
 impl MemoryContextStore {
@@ -40,6 +43,93 @@ impl MemoryContextStore {
     /// 存入 L2 原始字节（模拟 AGFS blob 写）。
     pub fn put_l2_blob(&self, uri: &str, bytes: Vec<u8>) {
         self.l2_blobs.lock().insert(uri.to_string(), bytes);
+    }
+}
+
+#[async_trait]
+impl GraphStore for MemoryContextStore {
+    async fn add_edge(
+        &self,
+        from: &ContextUri,
+        to: &ContextUri,
+        kind: GraphRelation,
+    ) -> Result<()> {
+        self.graph_edges
+            .lock()
+            .entry(from.to_string())
+            .or_default()
+            .push((to.to_string(), kind));
+        Ok(())
+    }
+
+    async fn remove_edge(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
+        if let Some(edges) = self.graph_edges.lock().get_mut(&from.to_string()) {
+            edges.retain(|(target, _)| target != &to.to_string());
+        }
+        Ok(())
+    }
+
+    async fn neighbors(
+        &self,
+        uri: &ContextUri,
+        kind: Option<GraphRelation>,
+    ) -> Result<Vec<ContextUri>> {
+        let edges = self.graph_edges.lock();
+        Ok(edges
+            .get(&uri.to_string())
+            .into_iter()
+            .flat_map(|out| out.iter())
+            .filter(|(_, relation)| kind.map(|k| k == *relation).unwrap_or(true))
+            .filter_map(|(target, _)| ContextUri::parse(target.clone()).ok())
+            .collect())
+    }
+
+    async fn batch_traverse(
+        &self,
+        seeds: &[ContextUri],
+        kinds: &[GraphRelation],
+        max_hops: usize,
+    ) -> Result<Vec<(ContextUri, ContextUri, GraphRelation)>> {
+        let edges = self.graph_edges.lock().clone();
+        let allowed: std::collections::HashSet<_> = kinds.iter().copied().collect();
+        let mut out = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        for seed in seeds {
+            visited.insert(seed.to_string());
+            queue.push_back((seed.clone(), 0_usize));
+        }
+        while let Some((from, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            if let Some(next) = edges.get(&from.to_string()) {
+                for (target, relation) in next {
+                    if !allowed.is_empty() && !allowed.contains(relation) {
+                        continue;
+                    }
+                    let Ok(to) = ContextUri::parse(target.clone()) else {
+                        continue;
+                    };
+                    out.push((from.clone(), to.clone(), *relation));
+                    if visited.insert(target.clone()) {
+                        queue.push_back((to, depth + 1));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn centrality(&self, uri: &ContextUri) -> Result<f32> {
+        let edges = self.graph_edges.lock();
+        let out_degree = edges.get(&uri.to_string()).map(|v| v.len()).unwrap_or(0);
+        let in_degree = edges
+            .values()
+            .flatten()
+            .filter(|(target, _)| target == &uri.to_string())
+            .count();
+        Ok(((out_degree + in_degree) as f32 / 16.0).min(1.0))
     }
 }
 

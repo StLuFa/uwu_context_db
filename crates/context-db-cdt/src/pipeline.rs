@@ -96,10 +96,12 @@ impl CognitiveTrainingPipeline {
                 let ct = ContentType::Skill; // 从 trajectory 推断
                 let grad = CognitiveGradient {
                     source_uri: ContextUri::parse(&format!(
-                        "uwu://t/a/x/skill/{}",
+                        "uwu://t/a/memory/skill/{}",
                         &pref.chosen.task_id
                     ))
-                    .unwrap_or_else(|_| ContextUri::parse("uwu://t/a/x/skill/fallback").unwrap()),
+                    .unwrap_or_else(|_| {
+                        ContextUri::parse("uwu://t/a/memory/skill/fallback").unwrap()
+                    }),
                     epistemic_type: ct,
                     gradient_type: crate::GradientType::SkillExtraction {
                         procedure: pref.chosen.task_description.clone(),

@@ -12,6 +12,7 @@ use tracing::Instrument;
 
 use crate::budget::load_hits_within_budget;
 use crate::compiler::query_to_logical;
+use crate::innovation::{IncrementalRetrievalLearner, RelevanceFeedback};
 use crate::intent::RuleBasedIntentAnalyzer;
 use crate::operators::ExecContext;
 use crate::planner::{
@@ -40,6 +41,7 @@ pub struct ContextRetriever {
     graph_rag_index: Option<Arc<crate::GraphRagIndex>>,
     planner: Arc<dyn QueryPlanner>,
     reranker: Arc<dyn Reranker>,
+    retrieval_learner: Option<Arc<IncrementalRetrievalLearner>>,
     intent_analyzer: Option<Arc<RuleBasedIntentAnalyzer>>,
     optimizer: CboOptimizer,
     /// 计划缓存（相同 query 不重复优化）。
@@ -64,6 +66,7 @@ impl ContextRetriever {
             graph_rag_index: None,
             planner,
             reranker,
+            retrieval_learner: None,
             intent_analyzer: None,
             optimizer: CboOptimizer::new(stats),
             plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -80,6 +83,18 @@ impl ContextRetriever {
     pub fn with_intent_analyzer(mut self, intent_analyzer: Arc<RuleBasedIntentAnalyzer>) -> Self {
         self.intent_analyzer = Some(intent_analyzer);
         self
+    }
+
+    /// 注入在线检索学习器，让 relevance feedback 参与热路径重排。
+    pub fn with_retrieval_learner(mut self, learner: Arc<IncrementalRetrievalLearner>) -> Self {
+        self.retrieval_learner = Some(learner);
+        self
+    }
+
+    pub fn record_relevance_feedback(&self, query: &str, feedbacks: &[RelevanceFeedback]) {
+        if let Some(learner) = &self.retrieval_learner {
+            learner.apply_feedback(query, feedbacks);
+        }
     }
 
     /// 若配置了图与联想扩展开关，则对已有命中做联想扩展并合并到结果尾部。
@@ -218,10 +233,17 @@ impl ContextRetriever {
             model: "score".into(),
         });
 
-        // 4b. 联想扩展（可选）
-        let expand_input = reranked.len();
+        // 4b. 在线学习式重排（可选）
+        let learned = if let Some(learner) = &self.retrieval_learner {
+            learner.rerank_hits(query, reranked)
+        } else {
+            reranked
+        };
+
+        // 4c. 联想扩展（可选）
+        let expand_input = learned.len();
         let expanded = self
-            .maybe_expand_associative(reranked)
+            .maybe_expand_associative(learned)
             .instrument(tracing::info_span!(
                 "expand.associative",
                 input = expand_input
@@ -291,9 +313,14 @@ impl ContextRetriever {
             .rerank("", batch.records)
             .instrument(tracing::info_span!("rerank", input = rerank_input))
             .await?;
-        let expand_input = reranked.len();
+        let learned = if let Some(learner) = &self.retrieval_learner {
+            learner.rerank_hits("", reranked)
+        } else {
+            reranked
+        };
+        let expand_input = learned.len();
         let expanded = self
-            .maybe_expand_associative(reranked)
+            .maybe_expand_associative(learned)
             .instrument(tracing::info_span!(
                 "expand.associative",
                 input = expand_input
@@ -378,6 +405,12 @@ impl QueryPlanner for RuleBasedPlanner {
             input: Box::new(LogicalPlan::Scan {
                 scope: Some(scope),
                 level: ContentLevel::L0,
+                limit: Some(
+                    ctx.budget_tokens
+                        .unwrap_or(8000)
+                        .div_ceil(160)
+                        .clamp(10, 512),
+                ),
             }),
             predicate,
         })
@@ -403,6 +436,7 @@ pub struct ContextRetrieverBuilder {
     associative_enabled: bool,
     graph_rag_llm: Option<Arc<dyn LlmClient>>,
     graph_rag_index: Option<Arc<crate::GraphRagIndex>>,
+    retrieval_learner: Option<Arc<IncrementalRetrievalLearner>>,
     planner: Option<Arc<dyn QueryPlanner>>,
     reranker: Option<Arc<dyn Reranker>>,
 }
@@ -417,6 +451,7 @@ impl ContextRetrieverBuilder {
             associative_enabled: false,
             graph_rag_llm: None,
             graph_rag_index: None,
+            retrieval_learner: None,
             planner: None,
             reranker: None,
         }
@@ -456,6 +491,11 @@ impl ContextRetrieverBuilder {
         self
     }
 
+    pub fn with_retrieval_learner(mut self, learner: Arc<IncrementalRetrievalLearner>) -> Self {
+        self.retrieval_learner = Some(learner);
+        self
+    }
+
     pub fn with_planner(mut self, planner: Arc<dyn QueryPlanner>) -> Self {
         self.planner = Some(planner);
         self
@@ -479,6 +519,7 @@ impl ContextRetrieverBuilder {
         r.associative_enabled = self.associative_enabled;
         r.graph_rag_llm = self.graph_rag_llm;
         r.graph_rag_index = self.graph_rag_index;
+        r.retrieval_learner = self.retrieval_learner;
         r
     }
 }

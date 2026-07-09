@@ -207,7 +207,7 @@ pub enum DecodedContent {
 
 /// 13 种内容类型 — URI 路径段原生的记忆分类。
 ///
-/// 类型进 URI：`uwu://t/{agent}/x/{type}/{semantic_path}/{id}`
+/// 类型进 URI：`uwu://t/{agent}/memory/{type}/{semantic_path}/{id}`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentType {

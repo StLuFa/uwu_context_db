@@ -79,7 +79,17 @@ impl Predicate {
 pub enum Condition {
     TypeEquals(ContentType),
     ScopeEquals(Scope),
-    TimeBetween(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    /// 事务时间过滤：条目何时写入/更新到系统。
+    TransactionTimeBetween(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    /// 有效时间点过滤：知识在现实世界的哪个时间点成立。
+    ValidTimeContains(chrono::DateTime<chrono::Utc>),
+    /// 有效时间区间过滤：知识有效期与给定区间有交集。
+    ValidTimeOverlaps(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    /// 双时态过滤：同时约束现实有效时间和系统事务时间。
+    Bitemporal {
+        valid_at: chrono::DateTime<chrono::Utc>,
+        transaction_at: chrono::DateTime<chrono::Utc>,
+    },
     TagsContains(Vec<String>),
     QualityAbove(f32),
     ValidOnly,

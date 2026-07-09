@@ -27,11 +27,12 @@ pub use innovation::{
     InterventionResult, KnowledgeCrystal, RepairAction, SelfHealer,
 };
 pub use model::{
-    Author, Branch, BranchLifecycle, BranchName, BranchType, CausalDag, ChangeSet, ChangeType,
-    Commit, CommitId, CommitMeta, CommitTrigger, ConflictResolver, CorrectionType, EntityChange,
-    FactCorrection, KnowledgeMergeStrategy, ProvenanceLink, ProvenanceRelation, RelationChange,
-    RelationChangeType, RelationKind, RenameOp, Resolution, SemanticCondition, SemanticConflict,
-    StructuredDiff, Tag, TagName, TagType, TemporalIndex, TemporalVersion, UriChange, VersionRef,
+    Author, BitemporalQuery, BitemporalRange, Branch, BranchLifecycle, BranchName, BranchType,
+    CausalDag, ChangeSet, ChangeType, Commit, CommitId, CommitMeta, CommitTrigger,
+    ConflictResolver, CorrectionType, EntityChange, FactCorrection, KnowledgeMergeStrategy,
+    ProvenanceLink, ProvenanceRelation, RelationChange, RelationChangeType, RelationKind, RenameOp,
+    Resolution, SemanticCondition, SemanticConflict, StructuredDiff, Tag, TagName, TagType,
+    TemporalIndex, TemporalVersion, UriChange, VersionRef,
 };
 pub use reasoning::{
     ChangeCategory, DiffChangeType, DiffImpact, DiffReasoner, SemanticChange, SemanticDiff,

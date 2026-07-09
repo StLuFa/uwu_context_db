@@ -3,7 +3,7 @@
 //! CDT 训练会产生 gradient、reflection insight、agent 行为记忆和 synthesis 产物。
 //! 这个模块把这些训练信号沉淀为 `ConsolidationProduct` / `ContextEntry`，让训练内循环能进入长期记忆巩固层。
 
-use crate::reflection::SemanticGradient;
+use crate::reflection::{ReflectionWritebackConfig, SemanticGradient};
 use crate::voting::EvolvableInsight;
 use crate::{CognitiveGradient, GradientType, HypothesisOutcome};
 use agent_context_db_consolidation::{
@@ -103,6 +103,22 @@ impl CdtConsolidationBridge {
             source: CdtSignalSource::Reflexion,
             tags: gradient.epistemic_tags.clone(),
         }
+    }
+
+    pub fn entries_from_semantic_gradients(
+        &self,
+        gradients: &[SemanticGradient],
+    ) -> Vec<ContextEntry> {
+        let config = ReflectionWritebackConfig {
+            agent_scope: self.agent_scope.clone(),
+            tenant: self.tenant,
+            min_priority: 0.35,
+        };
+        gradients
+            .iter()
+            .enumerate()
+            .flat_map(|(index, gradient)| gradient.to_memory_entries(&config, index))
+            .collect()
     }
 
     pub fn signal_from_insight(
@@ -302,7 +318,7 @@ impl CdtConsolidationBridge {
         let hash = blake3::hash(content.as_bytes()).to_hex();
         let short = &hash[..8];
         ContextUri::parse(&format!(
-            "uwu://{}/x/{}/{:02}-{}",
+            "uwu://{}/memory/{}/{:02}-{}",
             self.agent_scope, content_type, index, short
         ))
         .unwrap_or_else(|_| ContextUri::parse("uwu://t/agent/cdt/meta/fallback").unwrap())

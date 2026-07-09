@@ -166,8 +166,8 @@ mod tests {
     #[test]
     fn lsh_insert_and_query() {
         let mut index = LshIndex::new(3, 16);
-        let uri1 = ContextUri::parse("uwu://t/a/x/fact/1").unwrap();
-        let uri2 = ContextUri::parse("uwu://t/a/x/fact/2").unwrap();
+        let uri1 = ContextUri::parse("uwu://t/a/memory/fact/1").unwrap();
+        let uri2 = ContextUri::parse("uwu://t/a/memory/fact/2").unwrap();
         let v1 = vec![1.0, 0.0, 0.0];
         let v2 = vec![0.9, 0.1, 0.0];
         index.insert(&uri1, &v1);
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn lsh_uses_table_specific_buckets_without_duplicates() {
         let mut index = LshIndex::new(4, 12);
-        let uri = ContextUri::parse("uwu://t/a/x/fact/1").unwrap();
+        let uri = ContextUri::parse("uwu://t/a/memory/fact/1").unwrap();
         let v = vec![0.2, 0.4, -0.1, 0.7];
         index.insert(&uri, &v);
         index.insert(&uri, &v);

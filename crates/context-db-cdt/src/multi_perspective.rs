@@ -106,6 +106,17 @@ pub struct MultiPerspectiveConsolidator {
     llm: Option<Arc<dyn LlmClient>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawPerspectiveView {
+    summary: String,
+    #[serde(default)]
+    key_insights: Vec<String>,
+    #[serde(default)]
+    gaps: Vec<String>,
+    #[serde(default)]
+    confidence: Option<f32>,
+}
+
 impl MultiPerspectiveConsolidator {
     pub fn new() -> Self {
         Self {
@@ -229,20 +240,35 @@ impl MultiPerspectiveConsolidator {
             return fallback;
         }
 
+        if let Ok(raw) = serde_json::from_str::<RawPerspectiveView>(trimmed) {
+            return PerspectiveView {
+                perspective,
+                summary: raw.summary,
+                key_insights: raw.key_insights.into_iter().take(8).collect(),
+                confidence: raw
+                    .confidence
+                    .unwrap_or(fallback.confidence + 0.2)
+                    .clamp(self.min_confidence, 1.0),
+                evidence_uris: evidence.iter().map(|entry| entry.uri.clone()).collect(),
+                gaps: raw.gaps.into_iter().take(8).collect(),
+            };
+        }
+
+        let key_insights = trimmed
+            .lines()
+            .skip(1)
+            .map(|line| {
+                line.trim()
+                    .trim_start_matches(['-', '*'])
+                    .trim()
+                    .to_string()
+            })
+            .filter(|line| !line.is_empty())
+            .take(5)
+            .collect::<Vec<_>>();
         PerspectiveView {
             summary: trimmed.lines().next().unwrap_or(trimmed).trim().to_string(),
-            key_insights: trimmed
-                .lines()
-                .skip(1)
-                .map(|line| {
-                    line.trim()
-                        .trim_start_matches(['-', '*'])
-                        .trim()
-                        .to_string()
-                })
-                .filter(|line| !line.is_empty())
-                .take(5)
-                .collect(),
+            key_insights,
             confidence: (fallback.confidence + 0.2).clamp(self.min_confidence, 1.0),
             ..fallback
         }
@@ -429,8 +455,8 @@ fn evidence_prompt(evidence: &[ContextEntry]) -> String {
 fn perspective_prompt(perspective: Perspective, topic: &str, evidence_text: &str) -> String {
     format!(
         "{}\nTopic: {topic}\nEvidence:\n{evidence_text}\n\n\
-         Return a concise perspective analysis. First line: summary. \
-         Remaining lines: 3-5 key insights or gaps.",
+         Return strict JSON with fields: summary: string, key_insights: string[], gaps: string[], confidence: number. \
+         Use only the evidence above; gaps must be concrete exploration questions for missing evidence.",
         perspective.prompt_prefix()
     )
 }
@@ -462,7 +488,8 @@ fn synthesis_prompt(topic: &str, views: &[PerspectiveView], gaps: &[KnowledgeGap
     format!(
         "Synthesize these STORM-style perspectives for topic `{topic}` into a coherent report.\n\n\
          Perspectives:\n{views_text}\n\nKnowledge gaps:\n{gaps_text}\n\n\
-         Return markdown with integrated claims, tensions, confidence, and next exploration steps."
+         Return markdown with these sections: Evidence-grounded synthesis, Cross-perspective tensions, Confidence calibration, Next exploration steps. \
+         Every strong claim must name the supporting perspective; unresolved gaps must remain explicit."
     )
 }
 
@@ -476,10 +503,21 @@ mod tests {
         assert_eq!(all.len(), 4);
     }
 
+    #[test]
+    fn llm_json_response_becomes_structured_perspective_view() {
+        let consolidator = MultiPerspectiveConsolidator::new();
+        let response = r#"{"summary":"causal summary","key_insights":["a causes b"],"gaps":["need counterexample"],"confidence":0.81}"#;
+        let view = consolidator.view_from_llm_response(Perspective::Causal, "topic", &[], response);
+        assert_eq!(view.summary, "causal summary");
+        assert_eq!(view.key_insights, vec!["a causes b".to_string()]);
+        assert_eq!(view.gaps, vec!["need counterexample".to_string()]);
+        assert!(view.confidence > 0.8);
+    }
+
     #[tokio::test]
     async fn consolidator_basic() {
         let consolidator = MultiPerspectiveConsolidator::new();
-        let uri = ContextUri::parse("uwu://t/a/x/fact/test").unwrap();
+        let uri = ContextUri::parse("uwu://t/a/memory/fact/test").unwrap();
         let product = consolidator.consolidate(&uri, "test topic", &[]).await;
         assert_eq!(product.views.len(), 4);
         assert!(product.overall_confidence < 0.5); // 无证据 → 低置信度

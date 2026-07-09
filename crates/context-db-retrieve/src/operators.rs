@@ -50,7 +50,6 @@ pub struct ExecStats {
 
 impl PhysicalPlan {
     /// 执行物理计划 — 分发到对应算子。
-    /// 执行物理计划 — 分发到对应算子。
     pub fn execute<'a>(
         &'a self,
         ctx: &'a ExecContext,
@@ -189,24 +188,25 @@ impl VectorSearchOp {
             .search(collection, embedding.to_vec(), limit, filter_json)
             .await?;
 
-        let hits: Vec<RetrievalHit> = index_hits
-            .into_iter()
-            .map(|h| RetrievalHit {
-                uri: h.uri,
-                level: ContentLevel::L0,
-                content: ContentPayload::Text {
-                    sparse: String::new(),
-                    dense: String::new(),
-                    full: String::new(),
-                },
-                relevance: h.score,
-                parent_chain: vec![],
-                content_type: None,
-                metadata: Default::default(),
-                created_at: None,
-                updated_at: None,
-            })
-            .collect();
+        let mut hits = Vec::with_capacity(index_hits.len());
+        for h in index_hits {
+            let mut hit = if let Some(content) = &ctx.content {
+                match content.scan_by_prefix(&h.uri.to_string(), 1).await {
+                    Ok(mut entries) => entries
+                        .pop()
+                        .map(|entry| hit_from_entry(entry, ContentLevel::L0, h.score))
+                        .unwrap_or_else(|| sparse_vector_hit(h.uri.clone(), h.score)),
+                    Err(_) => sparse_vector_hit(h.uri.clone(), h.score),
+                }
+            } else {
+                sparse_vector_hit(h.uri.clone(), h.score)
+            };
+            if filter.only_valid && !is_currently_valid(&hit) {
+                continue;
+            }
+            hit.relevance = h.score;
+            hits.push(hit);
+        }
 
         Ok(RecordBatch {
             records: hits,
@@ -239,11 +239,20 @@ fn predicate_matches(hit: &RetrievalHit, predicate: &Predicate) -> bool {
         .all(|condition| match condition {
             Condition::TypeEquals(ct) => hit.content_type == Some(*ct),
             Condition::ScopeEquals(scope) => scope_matches(&hit.uri, scope),
-            Condition::TimeBetween(start, end) => hit
-                .updated_at
-                .or(hit.created_at)
+            Condition::TransactionTimeBetween(start, end) => transaction_time(hit)
                 .map(|ts| ts >= *start && ts <= *end)
                 .unwrap_or(false),
+            Condition::ValidTimeContains(at) => valid_at(hit, *at),
+            Condition::ValidTimeOverlaps(start, end) => valid_overlaps(hit, *start, *end),
+            Condition::Bitemporal {
+                valid_at: valid_ts,
+                transaction_at,
+            } => {
+                valid_at(hit, *valid_ts)
+                    && transaction_time(hit)
+                        .map(|ts| ts <= *transaction_at)
+                        .unwrap_or(false)
+            }
             Condition::TagsContains(tags) => tags
                 .iter()
                 .all(|tag| hit.metadata.tags.iter().any(|existing| existing == tag)),
@@ -252,12 +261,7 @@ fn predicate_matches(hit: &RetrievalHit, predicate: &Predicate) -> bool {
                 .quality_score
                 .map(|score| score >= *min)
                 .unwrap_or(false),
-            Condition::ValidOnly => hit
-                .metadata
-                .validity
-                .as_ref()
-                .map(|validity| validity.invalidated_by.is_none() && validity.valid_until.is_none())
-                .unwrap_or(true),
+            Condition::ValidOnly => is_currently_valid(hit),
         })
 }
 
@@ -308,28 +312,23 @@ impl GraphTraverseOp {
 
         match graph.batch_traverse(&seeds, edges, max_hops).await {
             Ok(edges_result) => {
-                let hits: Vec<RetrievalHit> = edges_result
-                    .into_iter()
-                    .map(|(from, to, kind)| RetrievalHit {
-                        uri: to.clone(),
-                        level: ContentLevel::L0,
-                        content: ContentPayload::Text {
-                            sparse: format!("{:?} {}", kind, from),
-                            dense: String::new(),
-                            full: String::new(),
-                        },
-                        relevance: 0.6,
-                        parent_chain: vec![from],
-                        content_type: None,
-                        metadata: Default::default(),
-                        created_at: None,
-                        updated_at: None,
-                    })
-                    .collect();
-
-                let count = hits.len();
+                let mut records = seed_batch.records;
+                let mut seen: std::collections::HashSet<ContextUri> =
+                    records.iter().map(|hit| hit.uri.clone()).collect();
+                for (from, to, kind) in edges_result {
+                    if !seen.insert(to.clone()) {
+                        continue;
+                    }
+                    let mut hit = load_graph_hit(&to, ctx)
+                        .await
+                        .unwrap_or_else(|| sparse_graph_hit(to.clone(), from.clone(), kind));
+                    hit.parent_chain.push(from);
+                    hit.relevance = hit.relevance.max(0.6);
+                    records.push(hit);
+                }
+                let count = records.len();
                 Ok(RecordBatch {
-                    records: hits,
+                    records,
                     stats: ExecStats {
                         rows_scanned: count,
                         ..Default::default()
@@ -338,10 +337,7 @@ impl GraphTraverseOp {
             }
             Err(e) => {
                 tracing::warn!(error=%e, "graph traverse failed, returning seeds");
-                Ok(RecordBatch {
-                    records: vec![],
-                    stats: ExecStats::default(),
-                })
+                Ok(seed_batch)
             }
         }
     }
@@ -482,6 +478,105 @@ fn hit_from_entry(entry: ContextEntry, level: ContentLevel, relevance: f32) -> R
     }
 }
 
+fn transaction_time(hit: &RetrievalHit) -> Option<chrono::DateTime<chrono::Utc>> {
+    hit.updated_at.or(hit.created_at)
+}
+
+fn is_currently_valid(hit: &RetrievalHit) -> bool {
+    let now = chrono::Utc::now();
+    hit.metadata
+        .validity
+        .as_ref()
+        .map(|validity| {
+            validity.invalidated_by.is_none()
+                && validity.valid_from <= now
+                && validity
+                    .valid_until
+                    .map(|until| until > now)
+                    .unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
+fn valid_at(hit: &RetrievalHit, at: chrono::DateTime<chrono::Utc>) -> bool {
+    hit.metadata
+        .validity
+        .as_ref()
+        .map(|validity| {
+            validity.invalidated_by.is_none()
+                && validity.valid_from <= at
+                && validity.valid_until.map(|until| until > at).unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
+fn valid_overlaps(
+    hit: &RetrievalHit,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    hit.metadata
+        .validity
+        .as_ref()
+        .map(|validity| {
+            validity.invalidated_by.is_none()
+                && validity.valid_from <= end
+                && validity
+                    .valid_until
+                    .map(|until| until >= start)
+                    .unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
+fn sparse_vector_hit(uri: ContextUri, score: f32) -> RetrievalHit {
+    RetrievalHit {
+        uri,
+        level: ContentLevel::L0,
+        content: ContentPayload::Text {
+            sparse: String::new(),
+            dense: String::new(),
+            full: String::new(),
+        },
+        relevance: score,
+        parent_chain: vec![],
+        content_type: None,
+        metadata: Default::default(),
+        created_at: None,
+        updated_at: None,
+    }
+}
+
+fn sparse_graph_hit(
+    to: ContextUri,
+    from: ContextUri,
+    kind: agent_context_db_core::GraphRelation,
+) -> RetrievalHit {
+    RetrievalHit {
+        uri: to,
+        level: ContentLevel::L0,
+        content: ContentPayload::Text {
+            sparse: format!("{:?} {}", kind, from),
+            dense: String::new(),
+            full: String::new(),
+        },
+        relevance: 0.6,
+        parent_chain: Vec::new(),
+        content_type: None,
+        metadata: Default::default(),
+        created_at: None,
+        updated_at: None,
+    }
+}
+
+async fn load_graph_hit(uri: &ContextUri, ctx: &ExecContext) -> Option<RetrievalHit> {
+    let content = ctx.content.as_ref()?;
+    let mut entries = content.scan_by_prefix(&uri.to_string(), 1).await.ok()?;
+    entries
+        .pop()
+        .map(|entry| hit_from_entry(entry, ContentLevel::L0, 0.6))
+}
+
 fn scope_matches(uri: &ContextUri, scope: &Scope) -> bool {
     match scope {
         Scope::All => true,
@@ -569,7 +664,7 @@ mod tests {
     use crate::compiler::query_to_logical;
     use crate::planner::CboOptimizer;
     use crate::query::{Condition, Predicate, Query, QueryMergeStrategy, SortKey};
-    use agent_context_db_core::{ContentRepo, TenantId};
+    use agent_context_db_core::{ContentRepo, GraphRelation, GraphStore, TenantId, ValidityRecord};
     use agent_context_db_testkit::MemoryContextStore;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -665,6 +760,127 @@ mod tests {
                 .records
                 .iter()
                 .all(|hit| hit.metadata.quality_score.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn wql_filters_bitemporal_valid_and_transaction_time() {
+        let store = Arc::new(MemoryContextStore::new());
+        let valid_at = chrono::Utc::now();
+        let mut current = entry(
+            "uwu://t/agent/a/memories/fact/current",
+            "current fact",
+            ContentType::Fact,
+            0.9,
+        );
+        current.created_at = valid_at - chrono::Duration::days(1);
+        current.updated_at = valid_at;
+        current.metadata.validity = Some(ValidityRecord {
+            valid_from: valid_at - chrono::Duration::days(10),
+            valid_until: Some(valid_at + chrono::Duration::days(10)),
+            invalidated_by: None,
+            invalidation_reason: None,
+        });
+        let mut expired = entry(
+            "uwu://t/agent/a/memories/fact/expired",
+            "expired fact",
+            ContentType::Fact,
+            0.9,
+        );
+        expired.created_at = valid_at - chrono::Duration::days(30);
+        expired.updated_at = valid_at - chrono::Duration::days(20);
+        expired.metadata.validity = Some(ValidityRecord {
+            valid_from: valid_at - chrono::Duration::days(30),
+            valid_until: Some(valid_at - chrono::Duration::days(5)),
+            invalidated_by: None,
+            invalidation_reason: None,
+        });
+        ContentRepo::write(store.as_ref(), current).await.unwrap();
+        ContentRepo::write(store.as_ref(), expired).await.unwrap();
+
+        let query = Query::Find {
+            scope: Some(ContextUri::parse("uwu://t/agent/a/memories").unwrap()),
+            predicate: Predicate::new()
+                .with(Condition::TypeEquals(ContentType::Fact))
+                .with(Condition::Bitemporal {
+                    valid_at,
+                    transaction_at: valid_at + chrono::Duration::seconds(1),
+                }),
+            budget: 10,
+            order: SortKey::Natural,
+            expand: None,
+        };
+        let physical = CboOptimizer::new(Arc::new(crate::planner::StatisticsCollector::new()))
+            .optimize(&query_to_logical(&query));
+        let ctx = ExecContext {
+            fs: store.clone(),
+            content: Some(store),
+            index: None,
+            graph: None,
+        };
+        let batch = physical.execute(&ctx).await.unwrap();
+        let uris: Vec<_> = batch
+            .records
+            .iter()
+            .map(|hit| hit.uri.to_string())
+            .collect();
+
+        assert_eq!(
+            uris,
+            vec!["uwu://t/agent/a/memories/fact/current".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_traverse_keeps_seed_and_loads_related_entries() {
+        let store = Arc::new(MemoryContextStore::new());
+        let seed_uri = ContextUri::parse("uwu://t/agent/a/memories/fact/root").unwrap();
+        let child_uri = ContextUri::parse("uwu://t/agent/a/memories/fact/child").unwrap();
+        ContentRepo::write(
+            store.as_ref(),
+            entry(seed_uri.as_str(), "root", ContentType::Fact, 0.9),
+        )
+        .await
+        .unwrap();
+        ContentRepo::write(
+            store.as_ref(),
+            entry(child_uri.as_str(), "child", ContentType::Fact, 0.8),
+        )
+        .await
+        .unwrap();
+        GraphStore::add_edge(
+            store.as_ref(),
+            &seed_uri,
+            &child_uri,
+            GraphRelation::DerivedFrom,
+        )
+        .await
+        .unwrap();
+
+        let query = Query::Traverse {
+            start: seed_uri.clone(),
+            edges: vec![GraphRelation::DerivedFrom],
+            max_hops: 1,
+            predicate: Predicate::new(),
+        };
+        let physical = CboOptimizer::new(Arc::new(crate::planner::StatisticsCollector::new()))
+            .optimize(&query_to_logical(&query));
+        let ctx = ExecContext {
+            fs: store.clone(),
+            content: Some(store.clone()),
+            index: None,
+            graph: Some(store),
+        };
+        let batch = physical.execute(&ctx).await.unwrap();
+        let uris: Vec<_> = batch.records.iter().map(|hit| hit.uri.clone()).collect();
+
+        assert!(uris.contains(&seed_uri));
+        assert!(uris.contains(&child_uri));
+        assert!(
+            batch
+                .records
+                .iter()
+                .any(|hit| hit.uri == child_uri && hit.content_type == Some(ContentType::Fact))
         );
     }
 }

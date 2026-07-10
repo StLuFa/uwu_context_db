@@ -1,5 +1,6 @@
 //! PublishGate — 质量门控 + 确认阶梯 + 声誉债券 + C2D 边界。
 
+use crate::secure_aggregation::PrivateContribution;
 use crate::types::*;
 use agent_context_db_core::{ContentType, ContextUri, EpistemicType};
 
@@ -122,6 +123,24 @@ impl PublishGate {
     pub fn boosted_quality(&self, base_quality: f32, bond: &ReputationBond) -> f32 {
         let bonus = bond.current_bonus(chrono::Utc::now());
         (base_quality + bonus).min(1.0)
+    }
+
+    pub fn private_contribution_from_entry(
+        &self,
+        entry: &MarketEntry,
+        value: f32,
+    ) -> PrivateContribution {
+        PrivateContribution {
+            contributor: entry.publisher.clone(),
+            entry_id: entry.id,
+            value,
+            evidence_uris: entry.evidence_uris.clone(),
+            quality_score: entry.quality_score,
+            confidence: entry.confidence,
+            epistemic_type: entry.epistemic_type,
+            content_type: entry.content_type,
+            created_at: chrono::Utc::now(),
+        }
     }
 }
 

@@ -13,6 +13,7 @@ use agent_context_db_core::{
     VersionOps, sanitize_entry_for_write,
 };
 use async_trait::async_trait;
+use sqlx::Row;
 use uuid::Uuid;
 
 use std::sync::Arc;
@@ -882,9 +883,113 @@ impl GraphStore for PgContextStore {
     }
 
     async fn centrality(&self, uri: &ContextUri) -> Result<f32> {
-        let in_degree = self.neighbors(uri, None).await?.len();
-        // 简化：PageRank 难度过高，用归一化入度近似中心性
-        Ok((in_degree as f32 / (in_degree + 10) as f32).clamp(0.0, 1.0))
+        const MAX_NODES: usize = 256;
+        const MAX_HOPS: usize = 3;
+        const MAX_ITERS: usize = 32;
+        const EPSILON: f32 = 1e-5;
+        const DAMPING: f32 = 0.85;
+
+        let pg = self.pg_pool();
+        let mut nodes = std::collections::BTreeSet::new();
+        let mut frontier = vec![uri.to_string()];
+        nodes.insert(uri.to_string());
+
+        for _ in 0..MAX_HOPS {
+            if frontier.is_empty() || nodes.len() >= MAX_NODES {
+                break;
+            }
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT to_uri FROM context_relations WHERE from_uri = ANY($1)
+                 UNION
+                 SELECT DISTINCT from_uri FROM context_relations WHERE to_uri = ANY($1)",
+            )
+            .bind(&frontier)
+            .fetch_all(pg)
+            .await
+            .map_err(|e| Self::storage_err("centrality.frontier", e))?;
+
+            frontier.clear();
+            for node in rows {
+                if nodes.len() >= MAX_NODES {
+                    break;
+                }
+                if nodes.insert(node.clone()) {
+                    frontier.push(node);
+                }
+            }
+        }
+
+        let node_list = nodes.into_iter().collect::<Vec<_>>();
+        if node_list.len() <= 1 {
+            return Ok(0.0);
+        }
+        let node_set = node_list.iter().cloned().collect::<std::collections::HashSet<_>>();
+        let rows = sqlx::query(
+            "SELECT from_uri, to_uri FROM context_relations
+             WHERE from_uri = ANY($1) OR to_uri = ANY($1)",
+        )
+        .bind(&node_list)
+        .fetch_all(pg)
+        .await
+        .map_err(|e| Self::storage_err("centrality.edges", e))?;
+
+        let mut outgoing: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for row in rows {
+            let from = row.try_get::<String, _>("from_uri").unwrap_or_default();
+            let to = row.try_get::<String, _>("to_uri").unwrap_or_default();
+            if node_set.contains(&from) && node_set.contains(&to) {
+                outgoing.entry(from).or_default().push(to);
+            }
+        }
+
+        let n = node_list.len() as f32;
+        let base = (1.0 - DAMPING) / n;
+        let mut ranks = node_list
+            .iter()
+            .map(|node| (node.clone(), 1.0 / n))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for _ in 0..MAX_ITERS {
+            let dangling_mass = node_list
+                .iter()
+                .filter(|node| outgoing.get(*node).map_or(true, Vec::is_empty))
+                .map(|node| ranks.get(node).copied().unwrap_or(0.0))
+                .sum::<f32>()
+                / n;
+            let mut next = node_list
+                .iter()
+                .map(|node| (node.clone(), base + DAMPING * dangling_mass))
+                .collect::<std::collections::HashMap<_, _>>();
+
+            for (from, targets) in &outgoing {
+                if targets.is_empty() {
+                    continue;
+                }
+                let contribution = DAMPING * ranks.get(from).copied().unwrap_or(0.0)
+                    / targets.len() as f32;
+                for target in targets {
+                    if let Some(value) = next.get_mut(target) {
+                        *value += contribution;
+                    }
+                }
+            }
+
+            let delta = node_list
+                .iter()
+                .map(|node| {
+                    (next.get(node).copied().unwrap_or(0.0)
+                        - ranks.get(node).copied().unwrap_or(0.0))
+                    .abs()
+                })
+                .sum::<f32>();
+            ranks = next;
+            if delta < EPSILON {
+                break;
+            }
+        }
+
+        let raw = ranks.get(uri.as_str()).copied().unwrap_or(0.0);
+        Ok((raw * n).clamp(0.0, 1.0))
     }
 }
 

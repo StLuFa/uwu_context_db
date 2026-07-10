@@ -40,7 +40,7 @@ pub mod tree_search;
 pub mod voting;
 
 use agent_context_db_consolidation::ConsolidationProduct;
-use agent_context_db_core::{ContentType, ContextEntry, ContextUri, EpistemicType, Result};
+use agent_context_db_core::{ContentType, ContextEntry, ContextUri};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -171,29 +171,10 @@ pub struct TrainingGoal {
     pub expected_new_knowledge: String,
 }
 
-/// 课程生成器 — 基于知识图谱拓扑 + 最近发展区。
-pub struct CurriculumGenerator {
-    pub exploration_ratio: f32,
-}
-
-impl CurriculumGenerator {
-    pub fn new(exploration_ratio: f32) -> Self {
-        Self { exploration_ratio }
-    }
-
-    /// 生成下一个训练目标（骨架：返回 placeholder）。
-    pub async fn next_goal(&self) -> Result<TrainingGoal> {
-        Ok(TrainingGoal {
-            target_node: ContextUri::parse("uwu://t/a/memory/skill/next")?,
-            difficulty: 0.5,
-            prerequisite_skills: vec![],
-            expected_new_knowledge: String::new(),
-        })
-    }
-}
+pub use curriculum::{CurriculumGenerator, FrontierNode};
 
 // ===========================================================================
-// 训练管线（骨架）
+// 训练管线
 // ===========================================================================
 
 /// 训练配置。
@@ -350,17 +331,6 @@ pub fn extract_gradients_from_products(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     gradients
-}
-
-fn map_content_to_epistemic(ct: ContentType) -> EpistemicType {
-    match ct {
-        ContentType::Fact => EpistemicType::Fact,
-        ContentType::Belief => EpistemicType::Belief,
-        ContentType::Hypothesis => EpistemicType::Hypothesis,
-        ContentType::Heuristic => EpistemicType::Heuristic,
-        ContentType::Procedure => EpistemicType::Procedure,
-        _ => EpistemicType::Fact,
-    }
 }
 
 // ===========================================================================

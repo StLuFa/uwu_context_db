@@ -197,7 +197,7 @@ pub struct LineageNode {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineageAction {
     Origin,
     Derived,

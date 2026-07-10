@@ -514,6 +514,127 @@ impl PgVersionStore {
         serde_json::to_string(payload).map_err(Self::storage_err)
     }
 
+    fn structured_entity_diff(
+        uri: &ContextUri,
+        old_raw: Option<&str>,
+        new_raw: Option<&str>,
+    ) -> Vec<agent_context_db_version::EntityChange> {
+        use agent_context_db_version::{ChangeType, EntityChange};
+
+        let old_value = old_raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let new_value = new_raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        match (old_value, new_value) {
+            (None, None) => Vec::new(),
+            (None, Some(value)) => vec![EntityChange {
+                entity_uri: uri.clone(),
+                field: "*".into(),
+                old_value: None,
+                new_value: Some(value),
+                change_type: ChangeType::Set,
+            }],
+            (Some(value), None) => vec![EntityChange {
+                entity_uri: uri.clone(),
+                field: "*".into(),
+                old_value: Some(value),
+                new_value: None,
+                change_type: ChangeType::Remove,
+            }],
+            (Some(old), Some(new)) if old == new => Vec::new(),
+            (Some(old), Some(new)) => {
+                let mut changes = Vec::new();
+                Self::diff_json_value(uri, "", &old, &new, &mut changes);
+                if changes.is_empty() {
+                    changes.push(EntityChange {
+                        entity_uri: uri.clone(),
+                        field: "*".into(),
+                        old_value: Some(old),
+                        new_value: Some(new),
+                        change_type: ChangeType::Set,
+                    });
+                }
+                changes
+            }
+        }
+    }
+
+    fn diff_json_value(
+        uri: &ContextUri,
+        path: &str,
+        old: &serde_json::Value,
+        new: &serde_json::Value,
+        changes: &mut Vec<agent_context_db_version::EntityChange>,
+    ) {
+        use agent_context_db_version::{ChangeType, EntityChange};
+
+        match (old, new) {
+            (serde_json::Value::Object(old_map), serde_json::Value::Object(new_map)) => {
+                let mut keys = old_map.keys().chain(new_map.keys()).collect::<Vec<_>>();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    match (old_map.get(key), new_map.get(key)) {
+                        (Some(old_child), Some(new_child)) => {
+                            Self::diff_json_value(uri, &child_path, old_child, new_child, changes)
+                        }
+                        (Some(old_child), None) => changes.push(EntityChange {
+                            entity_uri: uri.clone(),
+                            field: child_path,
+                            old_value: Some(old_child.clone()),
+                            new_value: None,
+                            change_type: ChangeType::Remove,
+                        }),
+                        (None, Some(new_child)) => changes.push(EntityChange {
+                            entity_uri: uri.clone(),
+                            field: child_path,
+                            old_value: None,
+                            new_value: Some(new_child.clone()),
+                            change_type: ChangeType::Set,
+                        }),
+                        (None, None) => {}
+                    }
+                }
+            }
+            (serde_json::Value::Array(old_items), serde_json::Value::Array(new_items)) => {
+                let common = old_items.len().min(new_items.len());
+                for idx in 0..common {
+                    let child_path = format!("{}[{}]", path_or_root(path), idx);
+                    Self::diff_json_value(uri, &child_path, &old_items[idx], &new_items[idx], changes);
+                }
+                for item in &new_items[common..] {
+                    changes.push(EntityChange {
+                        entity_uri: uri.clone(),
+                        field: path_or_root(path).into(),
+                        old_value: None,
+                        new_value: Some(item.clone()),
+                        change_type: ChangeType::ArrayAppend,
+                    });
+                }
+                for item in &old_items[common..] {
+                    changes.push(EntityChange {
+                        entity_uri: uri.clone(),
+                        field: path_or_root(path).into(),
+                        old_value: Some(item.clone()),
+                        new_value: None,
+                        change_type: ChangeType::ArrayRemove,
+                    });
+                }
+            }
+            _ if old != new => changes.push(EntityChange {
+                entity_uri: uri.clone(),
+                field: path_or_root(path).into(),
+                old_value: Some(old.clone()),
+                new_value: Some(new.clone()),
+                change_type: ChangeType::Set,
+            }),
+            _ => {}
+        }
+    }
+
     fn raw_to_payload(raw: &str) -> Option<ContentPayload> {
         serde_json::from_str(raw).ok()
     }
@@ -1468,15 +1589,38 @@ impl VersionStore for PgVersionStore {
     async fn gc(&self, scope: &ContextUri, policy: &GcPolicy) -> Result<GcReport> {
         let scope_key = Self::scope_key(scope);
         let cutoff = Utc::now() - chrono::Duration::days(policy.max_age_days);
-        // 找到候选 —— 不是任何分支/tag HEAD 的祖先，且 timestamp < cutoff
-        // 简化：先按时间戳 + LIMIT keep_recent 排除
+        // 只清理不可达且过期的 commit。branch/tag/head 可达祖先全部受保护，避免删掉
+        // 仍被某个引用依赖的历史链；keep_recent 额外保护该 scope 最近写入的 commit。
         let rows = sqlx::query(
-            r#"SELECT id FROM version_commits
-               WHERE scope = $1 AND timestamp < $2
-               AND id NOT IN (SELECT head FROM version_branches WHERE scope = $1)
-               AND id NOT IN (SELECT target FROM version_tags WHERE scope = $1)
-               ORDER BY timestamp ASC
-               OFFSET $3"#,
+            r#"
+            WITH RECURSIVE protected_refs AS (
+                SELECT commit_id AS id FROM version_heads WHERE scope = $1
+                UNION
+                SELECT head AS id FROM version_branches WHERE scope = $1
+                UNION
+                SELECT target AS id FROM version_tags WHERE scope = $1
+            ), protected AS (
+                SELECT id FROM protected_refs
+                UNION
+                SELECT p.parent_id AS id
+                FROM version_commit_parents p
+                JOIN protected pr ON pr.id = p.commit_id
+            ), recent AS (
+                SELECT id FROM version_commits
+                WHERE scope = $1
+                ORDER BY timestamp DESC
+                LIMIT $3
+            )
+            SELECT c.id
+            FROM version_commits c
+            LEFT JOIN protected p ON p.id = c.id
+            LEFT JOIN recent r ON r.id = c.id
+            WHERE c.scope = $1
+              AND c.timestamp < $2
+              AND p.id IS NULL
+              AND r.id IS NULL
+            ORDER BY c.timestamp ASC
+            "#,
         )
         .bind(&scope_key)
         .bind(cutoff)
@@ -1664,49 +1808,52 @@ impl VersionStore for PgVersionStore {
 
     async fn semantic_diff(
         &self,
-        scope: &ContextUri,
+        _scope: &ContextUri,
         a: &CommitId,
         b: &CommitId,
     ) -> Result<StructuredDiff> {
-        // 简化：把 TreeDiff 映射为 StructuredDiff（entity_changes 每个 URI 一条）
-        let tree = self.diff_commits(scope, a, b).await?;
-        use agent_context_db_version::{ChangeType, EntityChange};
+        let before = self.reconstruct_snapshot(a).await?;
+        let after = self.reconstruct_snapshot(b).await?;
+        let mut uris = before
+            .keys()
+            .chain(after.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        uris.sort();
+        uris.dedup();
+
         let mut entity_changes = Vec::new();
-        for uri in tree.adds {
-            entity_changes.push(EntityChange {
-                entity_uri: uri,
-                field: "*".into(),
-                old_value: None,
-                new_value: Some(serde_json::json!({})),
-                change_type: ChangeType::Set,
-            });
+        for uri_str in uris {
+            let Ok(uri) = ContextUri::parse(&uri_str) else {
+                continue;
+            };
+            entity_changes.extend(Self::structured_entity_diff(
+                &uri,
+                before.get(&uri_str).map(String::as_str),
+                after.get(&uri_str).map(String::as_str),
+            ));
         }
-        for uri in tree.updates {
-            entity_changes.push(EntityChange {
-                entity_uri: uri,
-                field: "*".into(),
-                old_value: Some(serde_json::json!({})),
-                new_value: Some(serde_json::json!({})),
-                change_type: ChangeType::Set,
-            });
-        }
-        for uri in tree.deletes {
-            entity_changes.push(EntityChange {
-                entity_uri: uri,
-                field: "*".into(),
-                old_value: Some(serde_json::json!({})),
-                new_value: None,
-                change_type: ChangeType::Remove,
-            });
-        }
+
+        let summary = if entity_changes.is_empty() {
+            "no semantic entity changes".to_string()
+        } else {
+            format!(
+                "{} semantic field change(s) across commit {}..{}",
+                entity_changes.len(),
+                a.0,
+                b.0
+            )
+        };
+
         Ok(StructuredDiff {
             entity_changes,
             relation_changes: vec![],
             fact_corrections: vec![],
             confidence_delta: 0.0,
-            summary: String::new(),
+            summary,
         })
     }
+
 
     // ---- 时态演化 ------------------------------------------------------------
 
@@ -2186,6 +2333,10 @@ impl InteractiveVersionStore for PgVersionStore {
     async fn abort_conflict_session(&self, id: &ConflictSessionId) -> Result<()> {
         self.mark_conflict_session_status(id, "aborted").await
     }
+}
+
+fn path_or_root(path: &str) -> &str {
+    if path.is_empty() { "*" } else { path }
 }
 
 /// 从 JSON 字符串重建 ContentPayload；失败时退化为纯文本。

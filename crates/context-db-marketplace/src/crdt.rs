@@ -100,14 +100,14 @@ impl SemanticCrdtMerger {
                     match self.llm_arbitrate(llm, lp, rp, local, remote).await {
                         Some(merged) => (merged, CrdtMergeStrategy::LlmArbitrated, 1),
                         None => {
-                            // LLM 仲裁失败 → LWW (高 clock 胜)
-                            let winner = if local.clock >= remote.clock { lp } else { rp };
-                            (winner.clone(), CrdtMergeStrategy::AutoCrdt, 1)
+                            // LLM 仲裁失败 → LWW；同 clock 用 node_id 稳定打破平局。
+                            let winner = self.lww_principle(local, lp, remote, rp);
+                            (winner, CrdtMergeStrategy::AutoCrdt, 1)
                         }
                     }
                 } else {
-                    let winner = if local.clock >= remote.clock { lp } else { rp };
-                    (winner.clone(), CrdtMergeStrategy::AutoCrdt, 1)
+                    let winner = self.lww_principle(local, lp, remote, rp);
+                    (winner, CrdtMergeStrategy::AutoCrdt, 1)
                 }
             }
             (Some(lp), None) => (lp.clone(), CrdtMergeStrategy::FastForward, 0),
@@ -124,6 +124,28 @@ impl SemanticCrdtMerger {
             quality_score,
             conflicts_resolved: conflicts,
             strategy,
+        }
+    }
+
+    fn lww_principle(
+        &self,
+        local: &PatchSet,
+        local_principle: &str,
+        remote: &PatchSet,
+        remote_principle: &str,
+    ) -> String {
+        if local.clock > remote.clock {
+            return local_principle.to_string();
+        }
+        if remote.clock > local.clock {
+            return remote_principle.to_string();
+        }
+        let local_key = format!("{}:{}", self.node_id, local.patcher);
+        let remote_key = remote.patcher.to_string();
+        if local_key >= remote_key {
+            local_principle.to_string()
+        } else {
+            remote_principle.to_string()
         }
     }
 

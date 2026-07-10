@@ -1,5 +1,6 @@
 //! Social Voting — 市场条目的众包投票。
 
+use crate::secure_aggregation::PrivateContribution;
 use crate::types::*;
 use std::collections::HashMap;
 
@@ -86,6 +87,34 @@ impl SocialVoter {
         }
         let p = tally.upvotes as f32 / total as f32;
         1.0 - 2.0 * (p - 0.5).abs() // 0=完全有争议, 1=高度共识
+    }
+
+    pub fn private_vote_contributions(&self, entry: &MarketEntry) -> Vec<PrivateContribution> {
+        self.votes
+            .read()
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|vote| {
+                let value = match vote.op {
+                    VoteOp::Upvote => vote.weight,
+                    VoteOp::Downvote => -vote.weight,
+                    VoteOp::FlagOutdated => -0.5 * vote.weight,
+                };
+                PrivateContribution {
+                    contributor: vote.voter,
+                    entry_id: entry.id,
+                    value,
+                    evidence_uris: entry.evidence_uris.clone(),
+                    quality_score: entry.quality_score,
+                    confidence: entry.confidence,
+                    epistemic_type: entry.epistemic_type,
+                    content_type: entry.content_type,
+                    created_at: vote.timestamp,
+                }
+            })
+            .collect()
     }
 
     /// 应下架？（downvote > upvote + flagged）

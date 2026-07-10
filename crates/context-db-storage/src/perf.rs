@@ -48,12 +48,11 @@ impl BatchWriteBuffer {
         let this_clone = Arc::downgrade(&this);
         let handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if let Some(strong) = this_clone.upgrade() {
-                    strong.flush().await;
-                } else {
+                let Some(strong) = this_clone.upgrade() else {
                     break; // Arc 已 drop，退出循环
-                }
+                };
+                tokio::time::sleep(strong.flush_interval).await;
+                strong.flush().await;
             }
         });
         *this._flush_handle.lock() = Some(handle);

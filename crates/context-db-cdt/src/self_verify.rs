@@ -76,14 +76,14 @@ impl CognitiveSelfVerifier {
             ));
         }
 
-        if execution.confidence_delta > 0.1 {
+        if execution.confidence_delta >= self.success_threshold {
             return VerificationResult::Passed;
         }
 
-        // 微小提升 — 要求足够 trial 数据
-        VerificationResult::Partial(
-            "task succeeded with marginal confidence gain — more trials needed".into(),
-        )
+        VerificationResult::Partial(format!(
+            "task succeeded but confidence gain {:.3} is below threshold {:.3}",
+            execution.confidence_delta, self.success_threshold
+        ))
     }
 
     /// 批量验证（用于多个 Skill 的并行验证）。

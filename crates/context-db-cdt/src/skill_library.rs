@@ -1,6 +1,7 @@
 //! SkillLibrary — embedding 检索 + deposit（课程驱动）。
 
 use agent_context_db_core::{ContextUri, VectorIndex};
+use agent_context_db_version::ReplaySkillCandidate;
 use std::sync::Arc;
 
 /// Skill 条目。
@@ -46,17 +47,66 @@ impl SkillLibrary {
 
     /// 执行成功后存入 skill library。
     pub async fn deposit(&self, skill: &SkillEntry) {
-        let point = agent_context_db_core::IndexPoint {
-            uri: skill.uri.clone(),
-            vector: skill.embedding.clone(),
-            embedding_model_id: None,
-            embedding_dim: None,
-            embedding_version: None,
-            payload: serde_json::json!({
+        self.deposit_with_payload(
+            skill.uri.clone(),
+            skill.embedding.clone(),
+            serde_json::json!({
                 "name": skill.name,
+                "description": skill.description,
                 "precondition": skill.precondition,
                 "success_rate": skill.success_rate,
             }),
+        )
+        .await;
+    }
+
+    /// 将睡眠期经验重放产出的 skill candidate 写入技能索引。
+    pub async fn deposit_replay_candidate(
+        &self,
+        candidate: &ReplaySkillCandidate,
+        embedding: Vec<f32>,
+    ) {
+        self.deposit_with_payload(
+            candidate.uri.clone(),
+            embedding,
+            serde_json::json!({
+                "name": candidate.name,
+                "description": candidate.description,
+                "precondition": candidate.precondition,
+                "success_rate": candidate.success_rate,
+                "evidence": candidate.evidence,
+                "source": "dream_replay",
+            }),
+        )
+        .await;
+    }
+
+    pub async fn deposit_replay_candidates(
+        &self,
+        candidates: &[(ReplaySkillCandidate, Vec<f32>)],
+    ) -> usize {
+        let mut written = 0;
+        for (candidate, embedding) in candidates {
+            self.deposit_replay_candidate(candidate, embedding.clone())
+                .await;
+            written += 1;
+        }
+        written
+    }
+
+    async fn deposit_with_payload(
+        &self,
+        uri: ContextUri,
+        vector: Vec<f32>,
+        payload: serde_json::Value,
+    ) {
+        let point = agent_context_db_core::IndexPoint {
+            uri,
+            vector,
+            embedding_model_id: None,
+            embedding_dim: None,
+            embedding_version: None,
+            payload,
         };
         let _ = self.index.upsert("skills", point).await;
     }

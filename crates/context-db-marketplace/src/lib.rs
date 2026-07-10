@@ -17,14 +17,16 @@ pub mod discovery;
 pub mod feedback;
 pub mod immune;
 pub mod influence;
+pub mod memetic;
 pub mod phylogeny;
 pub mod publish;
 pub mod registry;
+pub mod secure_aggregation;
 pub mod types;
 pub mod voting;
 
 pub use cap::{CapPolicyEngine, ConsistencyLevel};
-pub use community::{CommunityDetector, SpeciationTracker};
+pub use community::{CommunityDetector, SpeciationEvent, SpeciationFork, SpeciationTracker};
 pub use conflict::{ConflictResolver, MarketConflictResolution};
 pub use consensus::ConsensusTracker;
 pub use crdt::{CrdtMergeStrategy, SemanticCrdtMerger};
@@ -32,8 +34,17 @@ pub use discovery::{DiscoveryEngine, FederatedDiscoveryBackend};
 pub use feedback::{MarketFeedback, ReputationEngine};
 pub use immune::ImmuneProtocol;
 pub use influence::InfluenceAnalyzer;
+pub use memetic::{
+    EvolutionAction, EvolutionCandidate, EvolutionOffspring, EvolutionRunReport, FitnessScore,
+    FitnessSignals, MemeticEvolutionConfig, MemeticEvolutionEngine,
+};
 pub use phylogeny::CrossAgentPhylogeny;
 pub use publish::{KnowledgeSigner, PublishGate, PublishableProduct};
 pub use registry::FederatedRegistry;
+pub use secure_aggregation::{
+    ContributionCommitment, DpBudget, HashProvenanceVerifier, PrivateContribution,
+    ProvenanceVerifier, SecretShare, SecureAggregateReport, SecureAggregationEngine,
+    SecureAggregationError, SecureAggregationRejection, SharedContribution,
+};
 pub use types::*;
 pub use voting::SocialVoter;

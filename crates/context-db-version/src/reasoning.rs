@@ -347,10 +347,272 @@ impl<V: VersionStore> TemporalReasoner<V> {
 
 #[cfg(test)]
 mod tests {
-    /// 验证 TemporalReasoner 可用 MemoryVersionStore 构造。
-    #[test]
-    fn reasoner_constructs_with_store() {
-        // 此测试验证编译期类型约束，实际时序测试在集成测试中
-        assert!(true);
+    use super::*;
+    use crate::{
+        Author, Branch, BranchName, BranchType, ChangeSet, Commit, CommitMeta, ContentHash,
+        GcPolicy, GcReport, ImpactAnalysis, KnowledgeMergeStrategy, MergeResult, MergeStrategy,
+        ProvenanceGraph, StructuredDiff, Tag, TreeDiff, VersionRef,
+    };
+    use agent_context_db_core::{ContentPayload, ContextUri};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct TemporalTestStore {
+        commits: Vec<Commit>,
+        snapshots: HashMap<CommitId, HashMap<String, ContentPayload>>,
+    }
+
+    #[async_trait]
+    impl VersionStore for TemporalTestStore {
+        async fn commit(
+            &self,
+            _scope: &ContextUri,
+            _changes: ChangeSet,
+            _meta: CommitMeta,
+        ) -> crate::Result<CommitId> {
+            unsupported()
+        }
+
+        async fn create_branch(
+            &self,
+            _scope: &ContextUri,
+            _name: BranchName,
+            _from: CommitId,
+            _bt: BranchType,
+        ) -> crate::Result<Branch> {
+            unsupported()
+        }
+
+        async fn list_branches(&self, _scope: &ContextUri) -> crate::Result<Vec<Branch>> {
+            unsupported()
+        }
+
+        async fn delete_branch(&self, _scope: &ContextUri, _name: &BranchName) -> crate::Result<()> {
+            unsupported()
+        }
+
+        async fn create_tag(&self, _scope: &ContextUri, _tag: Tag) -> crate::Result<()> {
+            unsupported()
+        }
+
+        async fn list_tags(&self, _scope: &ContextUri) -> crate::Result<Vec<Tag>> {
+            unsupported()
+        }
+
+        async fn log(&self, _scope: &ContextUri, _opts: &LogOpts) -> crate::Result<Vec<Commit>> {
+            Ok(self.commits.clone())
+        }
+
+        async fn read_at(
+            &self,
+            uri: &ContextUri,
+            ref_: VersionRef,
+            _level: ContentLevel,
+        ) -> crate::Result<ContentPayload> {
+            match ref_ {
+                VersionRef::Commit(id) => self.asof_read(uri, AsOfTime::Commit(id), ContentLevel::L0).await,
+                _ => unsupported(),
+            }
+        }
+
+        async fn asof_read(
+            &self,
+            uri: &ContextUri,
+            when: AsOfTime,
+            _level: ContentLevel,
+        ) -> crate::Result<ContentPayload> {
+            let AsOfTime::Commit(commit) = when else {
+                return unsupported();
+            };
+            self.snapshots
+                .get(&commit)
+                .and_then(|snapshot| snapshot.get(uri.as_str()))
+                .cloned()
+                .ok_or_else(|| VersionError::NotFound(uri.to_string()))
+        }
+
+        async fn merge(
+            &self,
+            _scope: &ContextUri,
+            _from: &BranchName,
+            _into: &BranchName,
+            _strategy: MergeStrategy,
+        ) -> crate::Result<MergeResult> {
+            unsupported()
+        }
+
+        async fn diff_commits(
+            &self,
+            _scope: &ContextUri,
+            _a: &CommitId,
+            _b: &CommitId,
+        ) -> crate::Result<TreeDiff> {
+            unsupported()
+        }
+
+        async fn switch_head(&self, _scope: &ContextUri, _branch: &BranchName) -> crate::Result<()> {
+            unsupported()
+        }
+
+        async fn cherry_pick(
+            &self,
+            _scope: &ContextUri,
+            _commit: &CommitId,
+            _onto: &BranchName,
+            _strategy: crate::ConflictStrategy,
+        ) -> crate::Result<CommitId> {
+            unsupported()
+        }
+
+        async fn rebase(
+            &self,
+            _scope: &ContextUri,
+            _branch: &BranchName,
+            _onto: &BranchName,
+            _strategy: crate::ConflictStrategy,
+        ) -> crate::Result<Vec<CommitId>> {
+            unsupported()
+        }
+
+        async fn squash(
+            &self,
+            _scope: &ContextUri,
+            _commits: Vec<CommitId>,
+            _message: &str,
+        ) -> crate::Result<crate::SquashResult> {
+            unsupported()
+        }
+
+        async fn gc(&self, _scope: &ContextUri, _policy: &GcPolicy) -> crate::Result<GcReport> {
+            unsupported()
+        }
+
+        async fn evaluate_semantic_tags(
+            &self,
+            _scope: &ContextUri,
+        ) -> crate::Result<Vec<(crate::model::TagName, CommitId)>> {
+            unsupported()
+        }
+
+        async fn provenance(&self, _uri: &ContextUri) -> crate::Result<ProvenanceGraph> {
+            unsupported()
+        }
+
+        async fn impact_analysis(&self, _commit: &CommitId) -> crate::Result<ImpactAnalysis> {
+            unsupported()
+        }
+
+        async fn semantic_diff(
+            &self,
+            _scope: &ContextUri,
+            _a: &CommitId,
+            _b: &CommitId,
+        ) -> crate::Result<StructuredDiff> {
+            unsupported()
+        }
+
+        async fn evolution(&self, _uri: &ContextUri) -> crate::Result<Vec<crate::TemporalVersion>> {
+            unsupported()
+        }
+
+        async fn knowledge_merge(
+            &self,
+            _scope: &ContextUri,
+            _from: &BranchName,
+            _into: &BranchName,
+            _strategy: KnowledgeMergeStrategy,
+        ) -> crate::Result<MergeResult> {
+            unsupported()
+        }
+    }
+
+    fn unsupported<T>() -> crate::Result<T> {
+        Err(VersionError::Storage("unsupported in TemporalTestStore".into()))
+    }
+
+    fn text_payload(text: &str) -> ContentPayload {
+        ContentPayload::Text {
+            sparse: text.into(),
+            dense: String::new(),
+            full: text.into(),
+        }
+    }
+
+    fn test_commit(id: CommitId, changes: ChangeSet, timestamp: chrono::DateTime<chrono::Utc>) -> Commit {
+        Commit {
+            id,
+            parents: Vec::new(),
+            tree_hash: ContentHash("tree".into()),
+            author: Author {
+                agent_id: None,
+                user_id: None,
+                system: true,
+            },
+            message: "temporal test".into(),
+            timestamp,
+            metadata: CommitMeta {
+                changes,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn temporal_reasoner_reports_periodicity_timeline_and_diff() {
+        let scope = ContextUri::parse("uwu://tenant/agent/a/memory/fact/scope").unwrap();
+        let uri = ContextUri::parse("uwu://tenant/agent/a/memory/fact/topic/item").unwrap();
+        let first = CommitId::new();
+        let second = CommitId::new();
+        let t0 = chrono::Utc::now();
+        let commits = vec![
+            test_commit(
+                first.clone(),
+                ChangeSet {
+                    adds: vec![uri.clone()],
+                    ..Default::default()
+                },
+                t0,
+            ),
+            test_commit(
+                second.clone(),
+                ChangeSet {
+                    updates: vec![crate::UriChange {
+                        uri: uri.clone(),
+                        old_hash: None,
+                        new_hash: ContentHash("v2".into()),
+                        diff_summary: "updated fact text".into(),
+                    }],
+                    ..Default::default()
+                },
+                t0 + chrono::Duration::seconds(1),
+            ),
+        ];
+        let snapshots = HashMap::from([
+            (first.clone(), HashMap::from([(uri.to_string(), text_payload("before"))])),
+            (second.clone(), HashMap::from([(uri.to_string(), text_payload("after"))])),
+        ]);
+        let reasoner = TemporalReasoner::new(Arc::new(TemporalTestStore { commits, snapshots }));
+
+        let periodic = reasoner.detect_periodicity(&scope, 2).await.unwrap();
+        assert_eq!(periodic, vec![(uri.clone(), 2)]);
+
+        let timeline = reasoner
+            .evolution_timeline(
+                &scope,
+                AsOfTime::Timestamp(t0 - chrono::Duration::seconds(1)),
+                AsOfTime::Timestamp(t0 + chrono::Duration::seconds(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeline.len(), 2);
+        assert!(timeline.iter().any(|event| event.entries_changed.contains(&uri)));
+
+        let (before, after) = reasoner
+            .temporal_diff(&uri, AsOfTime::Commit(first), AsOfTime::Commit(second))
+            .await
+            .unwrap();
+        assert_eq!(before.as_deref(), Some("before"));
+        assert_eq!(after.as_deref(), Some("after"));
     }
 }

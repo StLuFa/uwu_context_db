@@ -18,13 +18,14 @@ pub mod reasoning;
 pub use belief_revision::{
     AgmBeliefReviser, AgmRevisionConfig, BeliefConflict, BeliefLiteral, BeliefPolarity,
     BeliefPredicate, BeliefRevisionAction, BeliefRevisionDecision, BeliefSentence,
-    revision_to_resolution,
+    NeuralBeliefExtraction, revision_to_resolution,
 };
 pub use crdt_merge::{CrdtMergeResult, CrdtMerger, CrdtStrategy};
 pub use innovation::{
     CausalDiscoveryConfig, CausalEdge, CausalGraph, CausalHypothesis, CausalInference,
     CausalIntervention, CounterfactualImpact, CrystalDistiller, DreamConsolidator,
-    InterventionResult, KnowledgeCrystal, RepairAction, SelfHealer,
+    InterventionResult, KnowledgeCrystal, RepairAction, ReplaySkillCandidate, ReplaySleepConfig,
+    ReplaySleepReport, SelfHealer,
 };
 pub use model::{
     Author, BitemporalQuery, BitemporalRange, Branch, BranchLifecycle, BranchName, BranchType,
@@ -285,7 +286,7 @@ pub struct ImpactAnalysis {
     pub affected_branches: Vec<BranchName>,
 }
 
-/// 版本存储端口（M2）。见 ARCHITECTURE.md §1.6（此为骨架子集，聚焦交付验收面）。
+/// 版本存储端口（M2）。覆盖提交、分支、标签、时间旅行、合并、GC、语义 diff 与时态演化。
 #[async_trait]
 pub trait VersionStore: Send + Sync {
     // === 提交 ===

@@ -27,8 +27,8 @@ workspace 内 15 个 crate，全部命名 `agent-context-db-*`（目录 `crates/
 | crate | 职责 |
 |-------|------|
 | `context-db-core` | URI + 三层模型 + 窄端口（FsOps/ContentRepo/VersionOps/TenantOps）+ LlmClient/VectorIndex/GraphStore/BlobStore/ReadCache/RateLimiter/生命周期/ACL/Pack/血缘/模板/继承链/去重聚类/UwuConfig/observability metrics + WatchHub/WatchableStore + SemanticWriteDedupStore + prompt 优化 + LLM cache/cascade |
-| `context-db-retrieve` | Query DSL + LogicalPlan + CBO 优化器 + PhysicalPlan 算子 + WQL 预算/谓词下推 + GraphTraverse 批量图遍历 + 双时态谓词过滤 + 分层检索 + GraphRAG 社区摘要/图增强检索 + 意图分析(Rule/LLM) + Rerank + 幻觉检测 + 分层背包预算装载 + 压缩感知加载 + 预测性预加载 + 增量检索学习 + 联想扩展 |
-| `context-db-version` | DAG 版本管理（CommitOps/BranchOps/TagOps/MergeOps/HistoryOps 五窄 trait） + ContentType 驱动 CRDT 合并 + 语义 diff + 时态推理 + TemporalIndex 双时态查询(valid-time/transaction-time) + CausalDag + PC/GES 因果发现 + do-calculus/反事实干预推断 + AGM 信念修正 + 知识晶体 + 自修复 + 梦境巩固 + cherry-pick/rebase (ConflictStrategy + 可选持久化交互式 ConflictSession) + CEL 语义标签 |
+| `context-db-retrieve` | Query DSL + LogicalPlan + CBO 优化器 + PhysicalPlan 算子 + WQL 预算/谓词下推 + GraphTraverse 批量图遍历 + 双时态谓词过滤 + Theory-of-Mind persona/relations 结构化模型 + 分层检索 + GraphRAG 社区摘要/图增强检索 + 意图分析(Rule/LLM) + Rerank + 幻觉检测 + 分层背包预算装载 + 压缩感知加载 + 预测性预加载 + 增量检索学习 + 联想扩展 |
+| `context-db-version` | DAG 版本管理（CommitOps/BranchOps/TagOps/MergeOps/HistoryOps 五窄 trait） + ContentType 驱动 CRDT 合并 + 语义 diff + 时态推理 + TemporalIndex 双时态查询(valid-time/transaction-time) + CausalDag + PC/GES 因果发现 + do-calculus/反事实干预推断 + Neural-Symbolic AGM 信念修正 + 知识晶体 + 自修复 + DreamConsolidator 睡眠期经验重放/技能候选合成 + cherry-pick/rebase (ConflictStrategy + 可选持久化交互式 ConflictSession) + CEL 语义标签 |
 | `context-db-session` | 两阶段 commit 会话压缩 |
 | `context-db-parse` | SemanticProcessor + 内容哈希/子摘要指纹增量缓存 + MemoryExtractor(ContentType 分类) + TrajectoryExtractor(两层归纳) |
 | `context-db-compressor` | tokio mpsc 异步语义处理队列 + RedisSemanticQueue |
@@ -37,10 +37,10 @@ workspace 内 15 个 crate，全部命名 `agent-context-db-*`（目录 `crates/
 | `context-db-testkit` | MemoryContextStore + MemoryVersionStore |
 | `context-db-nats` | EventSystem 装配壳：EventMesh + NatsBridge(按事件类型路由 Main/Consolidation/Monitoring) + NatsIngestor 跨进程事件桥接 |
 | `context-db-llm-provider` | LlmClient provider：OpenAI / Anthropic / 自建 OpenAI-compatible HTTP 后端 + config-driven factory；默认组装 PromptOptimizingLlmClient → CascadeLlmClient → CachingLlmClient，并下发 provider prompt-cache 标记 |
-| `context-db-marketplace` | Agent-to-Agent 知识市场：MarketId/AgentId/PublicationMetadata/FederatedDiscoveryResult 等 DTO + PublishGate + DiscoveryEngine + FederatedRegistry + ReputationEngine + SocialVoter + CRDT merge + immune/influence/phylogeny/community |
+| `context-db-marketplace` | Agent-to-Agent 知识市场：MarketId/AgentId/PublicationMetadata/FederatedDiscoveryResult 等 DTO + PublishGate + DiscoveryEngine + FederatedRegistry + ReputationEngine + SocialVoter + DP + secret sharing 安全聚合 + CRDT merge + ConflictResolver 多智能体 debate 仲裁 + immune/influence/phylogeny/community + SpeciationTracker 特化 fork + MemeticEvolutionEngine 选择/变异/交叉/淘汰 |
 | `context-db-knowledge-network` | 独立 KnowledgeNetwork：真 Laplace/Gaussian DP + RDP privacy budget + capability index + trust routing + probe/fetch + streaming top-k 聚合 + P4 语义能力图/佐证图/路由学习/拓扑优化 + P5 治理策略/ed25519 身份签名/AccessGrant/持久化接口/EventMesh 传输；实现 marketplace 的联邦发现/签名端口；NATS 继续通过 `context-db-nats` + `uwu_nats_bridge` 桥接 |
-| `context-db-consolidation` | 单 Agent 十大创新 + 七维质量分 + 短/中/长期 horizon-aware QualityReassessment + uncertainty-driven ActiveLearningPlanner + 可验证发布/证据链签名 + Sleeptime 执行器 + 巩固状态机；巩固产物通过 marketplace 的 PublishableProduct 端口发布 |
-| `context-db-cdt` | 认知驱动训练：认知梯度 + CDT Pipeline + Skill 系统 + DPO 融合 + LATS/MCTS 自我对弈 + ValueModule rollout/backprop + Voyager/AlphaZero/DSPy 基础组件 + STORM 多视角批量 LLM 分析/合成 |
+| `context-db-consolidation` | 单 Agent 十大创新 + 七维质量分 + 短/中/长期 horizon-aware QualityReassessment + uncertainty-driven ActiveLearningPlanner + BanditBudgetPolicy 渐进加载预算分配 + SelfConsistencyConsolidator 多采样投票巩固 + 预测驱动 TieredCache hot/warm promotion + 可验证发布/证据链签名 + Sleeptime 执行器 + 巩固状态机；巩固产物通过 marketplace 的 PublishableProduct 端口发布 |
+| `context-db-cdt` | 认知驱动训练：认知梯度 + CDT Pipeline + 生命周期门控训练样本 + Skill 系统 + Dream Replay skill candidates 入库 + DPO 融合 + LATS/MCTS 自我对弈 + ValueModule rollout/backprop + Voyager/AlphaZero/DSPy 基础组件 + STORM 多视角批量 LLM 分析/合成 |
 
 ## 功能矩阵
 
@@ -49,14 +49,14 @@ workspace 内 15 个 crate，全部命名 `agent-context-db-*`（目录 `crates/
 | 域 | 能力 |
 |----|------|
 | 存储 | PG 双层存储 · ContentType-only schema · 内存实现 · 路径 ACL · 写入前语义去重 · WatchableStore CDC/订阅流 · ContextPack 导出导入 · 批量写入 · pg_trgm/tags GIN · BlobStore |
-| 检索 | 意图分析(规则+LLM) · 向量召回 · 目录递归 · GraphRAG 社区摘要 + 图增强检索 · WQL Query DSL → LogicalPlan → CBO → PhysicalPlan · Scan/VectorSearch 预算与谓词下推 · GraphTraverse 批量图遍历 · 双时态谓词过滤 · Rerank · 幻觉检测 · cl100k tokenizer 计数 · 分层背包预算装载 · 压缩感知加载 · 预测性预加载 · 增量检索学习 · 检索管线 6 阶段 tracing span |
-| 版本 | Commit DAG · Branch/Tag(含 CEL Semantic) · merge · 时间旅行 · ContentType 驱动 CRDT 合并 · 语义差异推理 · 时态推理 · TemporalIndex 双时态 as-of/between 查询 · PC/GES 因果图 · do-calculus/反事实干预推断 · AGM 信念修正 · cherry-pick/rebase (ConflictStrategy Fail/Ours/Theirs) · squash · gc · Git 风格差量存储 · 三级快照缓存 |
+| 检索 | 意图分析(规则+LLM) · 向量召回 · 目录递归 · GraphRAG 社区摘要 + 图增强检索 · WQL Query DSL → LogicalPlan → CBO → PhysicalPlan · Scan/VectorSearch 预算与谓词下推 · GraphTraverse 批量图遍历 · 双时态谓词过滤 · Theory-of-Mind persona/relations 模型 · Rerank · 幻觉检测 · cl100k tokenizer 计数 · 分层背包预算装载 · BanditBudgetPolicy 渐进加载 · 压缩感知加载 · 预测性预加载 · 增量检索学习 · 检索管线 6 阶段 tracing span |
+| 版本 | Commit DAG · Branch/Tag(含 CEL Semantic) · merge · 时间旅行 · ContentType 驱动 CRDT 合并 · 语义差异推理 · 时态推理 · TemporalIndex 双时态 as-of/between 查询 · PC/GES 因果图 · do-calculus/反事实干预推断 · Neural-Symbolic AGM 信念修正 · 睡眠期经验重放/梦境技能候选 · cherry-pick/rebase (ConflictStrategy Fail/Ours/Theirs) · squash · gc · Git 风格差量存储 · 三级快照缓存 |
 | 语义 | L0/L1 生成 · 摘要增量缓存（内容哈希/子摘要指纹）· ContentType 记忆提取+去重 · 轨迹/经验两层归纳 · 两阶段 commit |
-| Agent | State fork/promote · 联邦发现/查询 · DP 隐私预算组合追踪 |
-| 创新 | 遗忘曲线(Ebbinghaus/SM-2/Bayesian) · Token 经济 · 知识晶体蒸馏 · 自修复 · 梦境巩固(batch_complete 批量洞察) · STORM 多视角批量分析/合成 · 因果推断 · 事件流因果链(CausalDag) · 血缘图 · 跨 Agent 去重 · 上下文模板 · 继承链 |
+| Agent | State fork/promote · 联邦发现/查询 · DP 隐私预算组合追踪 · 可验证 provenance + DP clipping/noise + additive secret sharing 安全聚合 |
+| 创新 | 遗忘曲线(Ebbinghaus/SM-2/Bayesian) · Token 经济 · Bandit/RL 渐进加载预算分配 · 自洽性投票巩固 · 多智能体辩论式仲裁 · Neural-Symbolic AGM 信念修正 · 知识晶体蒸馏 · Dream Replay 睡眠期技能合成 · Theory-of-Mind 交互对象建模 · 知识物种分化 fork + phylogeny + Memetic 演化选择 · 自修复 · 梦境巩固(batch_complete 批量洞察) · STORM 多视角批量分析/合成 · 因果推断 · 事件流因果链(CausalDag) · 血缘图 · 跨 Agent 去重 · 上下文模板 · 继承链 |
 | LLM | complete · embed/embed_batch · complete_json · stream · batch · speculative · PromptOptimizingLlmClient · CascadeLlmClient(cheap/strong 模型路由) · CachingLlmClient · provider 原生 prompt caching 标记 · OpenAI / Anthropic / 自建 OpenAI-compatible HTTP provider |
 | 事件 | WatchHub/WatchSource CDC · EventMeshBridge → uwu_event_mesh → NatsBridge 按事件类型分流 → uwu_nats_bridge(跨进程) |
-| 缓存 | L1 moka async cache + L2 快照 checkpoint（热度统计/容量上限/冷数据驱逐）· completion/embed_batch 缓存 · 摘要增量缓存 · provider prompt cache 标记 · TTL ±10% 抖动（雪崩防护）· 负缓存 marker（穿透防护）· DedupStore 可选持久化 |
+| 缓存 | L1 moka async cache + L2 快照 checkpoint（热度统计/容量上限/冷数据驱逐）· PredictivePrefetcher → TieredCache hot/warm promotion · completion/embed_batch 缓存 · 摘要增量缓存 · provider prompt cache 标记 · TTL ±10% 抖动（雪崩防护）· 负缓存 marker（穿透防护）· DedupStore 可选持久化 |
 | 配置 | UwuConfig 5 子模块 · Arc<ArcSwap<UwuConfig>> 无锁热更新 |
 | 可观测 | metrics crate 8 类计数器 · Prometheus exporter/recorder · tracing::instrument 全线关键路径 · 检索管线 6 阶段 span |
 
@@ -111,8 +111,8 @@ uwu://market/{publisher}/{entry_id}
 语义: SessionCompressor → MemoryExtractor(ContentType) → SemanticProcessor(摘要增量缓存) → SemanticQueue
 检索: QueryPlanner → LogicalPlan → CboOptimizer(预算/谓词下推) → PhysicalPlan(TypeScan/VectorSearch/GraphTraverse/Parallel) → GraphRAG 社区摘要/图下钻 → 6 阶段执行 (parse → optimize → execute → rerank → expand → knapsack budget.load)
 LLM: 调用方 LlmOpts(task/prompt) → PromptOptimizingLlmClient → CascadeLlmClient(cheap/strong 路由) → CachingLlmClient → provider(prompt-cache 标记 / batch embedding)
-版本: VersionStore::commit() → DAG → branch/tag → merge/cherry_pick/rebase → time travel / TemporalIndex 双时态查询 → CRDT merge(ContentType) → PC/GES 因果发现 → do(A)/remove(A) 反事实下游影响推断 → AGM 信念修正
+版本: VersionStore::commit() → DAG → branch/tag → merge/cherry_pick/rebase → time travel / TemporalIndex 双时态查询 → CRDT merge(ContentType) → PC/GES 因果发现 → do(A)/remove(A) 反事实下游影响推断 → Neural-Symbolic AGM 信念修正 → Dream Replay 睡眠期经验重放/技能候选
 事件: WatchHub/WatchSource → 内部 uwu_event_mesh → NatsBridge(type_id 分流 Main/Consolidation/Monitoring) → uwu_nats_bridge → 跨进程节点
-巩固: Sleeptime → 十大单 Agent 创新 + Marketplace 三级发现 → Dream/STORM 批量 LLM 合成 → ed25519 发布签名 + 证据链 hash → 七维质量分 → 主动学习任务 → 状态机 (Generate → Critique → Revise → Resolved → Active/Archived)
-训练: CDT Pipeline → 认知梯度 → LATS/MCTS 自我对弈 → DPO preference pair → Skill 库更新
+巩固: Sleeptime → 十大单 Agent 创新 + Marketplace 三级发现/多智能体 debate 仲裁/安全聚合 → Bandit 渐进加载预算 → Self-Consistency 多采样投票/Dream Replay/STORM 批量 LLM 合成 → KnowledgeCrystal/ReplaySkillCandidate 写回 → ed25519 发布签名 + 证据链 hash → 七维质量分 → 主动学习任务 → 巩固状态(Pending/InProgress/Converged/Stale)
+训练: CDT Pipeline → LifecycleEngine 过滤冻结/归档/删除样本 → 认知梯度 → LATS/MCTS 自我对弈 → DPO preference pair → Skill 库更新
 ```

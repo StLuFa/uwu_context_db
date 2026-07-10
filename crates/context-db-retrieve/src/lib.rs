@@ -26,6 +26,7 @@ pub mod quality;
 pub mod query;
 pub mod rag;
 pub mod retriever;
+pub mod theory_of_mind;
 
 pub use associative::AssociativeExpander;
 pub use budget::{BudgetLoadPlan, LevelAllocation, allocate_hit_levels, load_hits_within_budget};
@@ -33,7 +34,10 @@ pub use graph_rag::{
     GraphRagCommunity, GraphRagEngine, GraphRagIndex, GraphRagIndexConfig, GraphRagIndexStats,
     GraphRagIndexer, GraphRagRequest,
 };
-pub use innovation::{IncrementalRetrievalLearner, PredictivePrefetcher, RelevanceFeedback};
+pub use innovation::{
+    AccessPattern, IncrementalRetrievalLearner, PredictivePrefetcher, PrefetchPrediction,
+    RelevanceFeedback,
+};
 pub use intent::{
     BuiltinIntentPolicyProvider, CompiledIntentPolicy, EventMeshIntentTraceSink,
     FileIntentPolicyProvider, IntentCaller, IntentCandidate, IntentDecision, IntentExecutionGraph,
@@ -59,6 +63,10 @@ pub use rag::{
     CalibratedAnswerSynthesizer,
 };
 pub use retriever::{ContextRetriever, ContextRetrieverBuilder, RuleBasedPlanner};
+pub use theory_of_mind::{
+    BeliefFacet, TheoryOfMindModel, TomObservation, TomObservationKind, TomRetrievalHint,
+    model_from_entry,
+};
 
 use agent_context_db_core::{
     ContentLevel, ContentPayload, ContentType, ContextMeta, ContextUri, LlmClient, LlmOpts, Result,

@@ -197,6 +197,20 @@ impl StatisticsCollector {
         }
     }
 
+    pub fn update_avg_depth(&self, scope: &str, depth: usize) {
+        if let Ok(mut m) = self.avg_depth.write() {
+            m.insert(scope.to_string(), depth.max(1));
+        }
+    }
+
+    pub fn estimate_avg_depth(&self, scope: &str) -> usize {
+        self.avg_depth
+            .read()
+            .ok()
+            .and_then(|m| m.get(scope).copied())
+            .unwrap_or(2)
+    }
+
     /// 估算按类型过滤后的行数。
     pub fn estimate_rows_by_type(&self, ct: &ContentType) -> usize {
         self.type_counts
@@ -418,13 +432,19 @@ impl CboOptimizer {
                 edges,
                 max_hops,
             } => {
+                let scope_key = logical_scope_key(input);
                 let input = self.optimize_with_budget(input, budget, hint);
+                let stats_depth = scope_key
+                    .as_deref()
+                    .map(|scope| self.stats.estimate_avg_depth(scope))
+                    .unwrap_or_else(|| self.stats.estimate_avg_depth("*"));
+                let stats_capped_hops = (*max_hops).min(stats_depth.max(1));
                 let max_hops = hint
                     .filter(|hint| {
                         hint.prefer_graph || matches!(hint.route, IntentRoute::GraphTraversal)
                     })
-                    .map(|hint| (*max_hops).min(hint.max_graph_depth.max(1)))
-                    .unwrap_or(*max_hops);
+                    .map(|hint| stats_capped_hops.min(hint.max_graph_depth.max(1)))
+                    .unwrap_or(stats_capped_hops);
                 PhysicalPlan::GraphTraverse {
                     input: Box::new(input),
                     edges: edges.clone(),
@@ -628,6 +648,22 @@ fn extract_scope(plan: &LogicalPlan) -> Option<ScopeFilter> {
             .as_ref()
             .map(|u| ScopeFilter::UriPrefix(u.to_string())),
         _ => None,
+    }
+}
+
+fn logical_scope_key(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Scan { scope, .. } => scope.as_ref().map(ToString::to_string),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Traverse { input, .. } => logical_scope_key(input),
+        LogicalPlan::Join { left, right, .. } => {
+            logical_scope_key(left).or_else(|| logical_scope_key(right))
+        }
+        LogicalPlan::TemporalScan { uri, .. } => Some(uri.to_string()),
+        LogicalPlan::Parallel { plans, .. } => plans.iter().find_map(logical_scope_key),
+        LogicalPlan::VectorSearch { .. } => None,
     }
 }
 

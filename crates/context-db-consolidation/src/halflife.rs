@@ -42,8 +42,8 @@ impl HalfLifePredictor {
     ///
     /// 策略：
     /// 1. 优先用 LLM 评估 domain volatility + specificity + tech context
-    /// 2. LLM 不可用时回退到启发性规则
-    pub async fn predict(&self, content: &str, _domain_hint: Option<&str>) -> HalfLifePrediction {
+    /// 2. LLM 不可用时使用本地衰减画像，基于领域、版本指纹和知识形态估计复审周期
+    pub async fn predict(&self, content: &str, domain_hint: Option<&str>) -> HalfLifePrediction {
         let prompt = format!(
             r#"Predict the knowledge half-life (in days) for this insight:
 
@@ -76,43 +76,121 @@ Return a JSON object with these fields:
                         reasoning: parsed.reasoning,
                     };
                 }
-                // Parse failed — fall through to heuristic
+                // Parse failed — use local decay profile
             }
             Err(_) => {
-                // LLM unavailable — fall through to heuristic
+                // LLM unavailable — use local decay profile
             }
         }
 
-        // Heuristic fallback
-        Self::heuristic_predict(content)
+        Self::local_decay_profile(content, domain_hint)
     }
 
-    /// 启发性规则回退（不依赖 LLM）。
-    fn heuristic_predict(content: &str) -> HalfLifePrediction {
-        let has_code = content.contains('(') && content.contains(')')
+    fn local_decay_profile(content: &str, domain_hint: Option<&str>) -> HalfLifePrediction {
+        let text = content.to_ascii_lowercase();
+        let domain = domain_hint.unwrap_or_default().to_ascii_lowercase();
+        let has_api_shape = content.contains('(') && content.contains(')')
             || content.contains("::")
-            || content.contains("fn ");
-        let has_principle = content.contains("原则")
-            || content.contains("principle")
-            || content.contains("always")
-            || content.contains("never")
-            || content.contains("定义");
+            || text.contains("fn ")
+            || text.contains("api")
+            || text.contains("endpoint");
+        let has_version_marker = text.contains("v1")
+            || text.contains("v2")
+            || text.contains("version")
+            || text.contains("deprecated")
+            || text.contains("since ")
+            || text.contains("rust 20")
+            || text.contains("python 3")
+            || text.contains("node ");
+        let is_fast_domain = [
+            "frontend",
+            "javascript",
+            "typescript",
+            "react",
+            "node",
+            "api",
+            "sdk",
+            "deploy",
+            "kubernetes",
+            "llm",
+            "model",
+        ]
+        .iter()
+        .any(|needle| domain.contains(needle) || text.contains(needle));
+        let is_stable_domain = [
+            "math",
+            "algorithm",
+            "security principle",
+            "protocol invariant",
+            "definition",
+            "定义",
+            "原则",
+        ]
+        .iter()
+        .any(|needle| domain.contains(needle) || text.contains(needle));
+        let has_principle = text.contains("principle")
+            || text.contains("always")
+            || text.contains("never")
+            || text.contains("invariant")
+            || text.contains("原则")
+            || text.contains("定义");
+        let has_temporal_scope = text.contains("currently")
+            || text.contains("today")
+            || text.contains("now")
+            || text.contains("temporary")
+            || text.contains("当前")
+            || text.contains("临时");
 
-        let (days, reasoning) = if has_code && !has_principle {
-            (
-                60.0,
-                "contains specific API/function references — likely version-dependent",
-            )
-        } else if has_principle {
-            (365.0, "contains general principles — slow to change")
+        let mut days: f64 = 180.0;
+        let mut reasons = Vec::new();
+        let mut signal_count = 0usize;
+
+        if has_api_shape {
+            days *= 0.55;
+            signal_count += 1;
+            reasons.push("API/code-specific signal");
+        }
+        if has_version_marker {
+            days *= 0.45;
+            signal_count += 1;
+            reasons.push("version or deprecation marker");
+        }
+        if is_fast_domain {
+            days *= 0.70;
+            signal_count += 1;
+            reasons.push("fast-moving domain");
+        }
+        if has_temporal_scope {
+            days *= 0.50;
+            signal_count += 1;
+            reasons.push("explicit temporal scope");
+        }
+        if has_principle {
+            days *= 1.70;
+            signal_count += 1;
+            reasons.push("principle-like wording");
+        }
+        if is_stable_domain {
+            days *= 1.45;
+            signal_count += 1;
+            reasons.push("stable domain");
+        }
+        if domain_hint.is_some() {
+            signal_count += 1;
+        }
+
+        let half_life_days = days.clamp(14.0, 730.0);
+        let confidence = (0.34 + signal_count as f32 * 0.075).min(0.74);
+        let reasoning = if reasons.is_empty() {
+            "no strong decay signals; using medium-term review horizon".to_string()
         } else {
-            (180.0, "mixed content — moderate decay")
+            format!("local decay profile: {}", reasons.join(", "))
         };
 
         HalfLifePrediction {
-            half_life_days: days,
-            confidence: 0.6,
-            reasoning: reasoning.to_string(),
+            half_life_days,
+            confidence,
+            reasoning,
         }
     }
 

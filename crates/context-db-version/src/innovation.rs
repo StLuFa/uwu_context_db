@@ -480,6 +480,46 @@ pub struct DreamConsolidator<V: VersionStore> {
     store: Arc<V>,
     llm: Arc<dyn LlmClient>,
     fs: Arc<dyn FsOps>,
+    replay_config: ReplaySleepConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplaySleepConfig {
+    pub max_commits: usize,
+    pub min_cluster_size: usize,
+    pub min_crystal_confidence: f32,
+    pub skill_success_floor: f32,
+}
+
+impl Default for ReplaySleepConfig {
+    fn default() -> Self {
+        Self {
+            max_commits: 30,
+            min_cluster_size: 3,
+            min_crystal_confidence: 0.35,
+            skill_success_floor: 0.55,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplaySkillCandidate {
+    pub uri: ContextUri,
+    pub name: String,
+    pub description: String,
+    pub precondition: String,
+    pub success_rate: f32,
+    pub evidence: Vec<ContextUri>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReplaySleepReport {
+    pub replayed_commits: usize,
+    pub replayed_uris: Vec<ContextUri>,
+    pub insights: Vec<String>,
+    pub crystals: Vec<KnowledgeCrystal>,
+    pub memory_writeback: CrystalWritebackReport,
+    pub skill_candidates: Vec<ReplaySkillCandidate>,
 }
 
 struct DreamClusterPrompt {
@@ -490,7 +530,17 @@ struct DreamClusterPrompt {
 
 impl<V: VersionStore> DreamConsolidator<V> {
     pub fn new(store: Arc<V>, llm: Arc<dyn LlmClient>, fs: Arc<dyn FsOps>) -> Self {
-        Self { store, llm, fs }
+        Self {
+            store,
+            llm,
+            fs,
+            replay_config: ReplaySleepConfig::default(),
+        }
+    }
+
+    pub fn with_replay_config(mut self, config: ReplaySleepConfig) -> Self {
+        self.replay_config = config;
+        self
     }
 
     /// 执行一次"梦境"巩固周期。
@@ -508,7 +558,7 @@ impl<V: VersionStore> DreamConsolidator<V> {
             .log(
                 scope,
                 &crate::LogOpts {
-                    max_count: Some(30),
+                    max_count: Some(self.replay_config.max_commits),
                     ..Default::default()
                 },
             )
@@ -535,7 +585,7 @@ impl<V: VersionStore> DreamConsolidator<V> {
         let mut batch = Vec::new();
 
         for (key, uris) in clusters {
-            if uris.len() < 3 {
+            if uris.len() < self.replay_config.min_cluster_size {
                 if uris.len() >= 2 {
                     insights.push(format!(
                         "cluster '{}' with {} related changes",
@@ -614,6 +664,98 @@ impl<V: VersionStore> DreamConsolidator<V> {
         }
 
         Ok(insights)
+    }
+
+    pub async fn sleep_replay_cycle(
+        &self,
+        scope: &ContextUri,
+        writer: &CrystalMemoryWriter,
+    ) -> std::result::Result<ReplaySleepReport, crate::VersionError> {
+        let log = self
+            .store
+            .log(
+                scope,
+                &crate::LogOpts {
+                    max_count: Some(self.replay_config.max_commits),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let replayed_uris = replay_uris_from_log(&log);
+        let insights = self.consolidate(scope).await?;
+        let crystals = CrystalDistiller::new(self.llm.clone(), self.fs.clone())
+            .distill(&replayed_uris)
+            .await
+            .map_err(|e| crate::VersionError::Storage(format!("dream crystal distill: {e}")))?;
+
+        let mut memory_writeback = writer.write_crystals(&crystals).await;
+        let dream_report = writer.write_dream_insights(&insights).await;
+        memory_writeback.entries.extend(dream_report.entries);
+        memory_writeback.skipped_low_confidence += dream_report.skipped_low_confidence;
+        memory_writeback.written += dream_report.written;
+
+        let skill_candidates = crystals
+            .iter()
+            .filter(|crystal| crystal.confidence >= self.replay_config.min_crystal_confidence)
+            .enumerate()
+            .map(|(index, crystal)| {
+                skill_candidate_from_crystal(crystal, index, self.replay_config.skill_success_floor)
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ReplaySleepReport {
+            replayed_commits: log.len(),
+            replayed_uris,
+            insights,
+            crystals,
+            memory_writeback,
+            skill_candidates,
+        })
+    }
+}
+
+fn replay_uris_from_log(log: &[crate::model::Commit]) -> Vec<ContextUri> {
+    let mut seen = HashSet::new();
+    let mut uris = Vec::new();
+    for commit in log {
+        for uri in &commit.metadata.changes.adds {
+            if seen.insert(uri.clone()) {
+                uris.push(uri.clone());
+            }
+        }
+        for update in &commit.metadata.changes.updates {
+            if seen.insert(update.uri.clone()) {
+                uris.push(update.uri.clone());
+            }
+        }
+    }
+    uris
+}
+
+fn skill_candidate_from_crystal(
+    crystal: &KnowledgeCrystal,
+    index: usize,
+    success_floor: f32,
+) -> ReplaySkillCandidate {
+    let slug = stable_slug(&format!("{}-{}", crystal.id, crystal.principle));
+    let uri = ContextUri::parse(format!(
+        "uwu://dream/agent/replay/memory/skill/{index:02}-{slug}"
+    ))
+    .unwrap_or_else(|_| {
+        ContextUri::parse("uwu://dream/agent/replay/memory/skill/fallback").unwrap()
+    });
+    ReplaySkillCandidate {
+        uri,
+        name: crystal
+            .principle
+            .split_whitespace()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" "),
+        description: crystal.principle.clone(),
+        precondition: crystal.preconditions.join("; "),
+        success_rate: crystal.confidence.max(success_floor).clamp(0.0, 1.0),
+        evidence: crystal.evidence.clone(),
     }
 }
 

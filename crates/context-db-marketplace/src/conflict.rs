@@ -1,7 +1,9 @@
-//! ConflictResolver — 多维证据对比 + LLM 仲裁 + MarketConflictResolution 类型。
+//! ConflictResolver — 多维证据对比 + LLM 多智能体辩论仲裁。
 
 use crate::types::*;
-use agent_context_db_core::{LlmClient, LlmOpts, LlmTaskKind, PromptOptimization};
+use agent_context_db_core::{JsonSchema, LlmClient, LlmOpts, LlmTaskKind, PromptOptimization};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// 冲突 — 两个 MarketEntry 对同一事实给出矛盾结论。
@@ -15,16 +17,16 @@ pub struct MarketConflict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictType {
-    /// 直接语义矛盾（A说X对，B说X错）
+    /// 直接语义矛盾（A说X对，B说X错）。
     DirectContradiction,
-    /// 部分重叠但结论不同
+    /// 部分重叠但结论不同。
     Overlapping,
-    /// 同一证据得出不同结论
+    /// 同一证据得出不同结论。
     SameEvidenceDifferentConclusion,
 }
 
 /// 仲裁结果。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MarketConflictResolution {
     /// 保留 A，让 B 过期。
     KeepA { reason: String },
@@ -41,14 +43,69 @@ pub enum MarketConflictResolution {
     KeepBoth { reason: String },
 }
 
+#[derive(Debug, Clone)]
+pub struct DebateConfig {
+    pub rounds: usize,
+    pub judge_temperature: f32,
+    pub advocate_temperature: f32,
+    pub max_tokens_per_turn: u32,
+    pub min_judge_confidence: f32,
+}
+
+impl Default for DebateConfig {
+    fn default() -> Self {
+        Self {
+            rounds: 2,
+            judge_temperature: 0.15,
+            advocate_temperature: 0.45,
+            max_tokens_per_turn: 512,
+            min_judge_confidence: 0.62,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebateRole {
+    AdvocateA,
+    AdvocateB,
+    Judge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateTurn {
+    pub round: usize,
+    pub role: DebateRole,
+    pub argument: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateVerdict {
+    pub resolution: String,
+    pub reason: String,
+    pub merged: Option<String>,
+    pub confidence: f32,
+    pub hidden_assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateReport {
+    pub turns: Vec<DebateTurn>,
+    pub verdict: DebateVerdict,
+}
+
 /// 冲突仲裁器。
 pub struct ConflictResolver {
     llm: Option<Arc<dyn LlmClient>>,
+    debate_config: DebateConfig,
 }
 
 impl ConflictResolver {
     pub fn new() -> Self {
-        Self { llm: None }
+        Self {
+            llm: None,
+            debate_config: DebateConfig::default(),
+        }
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
@@ -56,19 +113,19 @@ impl ConflictResolver {
         self
     }
 
+    pub fn with_debate_config(mut self, config: DebateConfig) -> Self {
+        self.debate_config = config;
+        self
+    }
+
     /// 检测两个条目是否存在冲突。
     pub fn detect(&self, a: &MarketEntry, b: &MarketEntry) -> Option<MarketConflict> {
-        // 只检测同领域、同类型的条目
-        if a.domain != b.domain {
-            return None;
-        }
-        if a.entry_type != b.entry_type {
+        if a.domain != b.domain || a.entry_type != b.entry_type {
             return None;
         }
 
-        // Jaccard 重叠度
-        let words_a: std::collections::HashSet<&str> = a.principle.split_whitespace().collect();
-        let words_b: std::collections::HashSet<&str> = b.principle.split_whitespace().collect();
+        let words_a: HashSet<&str> = a.principle.split_whitespace().collect();
+        let words_b: HashSet<&str> = b.principle.split_whitespace().collect();
         let intersection = words_a.intersection(&words_b).count();
         let union = words_a.union(&words_b).count();
         let jaccard = if union > 0 {
@@ -77,16 +134,13 @@ impl ConflictResolver {
             0.0
         };
 
-        // 高重叠度 + 低置信度 → 可能是重复
         if jaccard > 0.8 {
-            return None; // 大概率是同一知识，不需要仲裁
+            return None;
         }
 
-        // 中高重叠度 + 否定词 → 可能矛盾
         if jaccard > 0.4 && has_contradiction_marker(&a.principle, &b.principle) {
-            // 确定冲突类型
             let common_evidence = a.evidence_uris.iter().any(|u| b.evidence_uris.contains(u));
-            let ct = if common_evidence {
+            let conflict_type = if common_evidence {
                 ConflictType::SameEvidenceDifferentConclusion
             } else if jaccard > 0.6 {
                 ConflictType::DirectContradiction
@@ -97,7 +151,7 @@ impl ConflictResolver {
             return Some(MarketConflict {
                 entry_a: a.clone(),
                 entry_b: b.clone(),
-                conflict_type: ct,
+                conflict_type,
                 similarity: jaccard,
             });
         }
@@ -118,117 +172,307 @@ impl ConflictResolver {
         conflicts
     }
 
-    /// 仲裁冲突 — 基于多维证据对比。
+    /// 仲裁冲突。证据强弱悬殊时直接裁决；其余高价值冲突走多智能体辩论。
     pub async fn arbitrate(&self, conflict: &MarketConflict) -> MarketConflictResolution {
-        // 1. 多维对比
-        let a = &conflict.entry_a;
-        let b = &conflict.entry_b;
-
-        // 证据数量
-        let a_evidence = a.evidence_uris.len();
-        let b_evidence = b.evidence_uris.len();
-
-        // 确认度
-        let a_corrob = a.corroboration.independent_sources;
-        let b_corrob = b.corroboration.independent_sources;
-
-        // 质量分
-        let a_quality = a.quality_score;
-        let b_quality = b.quality_score;
-
-        // 发布者声誉（在完整实现中查询 ReputationEngine）
-
-        // 2. 如果一方显著优势 → 直接裁决
-        if a_corrob > b_corrob * 2 && a_quality > b_quality + 0.2 {
-            return MarketConflictResolution::KeepA {
-                reason: format!(
-                    "{} corroborators vs {}, quality {:.2} vs {:.2}",
-                    a_corrob, b_corrob, a_quality, b_quality
-                ),
-            };
-        }
-        if b_corrob > a_corrob * 2 && b_quality > a_quality + 0.2 {
-            return MarketConflictResolution::KeepB {
-                reason: format!(
-                    "{} corroborators vs {}, quality {:.2} vs {:.2}",
-                    b_corrob, a_corrob, b_quality, a_quality
-                ),
-            };
+        if let Some(resolution) = strong_evidence_resolution(conflict) {
+            return resolution;
         }
 
-        // 3. LLM 仲裁
-        if let Some(ref llm) = self.llm {
-            let prompt = format!(
-                r#"Two agents have published contradictory knowledge. As an impartial arbiter, determine the resolution.
+        if self.llm.is_some() {
+            let (resolution, _) = self.debate_arbitrate(conflict).await;
+            return resolution;
+        }
 
-Entry A (by {}): "{}"
-  Evidence: {} URIs, {} corroborators, quality={:.2}
+        defer_tie_resolution(conflict)
+    }
 
-Entry B (by {}): "{}"
-  Evidence: {} URIs, {} corroborators, quality={:.2}
+    /// 多智能体辩论仲裁：A/B advocate 分别陈述和反驳，judge 最后给结构化裁决。
+    pub async fn debate_arbitrate(
+        &self,
+        conflict: &MarketConflict,
+    ) -> (MarketConflictResolution, DebateReport) {
+        let Some(llm) = &self.llm else {
+            let resolution = defer_tie_resolution(conflict);
+            return (resolution.clone(), fallback_report(resolution));
+        };
 
-Conflict type: {:?}
-
-Respond with JSON:
-{{"resolution": "keep_a"|"keep_b"|"fuse"|"defer"|"keep_both", "reason": "...", "merged": "..."}}"#,
-                a.publisher,
-                a.principle,
-                a_evidence,
-                a_corrob,
-                a_quality,
-                b.publisher,
-                b.principle,
-                b_evidence,
-                b_corrob,
-                b_quality,
-                conflict.conflict_type,
-            );
-
-            if let Ok(response) = llm
-                .complete(
-                    &prompt,
+        let mut turns = Vec::new();
+        for round in 0..self.debate_config.rounds.max(1) {
+            let prompts = vec![
+                debate_prompt(conflict, DebateRole::AdvocateA, round, &turns),
+                debate_prompt(conflict, DebateRole::AdvocateB, round, &turns),
+            ];
+            let responses = llm
+                .batch_complete(
+                    &prompts,
                     &LlmOpts {
-                        max_tokens: Some(512),
-                        temperature: Some(0.0),
+                        max_tokens: Some(self.debate_config.max_tokens_per_turn),
+                        temperature: Some(self.debate_config.advocate_temperature),
                         task: LlmTaskKind::Arbitration,
                         prompt: PromptOptimization::default()
                             .force_cache()
-                            .target_tokens(1_200),
+                            .target_tokens(2_000),
                         ..Default::default()
                     },
                 )
                 .await
-            {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                    return match json["resolution"].as_str() {
-                        Some("keep_a") => MarketConflictResolution::KeepA {
-                            reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into(),
-                        },
-                        Some("keep_b") => MarketConflictResolution::KeepB {
-                            reason: json["reason"].as_str().unwrap_or("LLM arbitrated").into(),
-                        },
-                        Some("fuse") => MarketConflictResolution::Fuse {
-                            merged_content: json["merged"].as_str().unwrap_or("").into(),
-                            reason: json["reason"].as_str().unwrap_or("").into(),
-                        },
-                        Some("keep_both") => MarketConflictResolution::KeepBoth {
-                            reason: json["reason"].as_str().unwrap_or("").into(),
-                        },
-                        _ => MarketConflictResolution::DeferToHuman {
-                            reason: "LLM response unclear".into(),
-                        },
-                    };
-                }
-            }
+                .unwrap_or_default();
+
+            turns.push(DebateTurn {
+                round,
+                role: DebateRole::AdvocateA,
+                argument: responses.first().cloned().unwrap_or_default(),
+            });
+            turns.push(DebateTurn {
+                round,
+                role: DebateRole::AdvocateB,
+                argument: responses.get(1).cloned().unwrap_or_default(),
+            });
         }
 
-        // 4. 无法自动裁决 → 人工
-        MarketConflictResolution::DeferToHuman {
+        let verdict = judge_verdict(llm, conflict, &turns, &self.debate_config).await;
+        let resolution = resolution_from_verdict(&verdict, self.debate_config.min_judge_confidence);
+        (resolution, DebateReport { turns, verdict })
+    }
+}
+
+impl Default for ConflictResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn strong_evidence_resolution(conflict: &MarketConflict) -> Option<MarketConflictResolution> {
+    let a = &conflict.entry_a;
+    let b = &conflict.entry_b;
+    let a_corrob = a.corroboration.independent_sources;
+    let b_corrob = b.corroboration.independent_sources;
+
+    if a_corrob > b_corrob * 2 && a.quality_score > b.quality_score + 0.2 {
+        return Some(MarketConflictResolution::KeepA {
             reason: format!(
-                "Evidence tie: A({}ev,{}cor,{:.2}q) vs B({}ev,{}cor,{:.2}q)",
-                a_evidence, a_corrob, a_quality, b_evidence, b_corrob, b_quality
+                "{} corroborators vs {}, quality {:.2} vs {:.2}",
+                a_corrob, b_corrob, a.quality_score, b.quality_score
             ),
+        });
+    }
+    if b_corrob > a_corrob * 2 && b.quality_score > a.quality_score + 0.2 {
+        return Some(MarketConflictResolution::KeepB {
+            reason: format!(
+                "{} corroborators vs {}, quality {:.2} vs {:.2}",
+                b_corrob, a_corrob, b.quality_score, a.quality_score
+            ),
+        });
+    }
+    None
+}
+
+fn defer_tie_resolution(conflict: &MarketConflict) -> MarketConflictResolution {
+    let a = &conflict.entry_a;
+    let b = &conflict.entry_b;
+    MarketConflictResolution::DeferToHuman {
+        reason: format!(
+            "Evidence tie: A({}ev,{}cor,{:.2}q) vs B({}ev,{}cor,{:.2}q)",
+            a.evidence_uris.len(),
+            a.corroboration.independent_sources,
+            a.quality_score,
+            b.evidence_uris.len(),
+            b.corroboration.independent_sources,
+            b.quality_score
+        ),
+    }
+}
+
+fn debate_prompt(
+    conflict: &MarketConflict,
+    role: DebateRole,
+    round: usize,
+    prior: &[DebateTurn],
+) -> String {
+    let stance = match role {
+        DebateRole::AdvocateA => "support Entry A and identify weaknesses in Entry B",
+        DebateRole::AdvocateB => "support Entry B and identify weaknesses in Entry A",
+        DebateRole::Judge => "judge",
+    };
+    let history = prior
+        .iter()
+        .map(|turn| format!("round {} {:?}: {}", turn.round, turn.role, turn.argument))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"You are participating in a multi-agent knowledge-market debate.
+Your role: {stance}.
+Round: {round}.
+
+Entry A by {a_pub}: {a_principle}
+Evidence A: {a_ev} URIs, corroborators={a_cor}, quality={a_q:.2}, confidence={a_c:.2}
+
+Entry B by {b_pub}: {b_principle}
+Evidence B: {b_ev} URIs, corroborators={b_cor}, quality={b_q:.2}, confidence={b_c:.2}
+
+Conflict type: {conflict_type:?}, lexical similarity={similarity:.3}
+
+Prior debate:
+{history}
+
+Give a concise argument. Surface hidden assumptions and evidence gaps."#,
+        a_pub = conflict.entry_a.publisher,
+        a_principle = conflict.entry_a.principle,
+        a_ev = conflict.entry_a.evidence_uris.len(),
+        a_cor = conflict.entry_a.corroboration.independent_sources,
+        a_q = conflict.entry_a.quality_score,
+        a_c = conflict.entry_a.confidence,
+        b_pub = conflict.entry_b.publisher,
+        b_principle = conflict.entry_b.principle,
+        b_ev = conflict.entry_b.evidence_uris.len(),
+        b_cor = conflict.entry_b.corroboration.independent_sources,
+        b_q = conflict.entry_b.quality_score,
+        b_c = conflict.entry_b.confidence,
+        conflict_type = conflict.conflict_type,
+        similarity = conflict.similarity,
+    )
+}
+
+async fn judge_verdict(
+    llm: &Arc<dyn LlmClient>,
+    conflict: &MarketConflict,
+    turns: &[DebateTurn],
+    config: &DebateConfig,
+) -> DebateVerdict {
+    let transcript = turns
+        .iter()
+        .map(|turn| format!("round {} {:?}: {}", turn.round, turn.role, turn.argument))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        r#"Judge this knowledge conflict after a structured debate.
+
+Entry A: {a}
+Entry B: {b}
+Conflict type: {typ:?}
+
+Debate transcript:
+{transcript}
+
+Return JSON only:
+{{"resolution":"keep_a|keep_b|fuse|defer|keep_both","reason":"...","merged":"... or null","confidence":0.0,"hidden_assumptions":["..."]}}"#,
+        a = conflict.entry_a.principle,
+        b = conflict.entry_b.principle,
+        typ = conflict.conflict_type,
+    );
+    let schema = JsonSchema::new(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "resolution": {"type":"string"},
+            "reason": {"type":"string"},
+            "merged": {"type":["string", "null"]},
+            "confidence": {"type":"number"},
+            "hidden_assumptions": {"type":"array", "items":{"type":"string"}}
+        },
+        "required": ["resolution", "reason", "confidence"]
+    }));
+    let opts = LlmOpts {
+        max_tokens: Some(config.max_tokens_per_turn),
+        temperature: Some(config.judge_temperature),
+        task: LlmTaskKind::Arbitration,
+        prompt: PromptOptimization::default()
+            .force_cache()
+            .target_tokens(3_000),
+        ..Default::default()
+    };
+    let raw = match llm.complete_json(&prompt, &schema, &opts).await {
+        Ok(value) => value,
+        Err(_) => llm.complete(&prompt, &opts).await.unwrap_or_default(),
+    };
+    parse_verdict(&raw).unwrap_or_else(|| DebateVerdict {
+        resolution: "defer".into(),
+        reason: "judge response could not be parsed".into(),
+        merged: None,
+        confidence: 0.0,
+        hidden_assumptions: Vec::new(),
+    })
+}
+
+fn parse_verdict(raw: &str) -> Option<DebateVerdict> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .or_else(|_| serde_json::from_str(&extract_json_object(raw)))
+        .ok()?;
+    Some(DebateVerdict {
+        resolution: value["resolution"].as_str()?.to_ascii_lowercase(),
+        reason: value["reason"].as_str().unwrap_or("debate judged").into(),
+        merged: value["merged"].as_str().map(ToOwned::to_owned),
+        confidence: value["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32,
+        hidden_assumptions: value["hidden_assumptions"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn extract_json_object(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            return trimmed[start..=end].to_string();
         }
+    }
+    trimmed.to_string()
+}
+
+fn resolution_from_verdict(
+    verdict: &DebateVerdict,
+    min_confidence: f32,
+) -> MarketConflictResolution {
+    if verdict.confidence < min_confidence {
+        return MarketConflictResolution::DeferToHuman {
+            reason: format!(
+                "debate confidence {:.2} below threshold {:.2}: {}",
+                verdict.confidence, min_confidence, verdict.reason
+            ),
+        };
+    }
+    match verdict.resolution.as_str() {
+        "keep_a" => MarketConflictResolution::KeepA {
+            reason: verdict.reason.clone(),
+        },
+        "keep_b" => MarketConflictResolution::KeepB {
+            reason: verdict.reason.clone(),
+        },
+        "fuse" => MarketConflictResolution::Fuse {
+            merged_content: verdict.merged.clone().unwrap_or_default(),
+            reason: verdict.reason.clone(),
+        },
+        "keep_both" => MarketConflictResolution::KeepBoth {
+            reason: verdict.reason.clone(),
+        },
+        _ => MarketConflictResolution::DeferToHuman {
+            reason: verdict.reason.clone(),
+        },
+    }
+}
+
+fn fallback_report(resolution: MarketConflictResolution) -> DebateReport {
+    let reason = match resolution {
+        MarketConflictResolution::KeepA { reason }
+        | MarketConflictResolution::KeepB { reason }
+        | MarketConflictResolution::Fuse { reason, .. }
+        | MarketConflictResolution::DeferToHuman { reason }
+        | MarketConflictResolution::KeepBoth { reason } => reason,
+    };
+    DebateReport {
+        turns: Vec::new(),
+        verdict: DebateVerdict {
+            resolution: "defer".into(),
+            reason,
+            merged: None,
+            confidence: 0.0,
+            hidden_assumptions: Vec::new(),
+        },
     }
 }
 
@@ -248,7 +492,89 @@ fn has_contradiction_marker(a: &str, b: &str) -> bool {
         "没有",
         "错误",
     ];
-    let a_neg = negation_words.iter().any(|n| a.to_lowercase().contains(n));
-    let b_neg = negation_words.iter().any(|n| b.to_lowercase().contains(n));
+    let a_lower = a.to_lowercase();
+    let b_lower = b.to_lowercase();
+    let a_neg = negation_words.iter().any(|n| a_lower.contains(n));
+    let b_neg = negation_words.iter().any(|n| b_lower.contains(n));
     a_neg != b_neg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_context_db_core::{ContentType, EpistemicType, LlmError};
+    use async_trait::async_trait;
+
+    struct DebateLlm;
+
+    #[async_trait]
+    impl LlmClient for DebateLlm {
+        async fn complete(&self, _prompt: &str, _opts: &LlmOpts) -> Result<String, LlmError> {
+            Ok("argument".into())
+        }
+
+        async fn batch_complete(
+            &self,
+            prompts: &[String],
+            _opts: &LlmOpts,
+        ) -> Result<Vec<String>, LlmError> {
+            Ok(prompts
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| format!("argument {idx}"))
+                .collect())
+        }
+
+        async fn complete_json(
+            &self,
+            _prompt: &str,
+            _schema: &JsonSchema,
+            _opts: &LlmOpts,
+        ) -> Result<String, LlmError> {
+            Ok(r#"{"resolution":"keep_a","reason":"A has stronger operational evidence","merged":null,"confidence":0.82,"hidden_assumptions":["evidence URIs are trustworthy"]}"#.into())
+        }
+    }
+
+    fn entry(principle: &str, quality: f32) -> MarketEntry {
+        MarketEntry {
+            id: MarketId::new(),
+            publisher: AgentId::new("agent"),
+            domain: "retrieval".into(),
+            entry_type: MarketEntryType::Fact,
+            principle: principle.into(),
+            evidence_uris: Vec::new(),
+            quality_score: quality,
+            confidence: quality,
+            corroboration: CorroborationProof::new(),
+            provenance: None,
+            license: KnowledgeLicense::Attribution,
+            epistemic_type: EpistemicType::Fact,
+            content_type: ContentType::Fact,
+            half_life_days: None,
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn debate_arbitration_uses_advocates_and_judge() {
+        let conflict = MarketConflict {
+            entry_a: entry("bounded graph traversal improves recall", 0.7),
+            entry_b: entry("bounded graph traversal does not improve recall", 0.7),
+            conflict_type: ConflictType::DirectContradiction,
+            similarity: 0.7,
+        };
+        let resolver = ConflictResolver::new()
+            .with_llm(Arc::new(DebateLlm))
+            .with_debate_config(DebateConfig {
+                rounds: 2,
+                ..Default::default()
+            });
+
+        let (resolution, report) = resolver.debate_arbitrate(&conflict).await;
+
+        assert!(matches!(resolution, MarketConflictResolution::KeepA { .. }));
+        assert_eq!(report.turns.len(), 4);
+        assert!(report.verdict.confidence > 0.8);
+    }
 }

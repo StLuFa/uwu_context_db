@@ -68,28 +68,49 @@ impl SemanticAxis {
         }
     }
 
-    /// Sleeptime 阶段：增量聚类，重新分配语义路径。
+    /// Sleeptime 阶段：使用向量索引近邻刷新类簇成员并重建语义路径。
     ///
-    /// 使用简化 k-means 风格聚类（无需 HDBSCAN 的完整依赖）：
-    /// 1. 扫描该类型下全部现有类簇的质心
-    /// 2. 新向量匹配最近的质心（距离 < threshold → 归入）
-    /// 3. 无法匹配 → 创建新类簇
-    /// 4. 更新 cluster_paths 映射
+    /// 每个已有类簇以当前质心查询同类型 top-k，按命中分数稳定排序、去重并更新成员。
+    /// 由于 `VectorIndex` 只返回命中 URI/score，不暴露原始向量，质心只做质量归一化；
+    /// 新类簇仍由上游 `add_cluster` 在有新标签或新质心时显式创建。
     pub async fn recluster(&self, content_type: ContentType) -> usize {
         let mut clusters = self.clusters.write();
         let type_clusters = clusters.entry(content_type).or_default();
 
-        // 获取该类型下所有条目的 URI（通过向量索引）
-        // 实际实现会调用 index 的 list 能力；这里用现有类簇数量做基线
         let existing_count = type_clusters.len();
 
-        // 更新每个类簇的质心（成员的 embedding 平均）
         for cluster in type_clusters.iter_mut() {
-            if cluster.members.len() > 1 {
-                // 质心衰减：每次 recluster 微调
-                for v in cluster.centroid.iter_mut() {
-                    *v *= 0.95; // 衰减旧质心
+            let hits = self
+                .index
+                .search(
+                    "context",
+                    cluster.centroid.clone(),
+                    64,
+                    Some(serde_json::json!({
+                        "content_type": content_type.as_path_segment()
+                    })),
+                )
+                .await
+                .unwrap_or_default();
+            if !hits.is_empty() {
+                let mut ranked = hits
+                    .into_iter()
+                    .filter(|hit| hit.score >= self.cluster_threshold)
+                    .map(|hit| (hit.uri.to_string(), hit.score.clamp(0.0, 1.0)))
+                    .collect::<Vec<_>>();
+                ranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                ranked.dedup_by(|a, b| a.0 == b.0);
+                if !ranked.is_empty() {
+                    let score_mass = ranked.iter().map(|(_, score)| *score).sum::<f32>();
+                    cluster.members = ranked.into_iter().map(|(uri, _)| uri).collect();
+                    normalize_centroid(&mut cluster.centroid, score_mass / cluster.members.len() as f32);
                 }
+            } else if cluster.members.len() > 1 {
+                normalize_centroid(&mut cluster.centroid, 0.5);
             }
         }
 
@@ -129,6 +150,21 @@ impl SemanticAxis {
             .get(&content_type)
             .map(|c| c.len())
             .unwrap_or(0)
+    }
+}
+
+fn normalize_centroid(centroid: &mut [f32], confidence: f32) {
+    let norm = centroid
+        .iter()
+        .map(|value| (*value as f64) * (*value as f64))
+        .sum::<f64>()
+        .sqrt();
+    if norm <= f64::EPSILON {
+        return;
+    }
+    let scale = confidence.clamp(0.25, 1.0) as f64 / norm;
+    for value in centroid {
+        *value = (*value as f64 * scale) as f32;
     }
 }
 

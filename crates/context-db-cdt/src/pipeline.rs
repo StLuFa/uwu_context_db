@@ -17,9 +17,10 @@ use crate::{
     CognitiveGradient, CognitiveMetric, CognitivePreferencePair, EpochResult, GateDecision,
     PolicyGate, TrainingConfig, TrainingReport, TrajectorySummary,
 };
-use agent_context_db_consolidation::ConsolidationEngine;
+use agent_context_db_consolidation::{ConsolidationEngine, ConsolidationProduct};
 use agent_context_db_core::{
-    ContentType, ContextUri, LifecycleEngine, LlmClient, Result, TenantId, VectorIndex,
+    AccessEvent, ConsolidationStatus, ContentType, ContextMeta, ContextUri, LifecycleAction,
+    LifecycleEngine, LlmClient, Result, TenantId, VectorIndex,
 };
 use std::sync::Arc;
 
@@ -264,9 +265,20 @@ impl CognitiveTrainingPipeline {
                 "consolidation complete"
             );
 
-            // ── 阶段 3: 认知梯度提取 ──
-            let gradients =
-                crate::extract_gradients_from_products(&products, effective_config.min_confidence);
+            // ── 阶段 3: 生命周期评估 + 认知梯度提取 ──
+            let lifecycle_rejected = products
+                .iter()
+                .filter(|product| self.lifecycle_action_for_product(product).blocks_training())
+                .count();
+            let trainable_products = products
+                .iter()
+                .filter(|product| !self.lifecycle_action_for_product(product).blocks_training())
+                .cloned()
+                .collect::<Vec<_>>();
+            let gradients = crate::extract_gradients_from_products(
+                &trainable_products,
+                effective_config.min_confidence,
+            );
             tracing::info!(
                 epoch = epoch,
                 gradients = gradients.len(),
@@ -289,7 +301,7 @@ impl CognitiveTrainingPipeline {
 
             // ── 阶段 5: 策略优化（偏好loss） ──
             let mut gradients_applied = 0usize;
-            let mut gradients_rejected = 0usize;
+            let mut gradients_rejected = lifecycle_rejected;
             let mut accepted_gradients = Vec::new();
 
             for gradient in gradients.iter().take(effective_config.gradient_batch_size) {
@@ -382,11 +394,39 @@ impl CognitiveTrainingPipeline {
         Ok(report)
     }
 
+    fn lifecycle_action_for_product(&self, product: &ConsolidationProduct) -> LifecycleAction {
+        let mut meta = ContextMeta::default();
+        meta.content_type = Some(product.content_type);
+        meta.epistemic_type = Some(product.epistemic_type);
+        meta.quality_score = Some(product.quality_score);
+        meta.validity = product.metadata.validity.clone();
+        meta.tags = match product.metadata.status {
+            ConsolidationStatus::Pending => vec!["pending".into()],
+            ConsolidationStatus::InProgress => vec!["in-progress".into()],
+            ConsolidationStatus::Converged => vec!["converged".into()],
+            ConsolidationStatus::Stale => vec!["stale".into()],
+        };
+        self.lifecycle.evaluate_entry(&[] as &[AccessEvent], &meta)
+    }
+
     /// 基于训练报告进行门控决策：是否替换当前策略。
     pub fn evaluate_gate(&self, report: &TrainingReport, total_trials: usize) -> GateDecision {
         let new_wins = report.epochs.iter().filter(|e| e.accuracy > 0.5).count();
         self.gate
             .should_replace(new_wins, total_trials, report.accuracy_delta)
+    }
+}
+
+trait LifecycleTrainingGate {
+    fn blocks_training(&self) -> bool;
+}
+
+impl LifecycleTrainingGate for LifecycleAction {
+    fn blocks_training(&self) -> bool {
+        matches!(
+            self,
+            LifecycleAction::Archive | LifecycleAction::Delete | LifecycleAction::Freeze
+        )
     }
 }
 

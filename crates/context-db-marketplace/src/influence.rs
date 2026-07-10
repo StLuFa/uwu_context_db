@@ -22,9 +22,9 @@ pub struct InfluenceScore {
 
 /// 影响力分析器。
 pub struct InfluenceAnalyzer {
-    /// 引用图：entry → 被哪些 entry 引用。
+    /// 引用图：entry -> 被哪些 entry 引用。
     citations: parking_lot::RwLock<HashMap<MarketId, Vec<MarketId>>>,
-    /// 采纳图：entry → 被哪些 Agent 采纳。
+    /// 采纳图：entry -> 被哪些 Agent 采纳。
     adoptions: parking_lot::RwLock<HashMap<MarketId, Vec<AgentId>>>,
 }
 
@@ -59,60 +59,88 @@ impl InfluenceAnalyzer {
         let citations = self.citations.read();
         let adoptions = self.adoptions.read();
 
-        // 构建图
-        let mut graph: HashMap<MarketId, Vec<MarketId>> = HashMap::new();
-        let mut all_entries: Vec<MarketId> = Vec::new();
+        let mut outgoing: HashMap<MarketId, Vec<MarketId>> = HashMap::new();
+        let mut incoming: HashMap<MarketId, Vec<MarketId>> = HashMap::new();
+        let mut all_entries = Vec::new();
 
         for (cited, citing_list) in citations.iter() {
-            graph.entry(*cited).or_default().extend(citing_list.clone());
-            if !all_entries.contains(cited) {
-                all_entries.push(*cited);
-            }
-            for c in citing_list {
-                if !all_entries.contains(c) {
-                    all_entries.push(*c);
-                }
+            push_unique_market_id(&mut all_entries, *cited);
+            for citing in citing_list {
+                push_unique_market_id(&mut all_entries, *citing);
+                outgoing.entry(*citing).or_default().push(*cited);
+                incoming.entry(*cited).or_default().push(*citing);
             }
         }
+        for entry in adoptions.keys() {
+            push_unique_market_id(&mut all_entries, *entry);
+        }
+        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         if all_entries.is_empty() {
-            return vec![];
+            return Vec::new();
         }
 
-        // 简化 PageRank：迭代 20 轮
         let n = all_entries.len();
+        let n_f = n as f32;
         let damping = 0.85;
         let mut ranks: HashMap<MarketId, f32> =
-            all_entries.iter().map(|e| (*e, 1.0 / n as f32)).collect();
+            all_entries.iter().map(|entry| (*entry, 1.0 / n_f)).collect();
 
-        for _ in 0..20 {
-            let mut new_ranks: HashMap<MarketId, f32> = HashMap::new();
+        for _ in 0..64 {
+            let dangling_mass = all_entries
+                .iter()
+                .filter(|entry| outgoing.get(entry).map_or(true, Vec::is_empty))
+                .map(|entry| ranks.get(entry).copied().unwrap_or(0.0))
+                .sum::<f32>()
+                / n_f;
+            let mut next: HashMap<MarketId, f32> = all_entries
+                .iter()
+                .map(|entry| (*entry, (1.0 - damping) / n_f + damping * dangling_mass))
+                .collect();
+
             for entry in &all_entries {
-                let mut rank = (1.0 - damping) / n as f32;
-                // 找到所有引用 entry 的节点
-                for (citing, cited_list) in graph.iter() {
-                    if cited_list.contains(entry) {
-                        let out_degree = graph.get(citing).map(|l| l.len()).unwrap_or(1);
-                        rank +=
-                            damping * ranks.get(citing).unwrap_or(&0.0) / out_degree.max(1) as f32;
+                let inbound = incoming.get(entry).map(Vec::as_slice).unwrap_or(&[]);
+                let mut rank = next.get(entry).copied().unwrap_or(0.0);
+                for citing in inbound {
+                    let out_degree = outgoing.get(citing).map(Vec::len).unwrap_or(0);
+                    if out_degree > 0 {
+                        rank += damping * ranks.get(citing).copied().unwrap_or(0.0)
+                            / out_degree as f32;
                     }
                 }
-                new_ranks.insert(*entry, rank);
+                next.insert(*entry, rank);
             }
-            ranks = new_ranks;
+
+            let delta = all_entries
+                .iter()
+                .map(|entry| {
+                    (next.get(entry).copied().unwrap_or(0.0)
+                        - ranks.get(entry).copied().unwrap_or(0.0))
+                    .abs()
+                })
+                .sum::<f32>();
+            ranks = next;
+            if delta < 1e-6 {
+                break;
+            }
         }
 
-        // 生成结果
+        let max_rank = ranks
+            .values()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(f32::EPSILON);
         let mut scores: Vec<InfluenceScore> = all_entries
             .iter()
-            .map(|e| {
-                let adoption_count = adoptions.get(e).map(|l| l.len()).unwrap_or(0);
-                let citation_count = citations.get(e).map(|l| l.len()).unwrap_or(0);
+            .map(|entry| {
+                let adoption_count = adoptions.get(entry).map(Vec::len).unwrap_or(0);
+                let citation_count = citations.get(entry).map(Vec::len).unwrap_or(0);
                 let betweenness =
                     (citation_count as f32 / (citation_count + 5) as f32).clamp(0.0, 1.0);
                 InfluenceScore {
-                    entry_id: *e,
-                    pagerank: ranks.get(e).copied().unwrap_or(0.0),
+                    entry_id: *entry,
+                    pagerank: (ranks.get(entry).copied().unwrap_or(0.0) / max_rank)
+                        .clamp(0.0, 1.0),
                     adoption_count,
                     citation_count,
                     betweenness,
@@ -124,6 +152,7 @@ impl InfluenceAnalyzer {
             b.pagerank
                 .partial_cmp(&a.pagerank)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.citation_count.cmp(&a.citation_count))
         });
         scores
     }
@@ -135,11 +164,17 @@ impl InfluenceAnalyzer {
         scores
     }
 
-    /// 查找桥梁知识（高介数 + 低质量 = 危险桥梁 → 跨Agent协同修复）。
+    /// 查找桥梁知识（高介数 + 低质量 = 危险桥梁 -> 跨Agent协同修复）。
     pub fn find_risky_bridges(&self, quality_threshold: f32) -> Vec<InfluenceScore> {
         self.analyze()
             .into_iter()
-            .filter(|s| s.betweenness > 0.5 && s.pagerank < quality_threshold)
+            .filter(|score| score.betweenness > 0.5 && score.pagerank < quality_threshold)
             .collect()
+    }
+}
+
+fn push_unique_market_id(ids: &mut Vec<MarketId>, id: MarketId) {
+    if !ids.contains(&id) {
+        ids.push(id);
     }
 }

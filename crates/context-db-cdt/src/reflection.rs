@@ -226,6 +226,117 @@ fn recall_token(reflection: &str, action: &str) -> String {
         .collect::<String>()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    Timeout,
+    MissingPrecondition,
+    Permission,
+    Validation,
+    ResourceExhaustion,
+    Dependency,
+    Unknown,
+}
+
+impl FailureClass {
+    fn classify(failed_step: &str, error_message: &str, trace: &[String]) -> Self {
+        let haystack = std::iter::once(failed_step)
+            .chain(std::iter::once(error_message))
+            .chain(trace.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        if contains_any(&haystack, &["timeout", "timed out", "deadline", "elapsed"]) {
+            Self::Timeout
+        } else if contains_any(&haystack, &["not found", "missing", "no such", "404", "absent"])
+        {
+            Self::MissingPrecondition
+        } else if contains_any(&haystack, &["permission", "forbidden", "unauthorized", "denied", "401", "403"])
+        {
+            Self::Permission
+        } else if contains_any(&haystack, &["invalid", "schema", "parse", "validation", "deserialize"])
+        {
+            Self::Validation
+        } else if contains_any(&haystack, &["quota", "rate limit", "oom", "memory", "disk full", "capacity"])
+        {
+            Self::ResourceExhaustion
+        } else if contains_any(&haystack, &["connection", "unavailable", "dns", "refused", "upstream", "dependency"])
+        {
+            Self::Dependency
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::MissingPrecondition => "missing-precondition",
+            Self::Permission => "permission",
+            Self::Validation => "validation",
+            Self::ResourceExhaustion => "resource-exhaustion",
+            Self::Dependency => "dependency",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn action(self, failed_step: &str, knowledge_signal: usize) -> String {
+        let evidence_clause = if knowledge_signal > 0 {
+            "reuse the retrieved knowledge before retrying"
+        } else {
+            "capture the missing evidence before retrying"
+        };
+        match self {
+            Self::Timeout => format!(
+                "Wrap '{failed_step}' with bounded retries, exponential backoff, and an idempotency check; {evidence_clause}."
+            ),
+            Self::MissingPrecondition => format!(
+                "Before '{failed_step}', verify required resources and create or fetch missing prerequisites; {evidence_clause}."
+            ),
+            Self::Permission => format!(
+                "Before '{failed_step}', validate credentials, tenant scope, and capability grants; fail closed when access is ambiguous."
+            ),
+            Self::Validation => format!(
+                "Add schema validation around '{failed_step}', preserve the rejected payload, and repair only fields with explicit evidence."
+            ),
+            Self::ResourceExhaustion => format!(
+                "Throttle '{failed_step}', reduce batch size, and record resource pressure before rescheduling the task."
+            ),
+            Self::Dependency => format!(
+                "Probe upstream dependency health before '{failed_step}', use a bounded fallback path, and record dependency evidence."
+            ),
+            Self::Unknown => format!(
+                "Instrument '{failed_step}' with structured error context and postpone writeback until a repeatable failure class is observed."
+            ),
+        }
+    }
+
+    fn tags(self) -> Vec<String> {
+        let mut tags = vec!["procedure".to_string(), format!("failure:{}", self.label())];
+        if matches!(self, Self::Unknown) {
+            tags.push("hypothesis".to_string());
+        } else {
+            tags.push("heuristic".to_string());
+        }
+        tags
+    }
+
+    fn priority(self, step_count: usize, knowledge_signal: usize) -> f32 {
+        let base: f32 = match self {
+            Self::Permission | Self::Validation => 0.72,
+            Self::Dependency | Self::ResourceExhaustion => 0.66,
+            Self::Timeout | Self::MissingPrecondition => 0.60,
+            Self::Unknown => 0.32,
+        };
+        let trace_weight = (step_count as f32 / 20.0).min(0.12);
+        let knowledge_weight = (knowledge_signal as f32 * 0.03).min(0.09);
+        (base + trace_weight + knowledge_weight).clamp(0.0, 0.88)
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 impl ReflectionGenerator {
     pub fn new(llm: Arc<dyn LlmClient>) -> Self {
         Self { llm }
@@ -236,7 +347,7 @@ impl ReflectionGenerator {
     /// Prompt 策略：
     /// 1. 描述任务和失败上下文
     /// 2. 要求结构化输出（why / action / tags / priority）
-    /// 3. LLM 不可用时回退到启发式规则
+    /// 3. LLM 不可用时使用本地失败分类器生成低污染度反思
     pub async fn reflect(
         &self,
         task_description: &str,
@@ -289,40 +400,41 @@ Output a JSON object with:
             }
         }
 
-        // 启发式回退
-        Self::heuristic_reflect(task_description, failed_step, error_message, trace)
+        Self::local_reflection(task_description, failed_step, error_message, relevant_knowledge, trace)
     }
 
-    /// 启发式反思（无需 LLM）。
-    fn heuristic_reflect(
+    fn local_reflection(
         task_description: &str,
-        _failed_step: &str,
+        failed_step: &str,
         error_message: &str,
+        relevant_knowledge: &[String],
         trace: &[String],
     ) -> SemanticGradient {
+        let class = FailureClass::classify(failed_step, error_message, trace);
         let step_count = trace.len();
+        let last_step = trace.last().map(String::as_str).unwrap_or(failed_step);
+        let knowledge_signal = relevant_knowledge
+            .iter()
+            .filter(|item| !item.trim().is_empty())
+            .count();
+        let priority = class.priority(step_count, knowledge_signal);
         let reflection = format!(
-            "Task '{}' failed after {} steps. Error: {}",
-            task_description, step_count, error_message
+            "Task '{}' failed at '{}' after {} steps; classified as {} from error '{}' and last trace '{}'.",
+            task_description,
+            failed_step,
+            step_count,
+            class.label(),
+            error_message,
+            last_step
         );
-
-        let improvement = if error_message.contains("timeout") {
-            "Add retry logic with exponential backoff".to_string()
-        } else if error_message.contains("not found") {
-            "Add pre-condition check before executing".to_string()
-        } else if error_message.contains("permission") {
-            "Verify access permissions before operation".to_string()
-        } else {
-            format!("Review step {} and add error handling", step_count)
-        };
 
         SemanticGradient {
             error_type: ContentType::Error,
             reflection_text: reflection,
-            action_improvement: improvement,
-            epistemic_tags: vec!["heuristic".to_string(), "procedure".to_string()],
+            action_improvement: class.action(failed_step, knowledge_signal),
+            epistemic_tags: class.tags(),
             source_uri: None,
-            priority: 0.7,
+            priority,
         }
     }
 
@@ -436,19 +548,21 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_produces_valid_gradient() {
-        let g = ReflectionGenerator::heuristic_reflect(
+    fn local_reflection_produces_valid_gradient() {
+        let g = ReflectionGenerator::local_reflection(
             "deploy app",
             "kubectl apply",
             "connection timeout",
+            &["retry policy".to_string()],
             &[
                 "build docker image".to_string(),
                 "kubectl apply".to_string(),
             ],
         );
-        assert!(!g.reflection_text.is_empty());
-        assert!(!g.action_improvement.is_empty());
-        assert!(g.epistemic_tags.contains(&"heuristic".to_string()));
+        assert!(g.reflection_text.contains("timeout"));
+        assert!(g.action_improvement.contains("bounded retries"));
+        assert!(g.epistemic_tags.contains(&"failure:timeout".to_string()));
+        assert!(g.priority > 0.6);
     }
 
     #[test]

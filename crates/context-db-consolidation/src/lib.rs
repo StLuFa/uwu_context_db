@@ -25,8 +25,15 @@ pub mod quality;
 pub mod relational_axis;
 pub mod rif;
 pub mod security;
+pub mod self_consistency;
 pub mod semantic_axis;
 pub mod tiered_cache;
+
+pub use loader::{BanditBudgetPolicy, LoadFeedback, LoadLevel, ProgressiveLoader};
+pub use self_consistency::{
+    ConsistencyVoteCluster, SelfConsistencyConfig, SelfConsistencyConsolidator,
+    SelfConsistencyReport,
+};
 
 use crate::halflife::SpacedRepetitionScheduler;
 use crate::health::{
@@ -416,6 +423,14 @@ impl ConfidenceCalibrator {
             .map(|(et, rec)| (*et, rec.temperature, rec.declared_confidences.len()))
             .collect()
     }
+
+    pub fn total_labeled_samples(&self) -> usize {
+        self.calibration_data
+            .read()
+            .values()
+            .map(|rec| rec.actual_adoption_rates.len())
+            .sum()
+    }
 }
 
 // ===========================================================================
@@ -586,7 +601,7 @@ Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup).
     async fn critique(
         &self,
         product: &ConsolidationProduct,
-        _entry: &ContextEntry,
+        entry: &ContextEntry,
     ) -> CritiqueResult {
         let prompt = format!(
             r#"Evaluate the quality of this consolidated insight:
@@ -617,8 +632,16 @@ Return a JSON object with:
                 let parsed: Option<serde_json::Value> = serde_json::from_str(&response).ok();
                 match parsed {
                     Some(ref v) => CritiqueResult {
-                        quality_score: v["quality_score"].as_f64().unwrap_or(0.7) as f32,
-                        confidence: v["confidence"].as_f64().unwrap_or(0.7) as f32,
+                        quality_score: v["quality_score"]
+                            .as_f64()
+                            .map(|score| score as f32)
+                            .unwrap_or_else(|| deterministic_critique(product, entry).quality_score)
+                            .clamp(0.0, 1.0),
+                        confidence: v["confidence"]
+                            .as_f64()
+                            .map(|confidence| confidence as f32)
+                            .unwrap_or_else(|| deterministic_critique(product, entry).confidence)
+                            .clamp(0.0, 1.0),
                         suggestions: v["suggestions"]
                             .as_array()
                             .map(|a| {
@@ -628,34 +651,10 @@ Return a JSON object with:
                             })
                             .unwrap_or_default(),
                     },
-                    None => {
-                        // Parse failed — fall back to heuristic
-                        let score = if product.content.len() >= 10 {
-                            0.8
-                        } else {
-                            0.3
-                        };
-                        CritiqueResult {
-                            quality_score: score,
-                            confidence: score,
-                            suggestions: vec![],
-                        }
-                    }
+                    None => deterministic_critique(product, entry),
                 }
             }
-            Err(_) => {
-                // LLM unavailable — fall back to heuristic
-                let score = if !product.content.is_empty() && product.content.len() >= 10 {
-                    0.8
-                } else {
-                    0.3
-                };
-                CritiqueResult {
-                    quality_score: score,
-                    confidence: score,
-                    suggestions: vec![],
-                }
-            }
+            Err(_) => deterministic_critique(product, entry),
         }
     }
 
@@ -718,6 +717,211 @@ pub struct CritiqueResult {
     pub quality_score: f32,
     pub confidence: f32,
     pub suggestions: Vec<String>,
+}
+
+fn deterministic_critique(product: &ConsolidationProduct, entry: &ContextEntry) -> CritiqueResult {
+    let content = product.content.trim();
+    let word_count = content.split_whitespace().count();
+    let char_count = content.chars().count();
+    let has_sentence_shape = content.ends_with('.')
+        || content.ends_with('!')
+        || content.ends_with('?')
+        || content.ends_with('。')
+        || content.ends_with('！')
+        || content.ends_with('？');
+    let repeated_ratio = repeated_token_ratio(content);
+
+    let structure = if char_count == 0 {
+        0.0
+    } else {
+        let length_score = match char_count {
+            1..=12 => 0.20,
+            13..=40 => 0.55,
+            41..=260 => 0.90,
+            261..=600 => 0.72,
+            _ => 0.45,
+        };
+        let sentence_bonus = if has_sentence_shape { 0.05 } else { 0.0 };
+        (length_score + sentence_bonus - repeated_ratio * 0.35_f32).clamp(0.0, 1.0)
+    };
+
+    let evidence = evidence_score(product, entry);
+    let validity = validity_score(product.metadata.validity.as_ref().or(entry.metadata.validity.as_ref()));
+    let type_fit = type_fit_score(product, entry, word_count);
+    let provenance = if product.provenance.is_some() { 0.95 } else { 0.55 };
+    let contradiction_penalty = if product.contradiction_uris.is_empty() {
+        0.0
+    } else {
+        (product.contradiction_uris.len() as f32 * 0.12).min(0.35)
+    };
+
+    let quality = (structure * 0.26
+        + evidence * 0.22
+        + validity * 0.20
+        + type_fit * 0.18
+        + provenance * 0.08
+        + entry.metadata.quality_score.unwrap_or(0.5).clamp(0.0, 1.0) * 0.06
+        - contradiction_penalty)
+        .clamp(0.0, 1.0);
+
+    let signal_count = [
+        char_count >= 24,
+        !product.evidence_uris.is_empty()
+            || entry
+                .metadata
+                .consolidation
+                .as_ref()
+                .is_some_and(|meta| !meta.evidence_uris.is_empty()),
+        product.metadata.validity.is_some() || entry.metadata.validity.is_some(),
+        product.provenance.is_some(),
+        product.metadata.half_life_days.is_some()
+            || entry
+                .metadata
+                .consolidation
+                .as_ref()
+                .and_then(|meta| meta.half_life_days)
+                .is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count() as f32;
+    let confidence = (0.28 + signal_count * 0.10 + evidence * 0.18 + validity * 0.12)
+        .min(0.82)
+        .clamp(0.0, 1.0);
+
+    let mut suggestions = Vec::new();
+    if char_count < 24 {
+        suggestions.push("expand the insight into a self-contained statement".into());
+    }
+    if repeated_ratio > 0.25 {
+        suggestions.push("remove repeated wording before consolidation".into());
+    }
+    if product.content_type == ContentType::Fact && evidence < 0.45 {
+        suggestions.push("attach evidence before treating this as a factual memory".into());
+    }
+    if validity < 0.45 {
+        suggestions.push("revalidate or mark the claim as uncertain".into());
+    }
+    if !product.contradiction_uris.is_empty() {
+        suggestions.push("resolve linked contradictions before promotion".into());
+    }
+
+    CritiqueResult {
+        quality_score: quality,
+        confidence,
+        suggestions,
+    }
+}
+
+fn evidence_score(product: &ConsolidationProduct, entry: &ContextEntry) -> f32 {
+    let product_evidence = product.evidence_uris.len();
+    let entry_meta = entry.metadata.consolidation.as_ref();
+    let entry_evidence = entry_meta.map_or(0, |meta| meta.evidence_uris.len());
+    let corroboration = entry_meta.map_or(0, |meta| meta.corroboration);
+    let count = product_evidence + entry_evidence;
+    (0.25 + (count as f32 * 0.18) + (corroboration as f32 * 0.08)).clamp(0.0, 1.0)
+}
+
+fn validity_score(validity: Option<&ValidityRecord>) -> f32 {
+    let Some(validity) = validity else {
+        return 0.55;
+    };
+    if validity.valid_until.is_some_and(|valid_until| valid_until < Utc::now()) {
+        return 0.20;
+    }
+    let mut score: f32 = 0.72;
+    if validity.valid_from > Utc::now() {
+        score -= 0.18;
+    }
+    if validity.invalidated_by.is_some() {
+        score -= 0.25;
+    }
+    if validity.invalidation_reason.is_some() {
+        score -= 0.12;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn type_fit_score(product: &ConsolidationProduct, entry: &ContextEntry, word_count: usize) -> f32 {
+    let content = product.content.to_ascii_lowercase();
+    let base = match product.content_type {
+        ContentType::Fact => {
+            if product.evidence_uris.is_empty()
+                && entry
+                    .metadata
+                    .consolidation
+                    .as_ref()
+                    .is_none_or(|meta| meta.evidence_uris.is_empty())
+            {
+                0.45
+            } else {
+                0.82
+            }
+        }
+        ContentType::Hypothesis => {
+            if product.hypothesis_outcome == Some(HypothesisOutcome::Falsified) {
+                0.35
+            } else if content.contains("if") || content.contains("may") || content.contains("可能") {
+                0.80
+            } else {
+                0.62
+            }
+        }
+        ContentType::Procedure => {
+            if content.contains("step") || content.contains("then") || content.contains("when") || content.contains("先") {
+                0.82
+            } else {
+                0.58
+            }
+        }
+        ContentType::Error => {
+            if product.error_pattern.is_some() || content.contains("error") || content.contains("failure") {
+                0.82
+            } else {
+                0.52
+            }
+        }
+        ContentType::Heuristic => {
+            if content.contains("when") || content.contains("prefer") || content.contains("should") || content.contains("如果") {
+                0.80
+            } else {
+                0.62
+            }
+        }
+        _ => 0.68,
+    };
+    let density = if word_count == 0 {
+        0.0
+    } else if word_count <= 6 {
+        0.58
+    } else if word_count <= 80 {
+        0.88
+    } else {
+        0.65
+    };
+    (base * 0.7_f32 + density * 0.3_f32).clamp(0.0, 1.0)
+}
+
+fn repeated_token_ratio(content: &str) -> f32 {
+    let tokens = content
+        .split_whitespace()
+        .map(|token| {
+            token
+                .chars()
+                .filter(|ch| ch.is_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return 0.0;
+    }
+    let unique = tokens
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    1.0 - (unique as f32 / tokens.len() as f32)
 }
 
 // ===========================================================================
@@ -1218,20 +1422,9 @@ impl SleeptimeExecutor {
                     report.tasks_executed += 1;
                 }
                 SleeptimeTask::CalibrationUpdate => {
-                    // 用当前条目样本喂校准器 —— 声明置信度 = quality_score，
-                    // 采纳与否用 quality_score ≥ 0.7 作为启发式判据
-                    let mut samples = 0usize;
-                    for entry in &entries {
-                        let epistemic = entry
-                            .metadata
-                            .epistemic_type()
-                            .unwrap_or(EpistemicType::Fact);
-                        let declared = entry.metadata.quality_score.unwrap_or(0.5);
-                        let adopted = declared >= 0.7;
-                        engine.calibrator.update(epistemic, declared, adopted);
-                        samples += 1;
-                    }
-                    report.calibration_samples = samples;
+                    // 校准器只接受真实采纳/抑制反馈；批量巡检不能用 quality_score 反推标签。
+                    // 真实反馈由 `on_adopted` 写入，避免把模型自评分训练成“采纳事实”。
+                    report.calibration_samples = engine.calibrator.total_labeled_samples();
                     report.tasks_executed += 1;
                 }
                 SleeptimeTask::ContextRotPrune => {
@@ -1542,8 +1735,8 @@ pub enum Constraint {
 
 /// 一致性约束检查器 — Sleeptime 阶段运行。
 pub struct ConsistencyChecker {
-    /// 语义矛盾阈值（余弦距离 < 此值 → 可能矛盾，需 LLM 确认）。
-    contradiction_threshold: f32,
+    /// 词面距离阈值（1 - Jaccard < 此值 → 同主题且可能矛盾）。
+    contradiction_distance_threshold: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -1556,8 +1749,8 @@ pub struct ConstraintViolation {
 impl ConsistencyChecker {
     pub fn new() -> Self {
         Self {
-            contradiction_threshold: 0.15,
-        } // 余弦距离 < 0.15 = 高度矛盾
+            contradiction_distance_threshold: 0.50,
+        }
     }
 
     /// 检查所有一致性约束。
@@ -1618,13 +1811,16 @@ impl ConsistencyChecker {
                 let has_contradiction_marker =
                     Self::detect_contradiction_marker(&a.content, &b.content);
 
-                if jaccard > 0.5 && has_contradiction_marker {
+                let lexical_distance = 1.0 - jaccard;
+                if lexical_distance < self.contradiction_distance_threshold
+                    && has_contradiction_marker
+                {
                     violations.push(ConstraintViolation {
                         uri: a.uri.clone(),
                         constraint: Constraint::NoContradiction,
                         description: format!(
-                            "possible contradiction between {} and {} (jaccard={:.2})",
-                            a.uri, b.uri, jaccard
+                            "possible contradiction between {} and {} (jaccard={:.2}, distance={:.2})",
+                            a.uri, b.uri, jaccard, lexical_distance
                         ),
                     });
                 }

@@ -54,8 +54,14 @@ impl ConsensusTracker {
     ) -> ConvergenceReport {
         let mut independent_sources = Vec::new();
         let mut corroboration = 1; // 自身
+        let vector_candidates = self.vector_candidates(new_entry, existing).await;
+        let candidate_entries = if vector_candidates.is_empty() {
+            existing.iter().collect::<Vec<_>>()
+        } else {
+            vector_candidates
+        };
 
-        for existing_entry in existing {
+        for existing_entry in candidate_entries {
             if existing_entry.publisher == new_entry.publisher {
                 continue;
             }
@@ -63,10 +69,8 @@ impl ConsensusTracker {
                 continue;
             }
 
-            // Jaccard 相似度作为快速筛选
             let sim = jaccard_similarity(&new_entry.principle, &existing_entry.principle);
             if sim >= (self.convergence_threshold - 0.2) {
-                // 高重叠 → 可能是独立收敛
                 independent_sources.push((
                     existing_entry.publisher.clone(),
                     existing_entry.id,
@@ -94,6 +98,36 @@ impl ConsensusTracker {
         }
     }
 
+    async fn vector_candidates<'a>(
+        &self,
+        new_entry: &MarketEntry,
+        existing: &'a [MarketEntry],
+    ) -> Vec<&'a MarketEntry> {
+        let hits = self
+            .vector_index
+            .search(
+                "market",
+                text_signature_vector(&new_entry.principle),
+                64,
+                Some(serde_json::json!({ "domain": new_entry.domain })),
+            )
+            .await
+            .unwrap_or_default();
+        if hits.is_empty() {
+            return Vec::new();
+        }
+        let ids = hits
+            .iter()
+            .filter_map(|hit| hit.payload.get("market_id")?.as_str())
+            .filter_map(|raw| uuid::Uuid::parse_str(raw).ok())
+            .map(MarketId)
+            .collect::<std::collections::HashSet<_>>();
+        existing
+            .iter()
+            .filter(|entry| ids.contains(&entry.id))
+            .collect()
+    }
+
     /// Schelling 点：返回所有 ≥N 个独立源的"已确立"条目。
     pub fn find_established<'a>(
         &self,
@@ -113,6 +147,26 @@ impl ConsensusTracker {
         });
         established
     }
+}
+
+fn text_signature_vector(text: &str) -> Vec<f32> {
+    let mut vector = vec![0.0_f32; 128];
+    for token in text.split_whitespace() {
+        let mut acc = 0xcbf29ce484222325_u64;
+        for byte in token.as_bytes() {
+            acc ^= *byte as u64;
+            acc = acc.wrapping_mul(0x100000001b3);
+        }
+        let idx = (acc as usize) % vector.len();
+        vector[idx] += 1.0;
+    }
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > f32::EPSILON {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
 }
 
 fn jaccard_similarity(a: &str, b: &str) -> f32 {

@@ -27,7 +27,6 @@ pub mod model;
 pub mod observability;
 pub mod pack;
 pub mod prompt;
-pub mod rate_limiter;
 pub mod read_cache;
 #[cfg(feature = "redis-backend")]
 pub mod redis_backend;
@@ -70,8 +69,9 @@ pub use lsh::LshIndex;
 pub use model::{
     BlobRef, ConsolidationMeta, ConsolidationStatus, ContentHash, ContentLevel, ContentPart,
     ContentPayload, ContentType, ContextDiff, ContextEntry, ContextMeta, DecodedContent,
-    DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit, LineageEntry,
-    MediaType, MvccVersion, StateScope, TenantId, TreeNode, ValidityRecord, VersionEntry,
+    DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit, HalfLife,
+    LineageEntry, MediaType, MvccVersion, SchemaRef, StateScope, TenantId, TreeNode,
+    ValidityRecord, VersionEntry,
 };
 pub use observability::{
     MetricsExporter, MetricsExporterConfig, ProvenanceEdge, ProvenanceGraph, ProvenanceNode,
@@ -86,7 +86,6 @@ pub use prompt::{
     LlmTaskKind, OptimizedPrompt, PromptCacheMode, PromptCompressionMode, PromptOptimization,
     optimize_prompt,
 };
-pub use rate_limiter::{MemoryRateLimiter, RateLimiter};
 pub use read_cache::{MemoryReadCache, ReadCache};
 pub use similarity::{
     Cluster, CrossAgentDedup, DedupRecommendation, KnowledgeNetwork, LocalKnowledgeNetwork,
@@ -94,7 +93,7 @@ pub use similarity::{
 };
 pub use store::{
     BlobStore, BrowsingOps, ContentRepo, ContentStore, ContextStore, FsOps, GraphRelation,
-    GraphStore, StorageEngine, TenantOps, VersionOps,
+    GraphStore, MAX_PAGE_SIZE, Page, PageRequest, StorageEngine, TenantOps, VersionOps,
 };
 pub use tokenizer::{count_tokens, count_tokens_with_floor};
 pub use uri::{AsOfTime, ContextUri, QueryParams, SCHEME, UriCategory};

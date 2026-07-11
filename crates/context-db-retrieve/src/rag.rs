@@ -67,18 +67,10 @@ impl Default for AnswerSynthesisConfig {
     }
 }
 
+#[derive(Default)]
 pub struct CalibratedAnswerSynthesizer {
     llm: Option<Arc<dyn LlmClient>>,
     config: AnswerSynthesisConfig,
-}
-
-impl Default for CalibratedAnswerSynthesizer {
-    fn default() -> Self {
-        Self {
-            llm: None,
-            config: AnswerSynthesisConfig::default(),
-        }
-    }
 }
 
 impl CalibratedAnswerSynthesizer {

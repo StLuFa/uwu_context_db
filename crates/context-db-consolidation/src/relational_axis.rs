@@ -22,6 +22,12 @@ pub struct RelationalAxis {
     graph: Option<Arc<dyn GraphStore>>,
 }
 
+impl Default for RelationalAxis {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RelationalAxis {
     pub fn new() -> Self {
         Self { graph: None }
@@ -53,10 +59,10 @@ impl RelationalAxis {
             RelKind::Supersedes => GraphRelation::Supersedes,
         });
         for uri in uris {
-            if let Ok(neighbors) = graph.neighbors(uri, gk).await {
-                if !neighbors.is_empty() {
-                    result.insert(uri.to_string(), neighbors);
-                }
+            if let Ok(neighbors) = graph.neighbors(uri, gk).await
+                && !neighbors.is_empty()
+            {
+                result.insert(uri.to_string(), neighbors);
             }
         }
         result
@@ -66,7 +72,11 @@ impl RelationalAxis {
     pub async fn evidence_tree(&self, uri: &ContextUri, max_hops: usize) -> Vec<ContextUri> {
         let _kinds = [RelKind::EvidenceOf, RelKind::DerivedFrom];
         let rels = self
-            .expand_relations(&[uri.clone()], Some(RelKind::EvidenceOf), max_hops)
+            .expand_relations(
+                std::slice::from_ref(uri),
+                Some(RelKind::EvidenceOf),
+                max_hops,
+            )
             .await;
         rels.get(&uri.to_string()).cloned().unwrap_or_default()
     }

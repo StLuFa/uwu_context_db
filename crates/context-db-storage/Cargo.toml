@@ -33,11 +33,12 @@ blake3 = "1"
 zstd = "0.13"
 tracing = "0.1"
 tokio = { version = "1", features = ["sync", "time"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "macros", "chrono", "uuid", "json"] }
 
 [features]
 default = []
 
 [dev-dependencies]
+agent-context-db-testkit = { path = "../context-db-testkit" }
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }

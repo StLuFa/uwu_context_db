@@ -1,4 +1,5 @@
 //! CDC / watch API for content writes.
+use crate::{Page, PageRequest};
 
 use crate::{
     BrowsingOps, ContentPayload, ContentRepo, ContentStore, ContextEntry, ContextError, ContextUri,
@@ -36,21 +37,11 @@ pub struct ChangeEvent {
     pub occurred_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchOptions {
     pub prefix: Option<String>,
     pub from_checkpoint: Option<WatchCheckpoint>,
     pub include_current: bool,
-}
-
-impl Default for WatchOptions {
-    fn default() -> Self {
-        Self {
-            prefix: None,
-            from_checkpoint: None,
-            include_current: false,
-        }
-    }
 }
 
 pub struct WatchStream {
@@ -62,10 +53,10 @@ pub struct WatchStream {
 impl WatchStream {
     pub async fn recv(&mut self) -> Result<ChangeEvent> {
         loop {
-            if let Some(event) = self.backlog.pop_front() {
-                if self.matches(&event) {
-                    return Ok(event);
-                }
+            if let Some(event) = self.backlog.pop_front()
+                && self.matches(&event)
+            {
+                return Ok(event);
             }
 
             match self.rx.recv().await {
@@ -213,20 +204,25 @@ impl<R> FsOps for WatchableStore<R>
 where
     R: FsOps + Send + Sync,
 {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
-        self.inner.ls(dir).await
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
+        self.inner.ls(dir, page).await
     }
 
-    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>> {
-        self.inner.find(pattern).await
+    async fn find(&self, pattern: &FindPattern, page: PageRequest) -> Result<Page<ContextUri>> {
+        self.inner.find(pattern, page).await
     }
 
     async fn grep(&self, regex: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
         self.inner.grep(regex, scope).await
     }
 
-    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
-        self.inner.tree(root, depth).await
+    async fn tree(
+        &self,
+        root: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
+        self.inner.tree(root, depth, page).await
     }
 
     async fn read(&self, uri: &ContextUri, level: crate::ContentLevel) -> Result<ContentPayload> {
@@ -239,16 +235,26 @@ impl<R> BrowsingOps for WatchableStore<R>
 where
     R: BrowsingOps + Send + Sync,
 {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
-        self.inner.ls(dir).await
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
+        self.inner.ls(dir, page).await
     }
 
-    async fn tree(&self, dir: &ContextUri, depth: usize) -> Result<TreeNode> {
-        self.inner.tree(dir, depth).await
+    async fn tree(
+        &self,
+        dir: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
+        self.inner.tree(dir, depth, page).await
     }
 
-    async fn find(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<ContextUri>> {
-        self.inner.find(scope, pattern).await
+    async fn find(
+        &self,
+        scope: &ContextUri,
+        pattern: &str,
+        page: PageRequest,
+    ) -> Result<Page<ContextUri>> {
+        self.inner.find(scope, pattern, page).await
     }
 
     async fn grep(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<GrepHit>> {
@@ -329,8 +335,17 @@ where
         Ok(versions)
     }
 
-    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
-        self.inner.scan_by_prefix(prefix, limit).await
+    async fn scan_by_prefix(&self, prefix: &str, page: PageRequest) -> Result<Page<ContextEntry>> {
+        self.inner.scan_by_prefix(prefix, page).await
+    }
+
+    async fn scan_by_type(
+        &self,
+        prefix: &str,
+        content_type: crate::ContentType,
+        page: PageRequest,
+    ) -> Result<Page<ContextEntry>> {
+        self.inner.scan_by_type(prefix, content_type, page).await
     }
 }
 

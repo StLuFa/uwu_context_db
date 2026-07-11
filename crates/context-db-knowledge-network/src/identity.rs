@@ -33,9 +33,18 @@ impl IdentityRegistry {
         self.signing_keys.write().insert(agent, signing_key);
     }
 
-    pub fn upsert_public_key_hex(&self, agent: AgentId, public_key_hex: &str) -> Result<()> {
+    /// Explicitly registers a trust anchor. Verification never learns keys from messages.
+    pub fn register_public_key(&self, agent: AgentId, public_key_hex: &str) -> Result<()> {
         let verifying_key = verifying_key_from_hex(public_key_hex)?;
-        self.verifying_keys.write().insert(agent, verifying_key);
+        let mut keys = self.verifying_keys.write();
+        if let Some(existing) = keys.get(&agent)
+            && existing.to_bytes() != verifying_key.to_bytes()
+        {
+            return Err(KnowledgeNetworkError::PolicyDenied(format!(
+                "refusing to replace trust anchor for mesh identity: {agent}"
+            )));
+        }
+        keys.insert(agent, verifying_key);
         Ok(())
     }
 
@@ -103,28 +112,6 @@ impl IdentityRegistry {
         verify_ed25519(&verifying_key, &bytes, &provenance.signature)
     }
 
-    pub fn verify_knowledge_provenance_offline(
-        payload: &KnowledgeProvenancePayload,
-        provenance: &KnowledgeProvenance,
-    ) -> Result<()> {
-        if provenance.publisher != payload.publisher {
-            return Err(KnowledgeNetworkError::PolicyDenied(
-                "knowledge provenance publisher mismatch".into(),
-            ));
-        }
-        if provenance.evidence_chain_hash != payload.evidence_chain_hash {
-            return Err(KnowledgeNetworkError::PolicyDenied(
-                "knowledge provenance evidence chain mismatch".into(),
-            ));
-        }
-        let verifying_key = verifying_key_from_hex(&provenance.public_key)?;
-        verify_ed25519(
-            &verifying_key,
-            &knowledge_signing_bytes(payload)?,
-            &provenance.signature,
-        )
-    }
-
     fn signing_key(&self, signer: &AgentId) -> Result<SigningKey> {
         let keys = self.signing_keys.read();
         keys.get(signer).cloned().ok_or_else(|| {
@@ -136,14 +123,22 @@ impl IdentityRegistry {
 
     fn verifying_key(&self, signer: &AgentId, provided_public_key: &str) -> Result<VerifyingKey> {
         let provided = verifying_key_from_hex(provided_public_key)?;
-        if let Some(registered) = self.verifying_keys.read().get(signer) {
-            if registered.to_bytes() != provided.to_bytes() {
-                return Err(KnowledgeNetworkError::PolicyDenied(format!(
-                    "public key mismatch for mesh identity: {signer}"
-                )));
-            }
+        let registered = self
+            .verifying_keys
+            .read()
+            .get(signer)
+            .copied()
+            .ok_or_else(|| {
+                KnowledgeNetworkError::PolicyDenied(format!(
+                    "unknown mesh identity; explicit registration required: {signer}"
+                ))
+            })?;
+        if registered.to_bytes() != provided.to_bytes() {
+            return Err(KnowledgeNetworkError::PolicyDenied(format!(
+                "public key mismatch for mesh identity: {signer}"
+            )));
         }
-        Ok(provided)
+        Ok(registered)
     }
 }
 
@@ -221,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_provenance_verifies_offline_and_rejects_content_tamper() {
+    fn knowledge_provenance_requires_registration_and_rejects_content_tamper() {
         let registry = IdentityRegistry::default();
         let agent = AgentId::new("agent-a");
         registry.upsert_signing_key(agent.clone(), [9u8; 32]);
@@ -239,12 +234,23 @@ mod tests {
         };
 
         let provenance = registry.sign_knowledge_provenance(&payload).unwrap();
-        IdentityRegistry::verify_knowledge_provenance_offline(&payload, &provenance).unwrap();
+        registry
+            .verify_knowledge_provenance(&payload, &provenance)
+            .unwrap();
+
+        let untrusted = IdentityRegistry::default();
+        assert!(
+            untrusted
+                .verify_knowledge_provenance(&payload, &provenance)
+                .is_err()
+        );
 
         let mut tampered = payload.clone();
         tampered.content = "rewritten principle".into();
         assert!(
-            IdentityRegistry::verify_knowledge_provenance_offline(&tampered, &provenance).is_err()
+            registry
+                .verify_knowledge_provenance(&tampered, &provenance)
+                .is_err()
         );
     }
 }

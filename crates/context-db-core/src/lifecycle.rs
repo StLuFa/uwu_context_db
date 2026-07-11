@@ -76,7 +76,7 @@ impl ForgettingModel for EbbinghausModel {
         self.access_history.push(access);
         self.reinforcements = self.reinforcements.saturating_add(1);
         self.last_access = Utc::now();
-        if self.reinforcements % 10 == 0 {
+        if self.reinforcements.is_multiple_of(10) {
             self.fit();
         }
     }
@@ -293,49 +293,87 @@ impl ForgettingModel for BayesianModel {
 // 重要性评分
 // ===========================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImportanceSignal {
+    Known(f32),
+    Unknown,
+}
+
+impl ImportanceSignal {
+    fn weighted(self, weight: f32) -> (f32, f32) {
+        match self {
+            Self::Known(value) => (value.clamp(0.0, 1.0) * weight, weight),
+            Self::Unknown => (0.0, 0.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportanceScore {
     pub access_frequency: f32,
     pub recency: f32,
-    pub centrality: f32,
-    pub confidence: f32,
-    pub tenant_priority: f32,
-    pub composite: f32,
+    pub centrality: ImportanceSignal,
+    pub confidence: ImportanceSignal,
+    pub tenant_priority: ImportanceSignal,
+    pub composite: Option<f32>,
+    pub completeness: f32,
 }
 
 impl ImportanceScore {
+    /// Computes importance exclusively from observed or policy-provided signals.
+    /// Missing inputs remain `Unknown`; weights are not silently assigned neutral values.
     pub fn compute(
         log: &[AccessEvent],
         meta: &crate::ContextMeta,
         weights: &ImportanceWeights,
+        centrality: Option<f32>,
+        tenant_priority: Option<f32>,
     ) -> Self {
         let access_frequency = if log.is_empty() {
-            0.1
+            0.0
         } else {
             (log.len() as f32 / (log.len() as f32 + 5.0)).clamp(0.0, 1.0)
         };
         let recency = match log.last() {
             Some(a) => {
                 let d = (Utc::now() - a.timestamp).num_hours() as f32 / 24.0;
-                (-d / 30.0).exp().clamp(0.05, 1.0)
+                (-d / 30.0).exp().clamp(0.0, 1.0)
             }
-            None => 0.05,
+            None => 0.0,
         };
-        let centrality = 0.5;
-        let confidence = meta.quality_score.unwrap_or(0.5);
-        let tenant_priority = 0.5;
-        let composite = weights.access_freq * access_frequency
-            + weights.recency * recency
-            + weights.centrality * centrality
-            + weights.confidence * confidence
-            + weights.tenant_priority * tenant_priority;
+        let centrality = centrality.map_or(ImportanceSignal::Unknown, ImportanceSignal::Known);
+        let confidence = meta
+            .quality_score
+            .map_or(ImportanceSignal::Unknown, ImportanceSignal::Known);
+        let tenant_priority =
+            tenant_priority.map_or(ImportanceSignal::Unknown, ImportanceSignal::Known);
+        let mut weighted = weights.access_freq * access_frequency + weights.recency * recency;
+        let mut observed_weight = weights.access_freq + weights.recency;
+        for (value, weight) in [
+            centrality.weighted(weights.centrality),
+            confidence.weighted(weights.confidence),
+            tenant_priority.weighted(weights.tenant_priority),
+        ] {
+            weighted += value;
+            observed_weight += weight;
+        }
+        let total_weight = weights.access_freq
+            + weights.recency
+            + weights.centrality
+            + weights.confidence
+            + weights.tenant_priority;
         Self {
             access_frequency,
             recency,
             centrality,
             confidence,
             tenant_priority,
-            composite,
+            composite: (observed_weight > 0.0).then_some(weighted / observed_weight),
+            completeness: if total_weight > 0.0 {
+                (observed_weight / total_weight).clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -375,9 +413,11 @@ pub enum LifecycleAction {
     Freeze,
 }
 
+pub type LifecycleCondition = dyn Fn(&ImportanceScore, &crate::ContextMeta) -> bool + Send + Sync;
+
 pub struct LifecycleRule {
     pub name: String,
-    pub condition: Box<dyn Fn(&ImportanceScore, &crate::ContextMeta) -> bool + Send + Sync>,
+    pub condition: Box<LifecycleCondition>,
     pub action: LifecycleAction,
     pub priority: u32,
 }
@@ -392,8 +432,16 @@ impl LifecycleEngine {
         Self { rules, weights }
     }
 
-    pub fn score(&self, log: &[AccessEvent], meta: &crate::ContextMeta) -> ImportanceScore {
-        ImportanceScore::compute(log, meta, &self.weights)
+    /// Scores with graph centrality and tenant priority supplied by runtime adapters.
+    /// `None` is preserved as an unknown signal and lowers score completeness.
+    pub fn score(
+        &self,
+        log: &[AccessEvent],
+        meta: &crate::ContextMeta,
+        centrality: Option<f32>,
+        tenant_priority: Option<f32>,
+    ) -> ImportanceScore {
+        ImportanceScore::compute(log, meta, &self.weights, centrality, tenant_priority)
     }
 
     pub fn evaluate(&self, score: &ImportanceScore, meta: &crate::ContextMeta) -> LifecycleAction {
@@ -409,8 +457,10 @@ impl LifecycleEngine {
         &self,
         log: &[AccessEvent],
         meta: &crate::ContextMeta,
+        centrality: Option<f32>,
+        tenant_priority: Option<f32>,
     ) -> LifecycleAction {
-        let score = self.score(log, meta);
+        let score = self.score(log, meta, centrality, tenant_priority);
         self.evaluate(&score, meta)
     }
 
@@ -419,14 +469,15 @@ impl LifecycleEngine {
             LifecycleRule {
                 name: "freeze".into(),
                 condition: Box::new(|s, m| {
-                    s.tenant_priority > 0.9 || m.tags.contains(&"pinned".to_string())
+                    matches!(s.tenant_priority, ImportanceSignal::Known(value) if value > 0.9)
+                        || m.tags.contains(&"pinned".to_string())
                 }),
                 action: LifecycleAction::Freeze,
                 priority: 100,
             },
             LifecycleRule {
                 name: "consolidate".into(),
-                condition: Box::new(|s, _| s.composite < 0.2),
+                condition: Box::new(|s, _| s.composite.is_some_and(|value| value < 0.2)),
                 action: LifecycleAction::Consolidate,
                 priority: 50,
             },
@@ -438,7 +489,7 @@ impl LifecycleEngine {
             },
             LifecycleRule {
                 name: "delete".into(),
-                condition: Box::new(|s, _| s.composite < 0.05),
+                condition: Box::new(|s, _| s.composite.is_some_and(|value| value < 0.05)),
                 action: LifecycleAction::Delete,
                 priority: 20,
             },

@@ -7,9 +7,10 @@
 
 use crate::tokenizer::count_tokens;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmTaskKind {
+    #[default]
     General,
     Summary,
     Extraction,
@@ -21,38 +22,22 @@ pub enum LlmTaskKind {
     Prediction,
 }
 
-impl Default for LlmTaskKind {
-    fn default() -> Self {
-        Self::General
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheMode {
     Off,
+    #[default]
     ProviderDefault,
     Force,
 }
 
-impl Default for PromptCacheMode {
-    fn default() -> Self {
-        Self::ProviderDefault
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCompressionMode {
     Off,
+    #[default]
     Extractive,
     Distill,
-}
-
-impl Default for PromptCompressionMode {
-    fn default() -> Self {
-        Self::Extractive
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

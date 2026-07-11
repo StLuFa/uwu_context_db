@@ -26,12 +26,12 @@ workspace 内 15 个 crate，全部命名 `agent-context-db-*`（目录 `crates/
 
 | crate | 职责 |
 |-------|------|
-| `context-db-core` | URI + 三层模型 + 窄端口（FsOps/ContentRepo/VersionOps/TenantOps）+ LlmClient/VectorIndex/GraphStore/BlobStore/ReadCache/RateLimiter/生命周期/ACL/Pack/血缘/模板/继承链/去重聚类/UwuConfig/observability metrics + WatchHub/WatchableStore + SemanticWriteDedupStore + prompt 优化 + LLM cache/cascade |
+| `context-db-core` | URI + 三层模型 + 窄端口（FsOps/ContentRepo/VersionOps/TenantOps）+ LlmClient/VectorIndex/GraphStore/BlobStore/ReadCache/生命周期/ACL/Pack/血缘/模板/继承链/去重聚类/UwuConfig/observability metrics + WatchHub/WatchableStore + SemanticWriteDedupStore + prompt 优化 + LLM cache/cascade |
 | `context-db-retrieve` | Query DSL + LogicalPlan + CBO 优化器 + PhysicalPlan 算子 + WQL 预算/谓词下推 + GraphTraverse 批量图遍历 + 双时态谓词过滤 + Theory-of-Mind persona/relations 结构化模型 + 分层检索 + GraphRAG 社区摘要/图增强检索 + 意图分析(Rule/LLM) + Rerank + 幻觉检测 + 分层背包预算装载 + 压缩感知加载 + 预测性预加载 + 增量检索学习 + 联想扩展 |
 | `context-db-version` | DAG 版本管理（CommitOps/BranchOps/TagOps/MergeOps/HistoryOps 五窄 trait） + ContentType 驱动 CRDT 合并 + 语义 diff + 时态推理 + TemporalIndex 双时态查询(valid-time/transaction-time) + CausalDag + PC/GES 因果发现 + do-calculus/反事实干预推断 + Neural-Symbolic AGM 信念修正 + 知识晶体 + 自修复 + DreamConsolidator 睡眠期经验重放/技能候选合成 + cherry-pick/rebase (ConflictStrategy + 可选持久化交互式 ConflictSession) + CEL 语义标签 |
 | `context-db-session` | 两阶段 commit 会话压缩 |
 | `context-db-parse` | SemanticProcessor + 内容哈希/子摘要指纹增量缓存 + MemoryExtractor(ContentType 分类) + TrajectoryExtractor(两层归纳) |
-| `context-db-compressor` | tokio mpsc 异步语义处理队列 + RedisSemanticQueue |
+| `context-db-compressor` | tokio mpsc 进程内异步语义处理队列 |
 | `context-db-storage` | PgContextStore + PgVersionStore（Git 风格差量 + L1 内存 + L2 checkpoint 三级快照缓存 + 可选持久化 version_conflict_sessions）+ UwuVectorIndex + UwuCacheAdapter + ContextDbService（ACL → 写入前语义去重 → WatchableStore 主路径） |
 | `context-db-wiki` | wiki-core → context-db 存储桥接（WikiVectorStoreAdapter） |
 | `context-db-testkit` | MemoryContextStore + MemoryVersionStore |

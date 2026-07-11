@@ -3,6 +3,7 @@
 //! The adapter stores the complete [`ContextEntry`] JSON alongside indexed columns. This keeps
 //! every payload and metadata field lossless while allowing URI, tenant, type, and text queries to
 //! remain efficient. Writes and their MVCC snapshots share one transaction.
+use agent_context_db_core::{Page, PageRequest};
 
 use agent_context_db_core::{
     BlobRef, BlobStore, BrowsingOps, ContentHash, ContentLevel, ContentPayload, ContentRepo,
@@ -12,10 +13,14 @@ use agent_context_db_core::{
 };
 use async_trait::async_trait;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 use uwu_database::DbPool;
+
+use crate::outbox::{
+    IndexMutation, collection_from_entry, enqueue_sqlite, point_from_entry, upsert_mutation,
+};
 
 #[derive(Clone)]
 pub struct SqliteContextStore {
@@ -201,6 +206,19 @@ pub async fn migrate_sqlite(pool: &DbPool) -> Result<()> {
             PRIMARY KEY (from_uri, to_uri, relation_kind)
         )"#,
         "CREATE INDEX IF NOT EXISTS idx_ctx_sqlite_rel_to ON context_relations (to_uri, relation_kind)",
+        r#"CREATE TABLE IF NOT EXISTS context_index_outbox (
+            id TEXT PRIMARY KEY,
+            mutation_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending','processing','done','failed','dead')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            available_at TEXT NOT NULL,
+            lease_until TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_context_index_outbox_ready ON context_index_outbox (status, available_at, created_at)",
         r#"CREATE TABLE IF NOT EXISTS context_blobs (
             content_hash TEXT PRIMARY KEY,
             data BLOB NOT NULL,
@@ -208,6 +226,19 @@ pub async fn migrate_sqlite(pool: &DbPool) -> Result<()> {
             size INTEGER NOT NULL,
             created_at TEXT NOT NULL
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS version_commits (id TEXT PRIMARY KEY, scope TEXT NOT NULL, tree_hash TEXT NOT NULL, author_json TEXT NOT NULL, message TEXT NOT NULL, timestamp TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')"#,
+        "CREATE INDEX IF NOT EXISTS idx_sqlite_version_commits_scope_time ON version_commits(scope, timestamp DESC)",
+        r#"CREATE TABLE IF NOT EXISTS version_commit_parents (commit_id TEXT NOT NULL REFERENCES version_commits(id) ON DELETE CASCADE, parent_id TEXT NOT NULL REFERENCES version_commits(id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL CHECK(ordinal >= 0), PRIMARY KEY(commit_id, parent_id), UNIQUE(commit_id, ordinal), CHECK(commit_id <> parent_id))"#,
+        "CREATE INDEX IF NOT EXISTS idx_sqlite_version_parents_child ON version_commit_parents(parent_id)",
+        r#"CREATE TABLE IF NOT EXISTS version_branches (scope TEXT NOT NULL, name TEXT NOT NULL, head TEXT NOT NULL, branch_type TEXT NOT NULL, lifecycle_json TEXT NOT NULL DEFAULT '{}', created_from TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(scope, name))"#,
+        r#"CREATE TABLE IF NOT EXISTS version_tags (scope TEXT NOT NULL, name TEXT NOT NULL, target TEXT NOT NULL, tag_type TEXT NOT NULL, message TEXT, timestamp TEXT NOT NULL, condition_expr TEXT, PRIMARY KEY(scope, name))"#,
+        r#"CREATE TABLE IF NOT EXISTS version_entry_deltas (commit_id TEXT NOT NULL REFERENCES version_commits(id) ON DELETE CASCADE, uri TEXT NOT NULL, op TEXT NOT NULL, entry_json TEXT, rename_from TEXT, PRIMARY KEY(commit_id, uri))"#,
+        "CREATE INDEX IF NOT EXISTS idx_sqlite_version_deltas_uri ON version_entry_deltas(uri, commit_id)",
+        r#"CREATE TABLE IF NOT EXISTS version_heads (scope TEXT PRIMARY KEY, commit_id TEXT NOT NULL REFERENCES version_commits(id) ON DELETE RESTRICT, attached_branch TEXT, FOREIGN KEY(scope, attached_branch) REFERENCES version_branches(scope, name) ON DELETE RESTRICT)"#,
+        r#"CREATE TABLE IF NOT EXISTS version_commit_checkpoints (commit_id TEXT PRIMARY KEY REFERENCES version_commits(id) ON DELETE CASCADE, snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL, last_accessed_at TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0)"#,
+        "CREATE INDEX IF NOT EXISTS idx_sqlite_version_checkpoints_heat ON version_commit_checkpoints(last_accessed_at DESC, access_count DESC, created_at DESC)",
+        r#"CREATE TABLE IF NOT EXISTS version_conflict_sessions (id TEXT PRIMARY KEY, scope TEXT NOT NULL, operation_json TEXT NOT NULL, session_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT)"#,
+        "CREATE INDEX IF NOT EXISTS idx_sqlite_conflict_sessions_scope_status ON version_conflict_sessions(scope, status, updated_at DESC)",
     ];
     for statement in statements {
         sqlx::query(statement)
@@ -228,6 +259,9 @@ impl ContentRepo for SqliteContextStore {
             .await
             .map_err(|e| Self::storage_err("begin write", e))?;
         let version = Self::write_in_tx(&mut tx, &entry).await?;
+        if let Some(mutation) = upsert_mutation(&entry, version)? {
+            enqueue_sqlite(&mut tx, &mutation).await?;
+        }
         tx.commit()
             .await
             .map_err(|e| Self::storage_err("commit write", e))?;
@@ -251,6 +285,24 @@ impl ContentRepo for SqliteContextStore {
         if affected.rows_affected() == 0 {
             return Err(ContextError::NotFound(uri.to_string()));
         }
+        let collection = sqlx::query_scalar::<_, String>(
+            "SELECT entry_json FROM context_versions WHERE uri = ? ORDER BY mvcc_version DESC LIMIT 1",
+        )
+        .bind(uri.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| Self::storage_err("read deleted collection", e))?
+        .and_then(|json| serde_json::from_str::<ContextEntry>(&json).ok())
+        .map(|entry| collection_from_entry(&entry))
+        .unwrap_or_else(|| crate::outbox::DEFAULT_COLLECTION.to_owned());
+        enqueue_sqlite(
+            &mut tx,
+            &IndexMutation::Delete {
+                collection,
+                uri: uri.clone(),
+            },
+        )
+        .await?;
         sqlx::query("DELETE FROM context_versions WHERE uri = ?")
             .bind(uri.to_string())
             .execute(&mut *tx)
@@ -305,24 +357,59 @@ impl ContentRepo for SqliteContextStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| Self::storage_err("rename", e))?;
-        sqlx::query("UPDATE context_versions SET uri = ? WHERE uri = ?")
+        let versions: Vec<(i64, String)> =
+            sqlx::query_as("SELECT mvcc_version, entry_json FROM context_versions WHERE uri = ?")
+                .bind(from.to_string())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| Self::storage_err("read rename versions", e))?;
+        for (version, json) in versions {
+            let mut historical: ContextEntry = serde_json::from_str(&json)?;
+            historical.uri = to.clone();
+            sqlx::query(
+                "UPDATE context_versions SET uri = ?, entry_json = ? WHERE uri = ? AND mvcc_version = ?",
+            )
             .bind(to.to_string())
+            .bind(serde_json::to_string(&historical)?)
+            .bind(from.to_string())
+            .bind(version)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::storage_err("rename version", e))?;
+        }
+        let relations: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT from_uri, to_uri, relation_kind, created_at FROM context_relations WHERE from_uri = ? OR to_uri = ?",
+        )
+        .bind(from.to_string())
+        .bind(from.to_string())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Self::storage_err("read rename relations", e))?;
+        sqlx::query("DELETE FROM context_relations WHERE from_uri = ? OR to_uri = ?")
+            .bind(from.to_string())
             .bind(from.to_string())
             .execute(&mut *tx)
             .await
-            .map_err(|e| Self::storage_err("rename versions", e))?;
-        sqlx::query("UPDATE context_relations SET from_uri = ? WHERE from_uri = ?")
-            .bind(to.to_string())
-            .bind(from.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::storage_err("rename outgoing relations", e))?;
-        sqlx::query("UPDATE context_relations SET to_uri = ? WHERE to_uri = ?")
-            .bind(to.to_string())
-            .bind(from.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::storage_err("rename incoming relations", e))?;
+            .map_err(|e| Self::storage_err("remove renamed relations", e))?;
+        for (edge_from, edge_to, kind, created_at) in relations {
+            sqlx::query("INSERT OR IGNORE INTO context_relations (from_uri, to_uri, relation_kind, created_at) VALUES (?, ?, ?, ?)")
+                .bind(if edge_from == from.as_str() { to.as_str() } else { &edge_from })
+                .bind(if edge_to == from.as_str() { to.as_str() } else { &edge_to })
+                .bind(kind)
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::storage_err("restore renamed relation", e))?;
+        }
+        enqueue_sqlite(
+            &mut tx,
+            &IndexMutation::Rename {
+                collection: collection_from_entry(&entry),
+                from: from.clone(),
+                point: point_from_entry(&entry)?,
+            },
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(|e| Self::storage_err("commit rename", e))?;
@@ -344,7 +431,11 @@ impl ContentRepo for SqliteContextStore {
             .map_err(|e| Self::storage_err("begin batch write", e))?;
         let mut versions = Vec::with_capacity(entries.len());
         for entry in entries {
-            versions.push(Self::write_in_tx(&mut tx, entry).await?);
+            let version = Self::write_in_tx(&mut tx, entry).await?;
+            if let Some(mutation) = upsert_mutation(entry, version)? {
+                enqueue_sqlite(&mut tx, &mutation).await?;
+            }
+            versions.push(version);
         }
         tx.commit()
             .await
@@ -360,63 +451,74 @@ impl ContentRepo for SqliteContextStore {
 
 #[async_trait]
 impl FsOps for SqliteContextStore {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
         let prefix = Self::dir_prefix(dir);
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("page limit exceeds SQLite INTEGER".into()))?;
         let rows = sqlx::query(
-            "SELECT uri, l0_abstract, content_type FROM context_entries WHERE uri LIKE ? ESCAPE '\\' ORDER BY uri",
+            "WITH scoped AS (SELECT uri, l0_abstract, content_type, substr(uri, length(?) + 1) AS rest FROM context_entries WHERE uri LIKE ? ESCAPE '\\'), children AS (SELECT CASE WHEN instr(rest, '/') > 0 THEN substr(rest, 1, instr(rest, '/') - 1) ELSE rest END AS name, max(instr(rest, '/') > 0) AS is_dir, max(CASE WHEN instr(rest, '/') = 0 THEN l0_abstract END) AS abstract_, max(CASE WHEN instr(rest, '/') = 0 THEN content_type END) AS content_type FROM scoped GROUP BY name) SELECT name, is_dir, abstract_, content_type FROM children WHERE (? IS NULL OR name > ?) ORDER BY name LIMIT ?",
         )
-        .bind(Self::prefix_pattern(&prefix))
-        .fetch_all(self.sqlite_pool())
-        .await
-        .map_err(|e| Self::storage_err("ls", e))?;
-        let mut seen = BTreeMap::new();
-        for row in rows {
-            let uri: String = row.try_get(0).map_err(|e| Self::storage_err("ls row", e))?;
-            let abstract_: String = row.try_get(1).map_err(|e| Self::storage_err("ls row", e))?;
-            let content_type: String =
-                row.try_get(2).map_err(|e| Self::storage_err("ls row", e))?;
-            let rest = uri.strip_prefix(&prefix).unwrap_or(&uri);
-            if let Some(pos) = rest.find('/') {
-                let name = &rest[..pos];
-                seen.entry(name.to_string()).or_insert(DirEntry {
-                    uri: ContextUri::parse(format!("{prefix}{name}"))?,
-                    is_dir: true,
-                    abstract_: String::new(),
-                    content_type: None,
-                });
-            } else {
-                seen.entry(rest.to_string()).or_insert(DirEntry {
-                    uri: ContextUri::parse(uri)?,
-                    is_dir: false,
-                    abstract_,
-                    content_type: ContentType::from_path_segment(&content_type),
-                });
-            }
+        .bind(&prefix).bind(Self::prefix_pattern(&prefix))
+        .bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit)
+        .fetch_all(self.sqlite_pool()).await.map_err(|e| Self::storage_err("ls", e))?;
+        let has_more = rows.len() > page.effective_limit();
+        let mut items = Vec::with_capacity(rows.len().min(page.effective_limit()));
+        for row in rows.into_iter().take(page.effective_limit()) {
+            let name: String = row.try_get(0).map_err(|e| Self::storage_err("ls row", e))?;
+            let is_dir: bool = row.try_get(1).map_err(|e| Self::storage_err("ls row", e))?;
+            items.push(DirEntry {
+                uri: ContextUri::parse(format!("{prefix}{name}"))?,
+                is_dir,
+                abstract_: row
+                    .try_get::<Option<String>, _>(2)
+                    .map_err(|e| Self::storage_err("ls row", e))?
+                    .unwrap_or_default(),
+                content_type: if is_dir {
+                    None
+                } else {
+                    row.try_get::<Option<String>, _>(3)
+                        .map_err(|e| Self::storage_err("ls row", e))?
+                        .and_then(|v| ContentType::from_path_segment(&v))
+                },
+            });
         }
-        Ok(seen.into_values().collect())
+        let next_cursor = has_more.then(|| {
+            items
+                .last()
+                .unwrap()
+                .uri
+                .as_str()
+                .strip_prefix(&prefix)
+                .unwrap()
+                .to_string()
+        });
+        Ok(Page::new(items, next_cursor))
     }
 
-    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>> {
+    async fn find(&self, pattern: &FindPattern, page: PageRequest) -> Result<Page<ContextUri>> {
         let scope = pattern
             .scope
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("page limit exceeds SQLite INTEGER".into()))?;
         let rows: Vec<String> = if let Some(kind) = pattern.content_type {
-            sqlx::query_scalar("SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND content_type = ? ORDER BY uri")
-                .bind(Self::prefix_pattern(&scope))
-                .bind(kind.as_path_segment())
-                .fetch_all(self.sqlite_pool()).await
+            sqlx::query_scalar("SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND content_type = ? AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?")
+                .bind(Self::prefix_pattern(&scope)).bind(kind.as_path_segment())
+                .bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit).fetch_all(self.sqlite_pool()).await
         } else {
-            sqlx::query_scalar("SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' ORDER BY uri")
-                .bind(Self::prefix_pattern(&scope))
-                .fetch_all(self.sqlite_pool()).await
-        }
-        .map_err(|e| Self::storage_err("find", e))?;
-        rows.into_iter()
+            sqlx::query_scalar("SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?")
+                .bind(Self::prefix_pattern(&scope)).bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit).fetch_all(self.sqlite_pool()).await
+        }.map_err(|e| Self::storage_err("find", e))?;
+        let has_more = rows.len() > page.effective_limit();
+        let items = rows
+            .into_iter()
+            .take(page.effective_limit())
             .map(ContextUri::parse)
-            .collect::<std::result::Result<_, _>>()
-            .map_err(Into::into)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let next_cursor = has_more.then(|| items.last().unwrap().to_string());
+        Ok(Page::new(items, next_cursor))
     }
 
     async fn grep(&self, pattern: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
@@ -455,35 +557,44 @@ impl FsOps for SqliteContextStore {
             .collect()
     }
 
-    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
+    async fn tree(
+        &self,
+        root: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
         let prefix = Self::dir_prefix(root);
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' ORDER BY uri",
-        )
-        .bind(Self::prefix_pattern(&prefix))
-        .fetch_all(self.sqlite_pool())
-        .await
-        .map_err(|e| Self::storage_err("tree", e))?;
-        Ok(TreeNode {
-            uri: root.clone(),
-            is_dir: true,
-            children: build_tree(&prefix, &rows, 0, depth),
-        })
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("page limit exceeds SQLite INTEGER".into()))?;
+        let mut rows: Vec<String> = sqlx::query_scalar(
+            "SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?",
+        ).bind(Self::prefix_pattern(&prefix)).bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit)
+        .fetch_all(self.sqlite_pool()).await.map_err(|e| Self::storage_err("tree", e))?;
+        let has_more = rows.len() > page.effective_limit();
+        rows.truncate(page.effective_limit());
+        let next_cursor = has_more.then(|| rows.last().unwrap().clone());
+        Ok(Page::new(
+            vec![TreeNode {
+                uri: root.clone(),
+                is_dir: true,
+                children: build_tree(&prefix, &rows, 0, depth),
+            }],
+            next_cursor,
+        ))
     }
 
     async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload> {
-        if level != ContentLevel::L2 {
-            if let Some(cache) = &self.read_cache {
-                if let Some(hit) = cache.get(uri, level).await {
-                    return hit.ok_or_else(|| ContextError::NotFound(uri.to_string()));
-                }
-            }
+        if level != ContentLevel::L2
+            && let Some(cache) = &self.read_cache
+            && let Some(hit) = cache.get(uri, level).await
+        {
+            return hit.ok_or_else(|| ContextError::NotFound(uri.to_string()));
         }
         let entry = self.load_entry(uri).await;
-        if let Err(ContextError::NotFound(_)) = &entry {
-            if let Some(cache) = &self.read_cache {
-                cache.put_negative(uri, level).await;
-            }
+        if let Err(ContextError::NotFound(_)) = &entry
+            && let Some(cache) = &self.read_cache
+        {
+            cache.put_negative(uri, level).await;
         }
         let entry = entry?;
         let payload = match (&entry.payload, level) {
@@ -504,17 +615,17 @@ impl FsOps for SqliteContextStore {
             (_, ContentLevel::L2) => entry.payload.clone(),
             _ => entry.payload.clone(),
         };
-        if level != ContentLevel::L2 {
-            if let Some(cache) = &self.read_cache {
-                cache
-                    .put(
-                        uri,
-                        level,
-                        payload.clone(),
-                        std::time::Duration::from_secs(300),
-                    )
-                    .await;
-            }
+        if level != ContentLevel::L2
+            && let Some(cache) = &self.read_cache
+        {
+            cache
+                .put(
+                    uri,
+                    level,
+                    payload.clone(),
+                    std::time::Duration::from_secs(300),
+                )
+                .await;
         }
         Ok(payload)
     }
@@ -522,15 +633,27 @@ impl FsOps for SqliteContextStore {
 
 #[async_trait]
 impl VersionOps for SqliteContextStore {
-    async fn version_history(&self, uri: &ContextUri) -> Result<Vec<VersionEntry>> {
+    async fn version_history(
+        &self,
+        uri: &ContextUri,
+        page: PageRequest,
+    ) -> Result<Page<VersionEntry>> {
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("page limit exceeds SQLite INTEGER".into()))?;
+        let after = page
+            .after
+            .as_deref()
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|e| ContextError::Storage(format!("invalid version cursor: {e}")))?;
         let rows = sqlx::query(
-            "SELECT mvcc_version, l0_abstract, created_at FROM context_versions WHERE uri = ? ORDER BY mvcc_version",
-        )
-        .bind(uri.to_string())
-        .fetch_all(self.sqlite_pool())
-        .await
-        .map_err(|e| Self::storage_err("version history", e))?;
-        rows.into_iter()
+            "SELECT mvcc_version, l0_abstract, created_at FROM context_versions WHERE uri = ? AND (? IS NULL OR mvcc_version > ?) ORDER BY mvcc_version LIMIT ?",
+        ).bind(uri.to_string()).bind(after).bind(after).bind(limit)
+        .fetch_all(self.sqlite_pool()).await.map_err(|e| Self::storage_err("version history", e))?;
+        let has_more = rows.len() > page.effective_limit();
+        let items = rows
+            .into_iter()
+            .take(page.effective_limit())
             .map(|row| {
                 let version: i64 = row
                     .try_get(0)
@@ -550,7 +673,9 @@ impl VersionOps for SqliteContextStore {
                     ts,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let next_cursor = has_more.then(|| items.last().unwrap().version.0.to_string());
+        Ok(Page::new(items, next_cursor))
     }
 
     async fn rollback(&self, uri: &ContextUri, to: MvccVersion) -> Result<()> {
@@ -593,31 +718,40 @@ impl VersionOps for SqliteContextStore {
     }
 
     async fn diff(&self, uri: &ContextUri, a: MvccVersion, b: MvccVersion) -> Result<ContextDiff> {
-        async fn text(
+        async fn snapshot(
             pool: &SqlitePool,
             uri: &ContextUri,
             version: MvccVersion,
         ) -> std::result::Result<Option<String>, sqlx::Error> {
             sqlx::query_scalar(
-                "SELECT l0_abstract FROM context_versions WHERE uri = ? AND mvcc_version = ?",
+                "SELECT entry_json FROM context_versions WHERE uri = ? AND mvcc_version = ?",
             )
             .bind(uri.to_string())
             .bind(version.0 as i64)
             .fetch_optional(pool)
             .await
         }
-        let left = text(self.sqlite_pool(), uri, a)
+        let left = snapshot(self.sqlite_pool(), uri, a)
             .await
-            .map_err(|e| Self::storage_err("diff a", e))?;
-        let right = text(self.sqlite_pool(), uri, b)
+            .map_err(|e| Self::storage_err("diff a", e))?
+            .ok_or_else(|| {
+                ContextError::VersionConflict(format!("no version {} for {uri}", a.0))
+            })?;
+        let right = snapshot(self.sqlite_pool(), uri, b)
             .await
-            .map_err(|e| Self::storage_err("diff b", e))?;
+            .map_err(|e| Self::storage_err("diff b", e))?
+            .ok_or_else(|| {
+                ContextError::VersionConflict(format!("no version {} for {uri}", b.0))
+            })?;
+        let left: serde_json::Value = serde_json::from_str(&left)?;
+        let right: serde_json::Value = serde_json::from_str(&right)?;
+        let mut changes = Vec::new();
+        collect_json_changes("$", &left, &right, &mut changes);
         Ok(ContextDiff {
-            summary: match (left, right) {
-                (Some(left), Some(right)) => {
-                    format!("{uri}: v{} -> v{}\n---\n{left}\n+++\n{right}", a.0, b.0)
-                }
-                _ => format!("{uri}: one or both versions not found"),
+            summary: if changes.is_empty() {
+                format!("{uri}: v{} and v{} are identical", a.0, b.0)
+            } else {
+                format!("{uri}: v{} -> v{}\n{}", a.0, b.0, changes.join("\n"))
             },
         })
     }
@@ -625,19 +759,25 @@ impl VersionOps for SqliteContextStore {
 
 #[async_trait]
 impl TenantOps for SqliteContextStore {
-    async fn list_tenants(&self) -> Result<Vec<TenantId>> {
-        let rows: Vec<String> =
-            sqlx::query_scalar("SELECT DISTINCT tenant_id FROM context_entries ORDER BY tenant_id")
-                .fetch_all(self.sqlite_pool())
-                .await
-                .map_err(|e| Self::storage_err("list tenants", e))?;
-        rows.into_iter()
+    async fn list_tenants(&self, page: PageRequest) -> Result<Page<TenantId>> {
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("page limit exceeds SQLite INTEGER".into()))?;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT tenant_id FROM context_entries WHERE (? IS NULL OR tenant_id > ?) ORDER BY tenant_id LIMIT ?")
+            .bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit)
+            .fetch_all(self.sqlite_pool()).await.map_err(|e| Self::storage_err("list tenants", e))?;
+        let has_more = rows.len() > page.effective_limit();
+        let items = rows
+            .into_iter()
+            .take(page.effective_limit())
             .map(|id| {
                 Uuid::parse_str(&id)
                     .map(TenantId)
                     .map_err(|e| Self::storage_err("tenant id", e))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let next_cursor = has_more.then(|| items.last().unwrap().0.to_string());
+        Ok(Page::new(items, next_cursor))
     }
 }
 
@@ -658,42 +798,100 @@ impl ContentStore for SqliteContextStore {
     async fn batch_write(&self, entries: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
         <Self as ContentRepo>::batch_write(self, entries).await
     }
-    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
+    async fn scan_by_prefix(&self, prefix: &str, page: PageRequest) -> Result<Page<ContextEntry>> {
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("scan limit exceeds SQLite INTEGER".into()))?;
+        let scope = ContextUri::parse(prefix.trim_end_matches('/'))?;
+        let exact = scope.to_string();
+        let descendants = Self::prefix_pattern(&Self::dir_prefix(&scope));
         let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT entry_json FROM context_entries WHERE uri LIKE ? ESCAPE '\\' ORDER BY uri LIMIT ?",
+            "SELECT entry_json FROM context_entries WHERE (uri = ? OR uri LIKE ? ESCAPE '\\') AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?",
         )
-        .bind(Self::prefix_pattern(&prefix))
-        .bind(limit as i64)
+        .bind(exact)
+        .bind(descendants)
+        .bind(page.after.as_deref()).bind(page.after.as_deref())
+        .bind(limit)
         .fetch_all(self.sqlite_pool())
         .await
         .map_err(|e| Self::storage_err("scan by prefix", e))?;
-        rows.into_iter()
-            .map(|json| serde_json::from_str(&json).map_err(Into::into))
-            .collect()
+        let has_more = rows.len() > page.effective_limit();
+        let items = rows
+            .into_iter()
+            .take(page.effective_limit())
+            .map(|json| serde_json::from_str::<ContextEntry>(&json).map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        let next_cursor = has_more.then(|| items.last().unwrap().uri.to_string());
+        Ok(Page::new(items, next_cursor))
+    }
+
+    async fn scan_by_type(
+        &self,
+        prefix: &str,
+        content_type: ContentType,
+        page: PageRequest,
+    ) -> Result<Page<ContextEntry>> {
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("scan limit exceeds SQLite INTEGER".into()))?;
+        let scope = ContextUri::parse(prefix.trim_end_matches('/'))?;
+        let exact = scope.to_string();
+        let descendants = Self::prefix_pattern(&Self::dir_prefix(&scope));
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT entry_json FROM context_entries WHERE (uri = ? OR uri LIKE ? ESCAPE '\\') AND content_type = ? AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?",
+        )
+        .bind(exact)
+        .bind(descendants)
+        .bind(content_type.as_path_segment())
+        .bind(page.after.as_deref()).bind(page.after.as_deref())
+        .bind(limit)
+        .fetch_all(self.sqlite_pool())
+        .await
+        .map_err(|e| Self::storage_err("scan by type", e))?;
+        let has_more = rows.len() > page.effective_limit();
+        let items = rows
+            .into_iter()
+            .take(page.effective_limit())
+            .map(|json| serde_json::from_str::<ContextEntry>(&json).map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        let next_cursor = has_more.then(|| items.last().unwrap().uri.to_string());
+        Ok(Page::new(items, next_cursor))
     }
 }
 
 #[async_trait]
 impl BrowsingOps for SqliteContextStore {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
-        <Self as FsOps>::ls(self, dir).await
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
+        <Self as FsOps>::ls(self, dir, page).await
     }
-    async fn tree(&self, dir: &ContextUri, depth: usize) -> Result<TreeNode> {
-        <Self as FsOps>::tree(self, dir, depth).await
+    async fn tree(
+        &self,
+        dir: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
+        <Self as FsOps>::tree(self, dir, depth, page).await
     }
-    async fn find(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<ContextUri>> {
+    async fn find(
+        &self,
+        scope: &ContextUri,
+        pattern: &str,
+        page: PageRequest,
+    ) -> Result<Page<ContextUri>> {
+        let limit = i64::try_from(page.effective_limit() + 1)
+            .map_err(|_| ContextError::Storage("page limit exceeds SQLite INTEGER".into()))?;
+        let exact = scope.to_string();
+        let descendants = Self::prefix_pattern(&Self::dir_prefix(scope));
         let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND instr(uri, ?) > 0 ORDER BY uri LIMIT 100",
-        )
-        .bind(Self::prefix_pattern(scope.as_str()))
-        .bind(pattern)
-        .fetch_all(self.sqlite_pool())
-        .await
-        .map_err(|e| Self::storage_err("browse find", e))?;
-        rows.into_iter()
+            "SELECT uri FROM context_entries WHERE (uri = ? OR uri LIKE ? ESCAPE '\\') AND instr(uri, ?) > 0 AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?",
+        ).bind(exact).bind(descendants).bind(pattern).bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit)
+        .fetch_all(self.sqlite_pool()).await.map_err(|e| Self::storage_err("browse find", e))?;
+        let has_more = rows.len() > page.effective_limit();
+        let items = rows
+            .into_iter()
+            .take(page.effective_limit())
             .map(ContextUri::parse)
-            .collect::<std::result::Result<_, _>>()
-            .map_err(Into::into)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let next_cursor = has_more.then(|| items.last().unwrap().to_string());
+        Ok(Page::new(items, next_cursor))
     }
     async fn grep(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<GrepHit>> {
         <Self as FsOps>::grep(self, pattern, scope).await
@@ -739,7 +937,6 @@ impl GraphStore for SqliteContextStore {
         rows.into_iter()
             .map(ContextUri::parse)
             .collect::<std::result::Result<_, _>>()
-            .map_err(Into::into)
     }
     async fn batch_traverse(
         &self,
@@ -771,21 +968,59 @@ impl GraphStore for SqliteContextStore {
         Ok(result)
     }
     async fn centrality(&self, uri: &ContextUri) -> Result<f32> {
-        let degree: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM context_relations WHERE from_uri = ? OR to_uri = ?",
-        )
-        .bind(uri.to_string())
-        .bind(uri.to_string())
-        .fetch_one(self.sqlite_pool())
-        .await
-        .map_err(|e| Self::storage_err("centrality degree", e))?;
-        let nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT from_uri AS uri FROM context_relations UNION SELECT to_uri AS uri FROM context_relations)")
-            .fetch_one(self.sqlite_pool()).await.map_err(|e| Self::storage_err("centrality nodes", e))?;
-        Ok(if nodes <= 1 {
-            0.0
-        } else {
-            (degree as f32 / (nodes - 1) as f32).clamp(0.0, 1.0)
-        })
+        const MAX_NODES: usize = 256;
+        const MAX_HOPS: usize = 3;
+        let mut nodes = BTreeSet::from([uri.to_string()]);
+        let mut frontier = vec![uri.to_string()];
+        for _ in 0..MAX_HOPS {
+            if frontier.is_empty() || nodes.len() >= MAX_NODES {
+                break;
+            }
+            let placeholders = std::iter::repeat_n("?", frontier.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT to_uri AS uri FROM context_relations WHERE from_uri IN ({placeholders}) UNION SELECT from_uri AS uri FROM context_relations WHERE to_uri IN ({placeholders}) ORDER BY uri"
+            );
+            let mut query = sqlx::query_scalar::<_, String>(&sql);
+            for value in &frontier {
+                query = query.bind(value);
+            }
+            for value in &frontier {
+                query = query.bind(value);
+            }
+            let rows = query
+                .fetch_all(self.sqlite_pool())
+                .await
+                .map_err(|e| Self::storage_err("centrality frontier", e))?;
+            frontier.clear();
+            for node in rows {
+                if nodes.len() >= MAX_NODES {
+                    break;
+                }
+                if nodes.insert(node.clone()) {
+                    frontier.push(node);
+                }
+            }
+        }
+        let node_list = nodes.into_iter().collect::<Vec<_>>();
+        if node_list.len() <= 1 {
+            return Ok(0.0);
+        }
+        let rows = sqlx::query("SELECT from_uri, to_uri FROM context_relations")
+            .fetch_all(self.sqlite_pool())
+            .await
+            .map_err(|e| Self::storage_err("centrality edges", e))?;
+        let node_set = node_list.iter().cloned().collect::<HashSet<_>>();
+        let edges = rows
+            .into_iter()
+            .filter_map(|row| {
+                let from = row.try_get::<String, _>(0).ok()?;
+                let to = row.try_get::<String, _>(1).ok()?;
+                (node_set.contains(&from) && node_set.contains(&to)).then_some((from, to))
+            })
+            .collect::<Vec<_>>();
+        Ok(pagerank_score(uri.as_str(), &node_list, &edges))
     }
 }
 
@@ -804,12 +1039,18 @@ impl BlobStore for SqliteContextStore {
         })
     }
     async fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {
-        sqlx::query_scalar("SELECT data FROM context_blobs WHERE content_hash = ?")
-            .bind(&blob_ref.hash.0)
-            .fetch_optional(self.sqlite_pool())
-            .await
-            .map_err(|e| Self::storage_err("blob get", e))?
-            .ok_or_else(|| ContextError::NotFound(format!("blob not found: {}", blob_ref.hash.0)))
+        let row: Option<(Vec<u8>, String, i64)> = sqlx::query_as(
+            "SELECT data, mime_type, size FROM context_blobs WHERE content_hash = ?",
+        )
+        .bind(&blob_ref.hash.0)
+        .fetch_optional(self.sqlite_pool())
+        .await
+        .map_err(|e| Self::storage_err("blob get", e))?;
+        let (data, mime_type, stored_size) = row.ok_or_else(|| {
+            ContextError::NotFound(format!("blob not found: {}", blob_ref.hash.0))
+        })?;
+        validate_blob(blob_ref, &data, &mime_type, stored_size)?;
+        Ok(data)
     }
     async fn dedup_check(&self, hash: &ContentHash) -> Result<bool> {
         let exists: i64 =
@@ -819,6 +1060,106 @@ impl BlobStore for SqliteContextStore {
                 .await
                 .map_err(|e| Self::storage_err("blob dedup", e))?;
         Ok(exists != 0)
+    }
+}
+
+fn validate_blob(blob_ref: &BlobRef, data: &[u8], mime_type: &str, stored_size: i64) -> Result<()> {
+    let actual_hash = blake3::hash(data).to_hex().to_string();
+    let actual_size = data.len();
+    if actual_hash != blob_ref.hash.0
+        || usize::try_from(stored_size).ok() != Some(actual_size)
+        || blob_ref.size != actual_size
+        || blob_ref.mime_type != mime_type
+    {
+        return Err(ContextError::Storage(format!(
+            "blob integrity mismatch for {}",
+            blob_ref.hash.0
+        )));
+    }
+    Ok(())
+}
+
+fn pagerank_score(target: &str, nodes: &[String], edges: &[(String, String)]) -> f32 {
+    const DAMPING: f32 = 0.85;
+    const MAX_ITERS: usize = 32;
+    const EPSILON: f32 = 1e-5;
+    let n = nodes.len() as f32;
+    let mut outgoing = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for (from, to) in edges {
+        outgoing.entry(from).or_default().push(to);
+    }
+    let mut ranks = nodes
+        .iter()
+        .map(|node| (node.as_str(), 1.0 / n))
+        .collect::<std::collections::HashMap<_, _>>();
+    for _ in 0..MAX_ITERS {
+        let dangling = nodes
+            .iter()
+            .filter(|node| outgoing.get(node.as_str()).is_none_or(Vec::is_empty))
+            .map(|node| ranks.get(node.as_str()).copied().unwrap_or(0.0))
+            .sum::<f32>()
+            / n;
+        let mut next = nodes
+            .iter()
+            .map(|node| (node.as_str(), (1.0 - DAMPING) / n + DAMPING * dangling))
+            .collect::<std::collections::HashMap<_, _>>();
+        for (from, targets) in &outgoing {
+            let contribution =
+                DAMPING * ranks.get(from).copied().unwrap_or(0.0) / targets.len() as f32;
+            for target in targets {
+                if let Some(value) = next.get_mut(target) {
+                    *value += contribution;
+                }
+            }
+        }
+        let delta = nodes
+            .iter()
+            .map(|node| {
+                (next.get(node.as_str()).copied().unwrap_or(0.0)
+                    - ranks.get(node.as_str()).copied().unwrap_or(0.0))
+                .abs()
+            })
+            .sum::<f32>();
+        ranks = next;
+        if delta < EPSILON {
+            break;
+        }
+    }
+    (ranks.get(target).copied().unwrap_or(0.0) * n).clamp(0.0, 1.0)
+}
+
+fn collect_json_changes(
+    path: &str,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    output: &mut Vec<String>,
+) {
+    match (left, right) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            let keys = left.keys().chain(right.keys()).collect::<BTreeSet<_>>();
+            for key in keys {
+                let child = format!("{path}.{key}");
+                match (left.get(key), right.get(key)) {
+                    (Some(a), Some(b)) => collect_json_changes(&child, a, b, output),
+                    (Some(a), None) => output.push(format!("- {child}: {a}")),
+                    (None, Some(b)) => output.push(format!("+ {child}: {b}")),
+                    (None, None) => {}
+                }
+            }
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            for index in 0..left.len().max(right.len()) {
+                let child = format!("{path}[{index}]");
+                match (left.get(index), right.get(index)) {
+                    (Some(a), Some(b)) => collect_json_changes(&child, a, b, output),
+                    (Some(a), None) => output.push(format!("- {child}: {a}")),
+                    (None, Some(b)) => output.push(format!("+ {child}: {b}")),
+                    (None, None) => {}
+                }
+            }
+        }
+        _ if left != right => output.push(format!("~ {path}: {left} -> {right}")),
+        _ => {}
     }
 }
 
@@ -852,10 +1193,10 @@ fn build_tree(prefix: &str, uris: &[String], depth: usize, max_depth: usize) -> 
     }
     let mut names = BTreeSet::new();
     for uri in uris {
-        if let Some(rest) = uri.strip_prefix(prefix) {
-            if let Some(name) = rest.split('/').next().filter(|name| !name.is_empty()) {
-                names.insert(name.to_string());
-            }
+        if let Some(rest) = uri.strip_prefix(prefix)
+            && let Some(name) = rest.split('/').next().filter(|name| !name.is_empty())
+        {
+            names.insert(name.to_string());
         }
     }
     names
@@ -963,6 +1304,7 @@ mod tests {
         let history = store
             .version_history(
                 &ContextUri::parse("uwu://tenant/agent/a/memory/fact/sqlite/one").unwrap(),
+                PageRequest::default(),
             )
             .await
             .unwrap();
@@ -981,7 +1323,13 @@ mod tests {
             vec![MvccVersion(1), MvccVersion(1)]
         );
         let root = ContextUri::parse("uwu://tenant/agent/a/memory/fact/sqlite").unwrap();
-        assert_eq!(FsOps::ls(&store, &root).await.unwrap().len(), 2);
+        assert_eq!(
+            FsOps::ls(&store, &root, PageRequest::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(FsOps::grep(&store, "needle", &root).await.unwrap().len(), 1);
         store
             .add_edge(
@@ -1033,7 +1381,7 @@ mod tests {
             ContentStore::scan_by_prefix(
                 &store,
                 "uwu://tenant/agent/a/memory/fact/literal_100%",
-                10,
+                PageRequest::new(10),
             )
             .await
             .unwrap()
@@ -1088,7 +1436,14 @@ mod tests {
                 .sparse_text(),
             "v1"
         );
-        assert_eq!(store.version_history(&to).await.unwrap().len(), 3);
+        assert_eq!(
+            store
+                .version_history(&to, PageRequest::default())
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
         assert!(matches!(
             FsOps::read(&store, &from, ContentLevel::L0).await,
             Err(ContextError::NotFound(_))

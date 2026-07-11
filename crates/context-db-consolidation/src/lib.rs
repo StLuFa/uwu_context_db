@@ -17,6 +17,7 @@ pub mod explainable;
 pub mod guard;
 pub mod halflife;
 pub mod health;
+pub mod lifecycle_execution;
 pub mod lineage;
 pub mod loader;
 pub mod opportunity;
@@ -43,7 +44,7 @@ use crate::health::{
 use crate::quality::{HorizonAwareQualityScorer, HorizonQualitySignals, QualityRoute};
 use agent_context_db_core::{
     ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType, LineageEntry,
-    LlmClient, LlmOpts, Result, StateScope, ValidityRecord,
+    LlmClient, LlmOpts, PageRequest, Result, StateScope, ValidityRecord,
 };
 use agent_context_db_knowledge_network::identity::IdentityRegistry;
 use agent_context_db_marketplace::{
@@ -139,8 +140,8 @@ impl PublishableProduct for ConsolidationProduct {
         self.epistemic_type
     }
 
-    fn half_life_days(&self) -> Option<f64> {
-        self.metadata.half_life_days
+    fn half_life(&self) -> Option<agent_context_db_core::HalfLife> {
+        self.metadata.half_life
     }
 }
 
@@ -161,7 +162,7 @@ pub struct ConsolidationProductMeta {
     pub patch_count: usize,
     pub lineage: Vec<LineageEntry>,
     pub validity: Option<ValidityRecord>,
-    pub half_life_days: Option<f64>,
+    pub half_life: Option<agent_context_db_core::HalfLife>,
 }
 
 // ===========================================================================
@@ -181,6 +182,12 @@ pub enum ResolveAction {
 pub struct MemoryResolver {
     /// 领域饱和度阈值：同领域条目超此数 → 倾向 NOOP
     domain_saturation_threshold: usize,
+}
+
+impl Default for MemoryResolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryResolver {
@@ -232,6 +239,7 @@ impl MemoryResolver {
             if product.content_type == ContentType::Fact && product.evidence_uris.is_empty() {
                 return ResolveAction::Noop; // Fact 无证据 → 拒绝
             }
+
             return ResolveAction::Add;
         }
 
@@ -243,8 +251,10 @@ impl MemoryResolver {
                 if info_gain > 0.1 {
                     return ResolveAction::Update;
                 }
+
                 return ResolveAction::Noop; // 增益不足
             }
+
             return ResolveAction::Add; // 无已有条目
         }
 
@@ -258,6 +268,12 @@ impl MemoryResolver {
 
 /// 认识论分类器 — 基于内容特征判断 knowledge type。
 pub struct EpistemicTyper;
+
+impl Default for EpistemicTyper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl EpistemicTyper {
     pub fn new() -> Self {
@@ -287,6 +303,12 @@ pub struct BlindSpot {
     pub pattern: String,
     pub missing_count: usize,
     pub severity: f32,
+}
+
+impl Default for IgnoranceMap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IgnoranceMap {
@@ -344,6 +366,12 @@ pub struct ConfidenceCalibrator {
         parking_lot::RwLock<std::collections::HashMap<EpistemicType, CalibrationRecord>>,
 }
 
+impl Default for ConfidenceCalibrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfidenceCalibrator {
     pub fn new() -> Self {
         Self {
@@ -358,6 +386,7 @@ impl ConfidenceCalibrator {
             if record.temperature <= 0.0 || declared <= 0.0 || declared >= 1.0 {
                 return declared;
             }
+
             let logit = ((declared as f64) / (1.0 - declared as f64)).ln();
             let calibrated = (logit / record.temperature).sigmoid();
             calibrated as f32
@@ -376,7 +405,7 @@ impl ConfidenceCalibrator {
             .push(if adopted { 1.0 } else { 0.0 });
 
         // 每 10 个数据点重新拟合温度
-        if record.declared_confidences.len() % 10 == 0 {
+        if record.declared_confidences.len().is_multiple_of(10) {
             record.temperature = Self::fit_temperature(record);
         }
     }
@@ -386,6 +415,7 @@ impl ConfidenceCalibrator {
         if record.declared_confidences.len() < 5 {
             return 1.0;
         }
+
         let n = record
             .declared_confidences
             .len()
@@ -398,8 +428,12 @@ impl ConfidenceCalibrator {
             if declared > 0.0 && declared < 1.0 {
                 // ratio = logit(actual) / logit(declared)
                 // temperature = 1/ratio
-                let actual_logit =
-                    (actual.max(0.01).min(0.99) / (1.0 - actual.max(0.01).min(0.99))).ln();
+                let bounded_actual = if actual.is_nan() {
+                    actual
+                } else {
+                    actual.clamp(0.01, 0.99)
+                };
+                let actual_logit = (bounded_actual / (1.0 - bounded_actual)).ln();
                 let declared_logit = (declared / (1.0 - declared)).ln();
                 if declared_logit != 0.0 {
                     sum_ratio += actual_logit / declared_logit;
@@ -407,6 +441,7 @@ impl ConfidenceCalibrator {
                 }
             }
         }
+
         if count > 0 {
             let avg_ratio = sum_ratio / count as f64;
             (1.0 / avg_ratio).clamp(0.5, 3.0) // 限制在合理范围
@@ -532,6 +567,7 @@ impl ConsolidationEngine {
         if current.metadata.status != ConsolidationStatus::Converged {
             current.metadata.status = ConsolidationStatus::Stale;
         }
+
         current.metadata.patch_count = current.metadata.generation as usize;
         Ok(current)
     }
@@ -548,7 +584,11 @@ impl ConsolidationEngine {
 
 Memory content: "{content}"
 Content type: {ct:?}
+
+
 Epistemic type: {et:?}
+
+
 
 Produce a concise, self-contained principle that captures the key knowledge.
 Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup)."#
@@ -593,7 +633,7 @@ Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup).
                 patch_count: 0,
                 lineage: vec![],
                 validity: entry.metadata.validity.clone(),
-                half_life_days: None,
+                half_life: None,
             },
         }
     }
@@ -608,7 +648,11 @@ Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup).
 
 Content: "{}"
 Type: {:?}
+
+
 Epistemic type: {:?}
+
+
 
 Score the insight on these dimensions (0.0-1.0):
 - Clarity: Is it self-contained and understandable?
@@ -654,6 +698,7 @@ Return a JSON object with:
                     None => deterministic_critique(product, entry),
                 }
             }
+
             Err(_) => deterministic_critique(product, entry),
         }
     }
@@ -675,6 +720,8 @@ Return a JSON object with:
 Insight: "{}"
 Suggestions: {:?}
 
+
+
 Return ONLY the revised insight text (no JSON, no markup)."#,
                 product.content, critique.suggestions
             );
@@ -693,8 +740,10 @@ Return ONLY the revised insight text (no JSON, no markup)."#,
             {
                 revised.content = response.trim().to_string();
             }
+
             revised.metadata.status = ConsolidationStatus::InProgress;
         }
+
         revised
     }
 
@@ -707,6 +756,7 @@ Return ONLY the revised insight text (no JSON, no markup)."#,
         for entry in entries {
             products.push(self.consolidate(entry).await?);
         }
+
         Ok(products)
     }
 }
@@ -746,9 +796,19 @@ fn deterministic_critique(product: &ConsolidationProduct, entry: &ContextEntry) 
     };
 
     let evidence = evidence_score(product, entry);
-    let validity = validity_score(product.metadata.validity.as_ref().or(entry.metadata.validity.as_ref()));
+    let validity = validity_score(
+        product
+            .metadata
+            .validity
+            .as_ref()
+            .or(entry.metadata.validity.as_ref()),
+    );
     let type_fit = type_fit_score(product, entry, word_count);
-    let provenance = if product.provenance.is_some() { 0.95 } else { 0.55 };
+    let provenance = if product.provenance.is_some() {
+        0.95
+    } else {
+        0.55
+    };
     let contradiction_penalty = if product.contradiction_uris.is_empty() {
         0.0
     } else {
@@ -774,12 +834,12 @@ fn deterministic_critique(product: &ConsolidationProduct, entry: &ContextEntry) 
                 .is_some_and(|meta| !meta.evidence_uris.is_empty()),
         product.metadata.validity.is_some() || entry.metadata.validity.is_some(),
         product.provenance.is_some(),
-        product.metadata.half_life_days.is_some()
+        product.metadata.half_life.is_some()
             || entry
                 .metadata
                 .consolidation
                 .as_ref()
-                .and_then(|meta| meta.half_life_days)
+                .and_then(|meta| meta.half_life)
                 .is_some(),
     ]
     .into_iter()
@@ -793,15 +853,19 @@ fn deterministic_critique(product: &ConsolidationProduct, entry: &ContextEntry) 
     if char_count < 24 {
         suggestions.push("expand the insight into a self-contained statement".into());
     }
+
     if repeated_ratio > 0.25 {
         suggestions.push("remove repeated wording before consolidation".into());
     }
+
     if product.content_type == ContentType::Fact && evidence < 0.45 {
         suggestions.push("attach evidence before treating this as a factual memory".into());
     }
+
     if validity < 0.45 {
         suggestions.push("revalidate or mark the claim as uncertain".into());
     }
+
     if !product.contradiction_uris.is_empty() {
         suggestions.push("resolve linked contradictions before promotion".into());
     }
@@ -826,19 +890,26 @@ fn validity_score(validity: Option<&ValidityRecord>) -> f32 {
     let Some(validity) = validity else {
         return 0.55;
     };
-    if validity.valid_until.is_some_and(|valid_until| valid_until < Utc::now()) {
+    if validity
+        .valid_until
+        .is_some_and(|valid_until| valid_until < Utc::now())
+    {
         return 0.20;
     }
+
     let mut score: f32 = 0.72;
     if validity.valid_from > Utc::now() {
         score -= 0.18;
     }
+
     if validity.invalidated_by.is_some() {
         score -= 0.25;
     }
+
     if validity.invalidation_reason.is_some() {
         score -= 0.12;
     }
+
     score.clamp(0.0, 1.0)
 }
 
@@ -858,36 +929,53 @@ fn type_fit_score(product: &ConsolidationProduct, entry: &ContextEntry, word_cou
                 0.82
             }
         }
+
         ContentType::Hypothesis => {
             if product.hypothesis_outcome == Some(HypothesisOutcome::Falsified) {
                 0.35
-            } else if content.contains("if") || content.contains("may") || content.contains("可能") {
+            } else if content.contains("if") || content.contains("may") || content.contains("可能")
+            {
                 0.80
             } else {
                 0.62
             }
         }
+
         ContentType::Procedure => {
-            if content.contains("step") || content.contains("then") || content.contains("when") || content.contains("先") {
+            if content.contains("step")
+                || content.contains("then")
+                || content.contains("when")
+                || content.contains("先")
+            {
                 0.82
             } else {
                 0.58
             }
         }
+
         ContentType::Error => {
-            if product.error_pattern.is_some() || content.contains("error") || content.contains("failure") {
+            if product.error_pattern.is_some()
+                || content.contains("error")
+                || content.contains("failure")
+            {
                 0.82
             } else {
                 0.52
             }
         }
+
         ContentType::Heuristic => {
-            if content.contains("when") || content.contains("prefer") || content.contains("should") || content.contains("如果") {
+            if content.contains("when")
+                || content.contains("prefer")
+                || content.contains("should")
+                || content.contains("如果")
+            {
                 0.80
             } else {
                 0.62
             }
         }
+
         _ => 0.68,
     };
     let density = if word_count == 0 {
@@ -917,6 +1005,7 @@ fn repeated_token_ratio(content: &str) -> f32 {
     if tokens.len() < 2 {
         return 0.0;
     }
+
     let unique = tokens
         .iter()
         .collect::<std::collections::HashSet<_>>()
@@ -935,6 +1024,12 @@ fn repeated_token_ratio(content: &str) -> f32 {
 /// - `valid_until` → None=当前有效，Some=已失效（Zep 软失效）
 /// - 失效传播：invalidate 一个晶体后，其关联后代应标记受影响
 pub struct DualTimeline;
+
+impl Default for DualTimeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DualTimeline {
     pub fn new() -> Self {
@@ -975,7 +1070,7 @@ impl DualTimeline {
     /// 检查条目在指定时间点是否有效。
     pub fn is_valid(meta: &agent_context_db_core::ContextMeta, at: DateTime<Utc>) -> bool {
         match &meta.validity {
-            Some(v) => at >= v.valid_from && v.valid_until.map_or(true, |until| at <= until),
+            Some(v) => at >= v.valid_from && v.valid_until.is_none_or(|until| at <= until),
             None => true, // 无记录默认有效
         }
     }
@@ -992,13 +1087,14 @@ impl DualTimeline {
             if meta
                 .validity
                 .as_ref()
-                .map_or(true, |v| v.valid_until.is_none())
+                .is_none_or(|v| v.valid_until.is_none())
             {
                 let reason = format!("parent {} was invalidated", parent_uri);
                 Self::invalidate(meta, parent_uri, &reason);
                 propagated += 1;
             }
         }
+
         propagated
     }
 }
@@ -1020,6 +1116,12 @@ pub struct BackwardEvolver {
     similarity_threshold: f32,
     /// 关系图存储（可选）。注入后启用图边扩展。
     graph: Option<Arc<dyn agent_context_db_core::GraphStore>>,
+}
+
+impl Default for BackwardEvolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BackwardEvolver {
@@ -1098,6 +1200,7 @@ impl BackwardEvolver {
             if !affected_uris.contains(&entry.uri) {
                 continue;
             }
+
             let similarity_note = if self.graph.is_some() {
                 format!("backward-evolved from {} (jaccard+graph)", new_product.uri)
             } else {
@@ -1119,10 +1222,11 @@ impl BackwardEvolver {
                     lineage: vec![lineage_entry],
                     evidence_uris: vec![],
                     corroboration: 0,
-                    half_life_days: None,
+                    half_life: None,
                     entangled_with: vec![],
                 });
             }
+
             updated += 1;
         }
 
@@ -1153,24 +1257,102 @@ pub enum SleeptimeTask {
     CuriosityExploration,
 }
 
-/// Sleeptime 执行器 — 空闲时执行后台整理，支持从存储加载数据。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SleeptimeProgress {
+    pub cursor: Option<ContextUri>,
+    pub watermark: Option<ContextUri>,
+    pub attempt: u32,
+    pub last_error: Option<String>,
+}
+
+#[async_trait::async_trait]
+pub trait ProgressStore: Send + Sync {
+    async fn load(&self, key: &str) -> Result<Option<SleeptimeProgress>>;
+    async fn save(&self, key: &str, progress: &SleeptimeProgress) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EntrySignals {
+    pub adoption_rate: Option<f32>,
+    pub recall_rate: Option<f32>,
+    pub downstream_success_rate: Option<f32>,
+    pub contradiction_count: Option<u32>,
+    pub corroboration_count: Option<u32>,
+    pub repeated_observations: Option<u32>,
+    pub tenant_priority: Option<f32>,
+}
+
+#[async_trait::async_trait]
+pub trait SignalProvider: Send + Sync {
+    async fn signals(&self, uri: &ContextUri) -> Result<EntrySignals>;
+}
+
+/// Sleeptime 执行器。构造时绑定 tenant/agent 根 scope，运行时拒绝越界目标。
 pub struct SleeptimeExecutor {
     pub tasks: Vec<SleeptimeTask>,
     pub interval: std::time::Duration,
     checker: ConsistencyChecker,
     /// 纠缠检测器 —— EntanglementDetection 任务的实际执行者。
     entanglement: crate::entanglement::EntanglementDetector,
-    /// 可选的存储读取器（Sleeptime 加载条目用）。
-    store: Option<Arc<dyn agent_context_db_core::ContentStore>>,
-    /// 可选的关系图存储（BackwardEvolve 用于图边扩展）。
-    graph: Option<Arc<dyn agent_context_db_core::GraphStore>>,
+    root_scope: ContextUri,
+    batch_limit: usize,
+    store: Arc<dyn agent_context_db_core::ContentStore>,
+    progress: Arc<dyn ProgressStore>,
+    signals: Arc<dyn SignalProvider>,
+    graph: Arc<dyn agent_context_db_core::GraphStore>,
     /// 可选的向量索引 —— `on_adopted()` 触发 RIF 抑制时使用。
     vector_index: Option<Arc<dyn agent_context_db_core::VectorIndex>>,
+    lifecycle_executor: Option<Arc<dyn LifecycleExecutorPort>>,
+}
+
+#[async_trait::async_trait]
+pub trait LifecycleExecutorPort: Send + Sync {
+    async fn run_pending(&self) -> Vec<crate::lifecycle_execution::LifecycleJob>;
+    async fn submit(
+        &self,
+        uri: ContextUri,
+        action: agent_context_db_core::LifecycleAction,
+    ) -> Result<crate::lifecycle_execution::LifecycleJob>;
+}
+
+#[async_trait::async_trait]
+impl LifecycleExecutorPort for crate::lifecycle_execution::LifecycleActionExecutor {
+    async fn run_pending(&self) -> Vec<crate::lifecycle_execution::LifecycleJob> {
+        self.run_pending().await
+    }
+
+    async fn submit(
+        &self,
+        uri: ContextUri,
+        action: agent_context_db_core::LifecycleAction,
+    ) -> Result<crate::lifecycle_execution::LifecycleJob> {
+        self.submit(uri, action).await
+    }
 }
 
 impl SleeptimeExecutor {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(
+        root_scope: ContextUri,
+        store: Arc<dyn agent_context_db_core::ContentStore>,
+        graph: Arc<dyn agent_context_db_core::GraphStore>,
+        progress: Arc<dyn ProgressStore>,
+        signals: Arc<dyn SignalProvider>,
+        batch_limit: usize,
+    ) -> Result<Self> {
+        let segments = root_scope.segments();
+        if segments.len() != 3 || segments.get(1).map(String::as_str) != Some("agent") {
+            return Err(agent_context_db_core::ContextError::InvalidUri(
+                "sleeptime root must be uwu://<tenant>/agent/<agent>".into(),
+            ));
+        }
+
+        if batch_limit == 0 {
+            return Err(agent_context_db_core::ContextError::InvalidUri(
+                "sleeptime batch_limit must be positive".into(),
+            ));
+        }
+
+        Ok(Self {
             tasks: vec![
                 SleeptimeTask::QualityReassessment,
                 SleeptimeTask::ConsistencyCheck,
@@ -1190,27 +1372,26 @@ impl SleeptimeExecutor {
             interval: std::time::Duration::from_secs(3600),
             checker: ConsistencyChecker::new(),
             entanglement: crate::entanglement::EntanglementDetector::new(0.3),
-            store: None,
-            graph: None,
+            root_scope,
+            batch_limit,
+            store,
+            progress,
+            signals,
+            graph,
             vector_index: None,
-        }
-    }
-
-    /// 绑定存储读取器，使 Sleeptime 可以从存储中加载条目。
-    pub fn with_store(mut self, store: Arc<dyn agent_context_db_core::ContentStore>) -> Self {
-        self.store = Some(store);
-        self
-    }
-
-    /// 绑定关系图存储，启用 BackwardEvolve 的图边扩展路径。
-    pub fn with_graph(mut self, graph: Arc<dyn agent_context_db_core::GraphStore>) -> Self {
-        self.graph = Some(graph);
-        self
+            lifecycle_executor: None,
+        })
     }
 
     /// 绑定向量索引，启用 `on_adopted()` 的 RIF 邻居抑制路径。
     pub fn with_vector_index(mut self, index: Arc<dyn agent_context_db_core::VectorIndex>) -> Self {
         self.vector_index = Some(index);
+        self
+    }
+
+    /// 绑定持久生命周期执行器；Sleeptime 会先恢复未完成任务，再执行本轮决策。
+    pub fn with_lifecycle_executor(mut self, executor: Arc<dyn LifecycleExecutorPort>) -> Self {
+        self.lifecycle_executor = Some(executor);
         self
     }
 
@@ -1253,6 +1434,7 @@ impl SleeptimeExecutor {
                 .calibrator
                 .update(adopted.epistemic_type, adopted.confidence, false);
         }
+
         suppressed
     }
 
@@ -1261,28 +1443,96 @@ impl SleeptimeExecutor {
         &self,
         engine: &ConsolidationEngine,
         scope: &ContextUri,
-    ) -> SleeptimeReport {
-        let mut report = SleeptimeReport::default();
+    ) -> Result<SleeptimeReport> {
+        let root = self.root_scope.to_string();
+        let target = scope.to_string();
+        if target != root && !target.starts_with(&format!("{root}/")) {
+            return Err(agent_context_db_core::ContextError::PermissionDenied(
+                format!("sleeptime scope {target} is outside bound root {root}"),
+            ));
+        }
 
-        // 从存储中加载 scope 下的条目
-        let entries: Vec<ContextEntry> = if let Some(ref store) = self.store {
-            store
-                .scan_by_prefix(&scope.to_string(), 100)
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
+        let progress_key = format!("sleeptime:{target}");
+        let mut state = self.progress.load(&progress_key).await?.unwrap_or_default();
+        state.attempt = state.attempt.saturating_add(1);
+        let page_request = state.cursor.as_ref().map_or_else(
+            || PageRequest::new(self.batch_limit),
+            |cursor| PageRequest::new(self.batch_limit).after(cursor.to_string()),
+        );
+        let scanned = match self.store.scan_by_prefix(&target, page_request).await {
+            Ok(page) => page.items,
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                self.progress.save(&progress_key, &state).await?;
+                return Err(error);
+            }
         };
+        let entries: Vec<ContextEntry> = scanned
+            .into_iter()
+            .filter(|entry| {
+                state
+                    .cursor
+                    .as_ref()
+                    .is_none_or(|cursor| entry.uri > *cursor)
+            })
+            .filter(|entry| {
+                state
+                    .watermark
+                    .as_ref()
+                    .is_none_or(|watermark| entry.uri <= *watermark)
+            })
+            .take(self.batch_limit)
+            .collect();
+        if entries.is_empty() && state.cursor.is_some() {
+            state.cursor = None;
+            state.watermark = None;
+            state.attempt = 0;
+        }
+
+        let mut report = SleeptimeReport::default();
+        if !entries.is_empty() {
+            let mut known = 0usize;
+            const SIGNALS_PER_ENTRY: usize = 8;
+            for entry in &entries {
+                self.graph.centrality(&entry.uri).await?;
+                known += 1;
+                let observed = self.signals.signals(&entry.uri).await?;
+                known += [
+                    observed.adoption_rate.is_some(),
+                    observed.recall_rate.is_some(),
+                    observed.downstream_success_rate.is_some(),
+                    observed.contradiction_count.is_some(),
+                    observed.corroboration_count.is_some(),
+                    observed.repeated_observations.is_some(),
+                    observed.tenant_priority.is_some(),
+                ]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+            }
+
+            report.signal_completeness = known as f32 / (entries.len() * SIGNALS_PER_ENTRY) as f32;
+        }
+
+        if let Some(executor) = &self.lifecycle_executor {
+            let recovered = executor.run_pending().await;
+            report.lifecycle_succeeded += recovered
+                .iter()
+                .filter(|j| {
+                    matches!(
+                        j.state,
+                        crate::lifecycle_execution::LifecycleJobState::Succeeded
+                    )
+                })
+                .count();
+            report.lifecycle_failed += recovered.len().saturating_sub(report.lifecycle_succeeded);
+        }
 
         for task in &self.tasks {
             match task {
                 SleeptimeTask::QualityReassessment => {
                     let scorer = HorizonAwareQualityScorer::default();
-                    let Some(store) = self.store.as_ref() else {
-                        tracing::info!(scope=%scope, count=%entries.len(), "sleeptime: quality reassessment skipped without store");
-                        report.tasks_executed += 1;
-                        continue;
-                    };
+                    let store = &self.store;
 
                     let mut reassessed = 0usize;
                     let mut promoted_mid = 0usize;
@@ -1291,21 +1541,17 @@ impl SleeptimeExecutor {
                     let mut training_candidates = 0usize;
 
                     for entry in &entries {
+                        let observed = self.signals.signals(&entry.uri).await?;
                         let signals = HorizonQualitySignals {
-                            adoption_rate: entry
-                                .metadata
-                                .quality_score
-                                .unwrap_or(0.5)
-                                .clamp(0.0, 1.0),
-                            recall_rate: entry
-                                .metadata
-                                .quality_score
-                                .unwrap_or(0.5)
-                                .clamp(0.0, 1.0),
-                            downstream_success_rate: 0.5,
-                            contradiction_count: 0,
-                            corroboration_count: 0,
-                            repeated_observations: 1,
+                            adoption_rate: observed.adoption_rate.unwrap_or(0.0),
+                            recall_rate: observed.recall_rate.unwrap_or(0.0),
+                            downstream_success_rate: observed
+                                .downstream_success_rate
+                                .unwrap_or(0.0),
+                            contradiction_count: observed.contradiction_count.unwrap_or(0) as usize,
+                            corroboration_count: observed.corroboration_count.unwrap_or(0) as usize,
+                            repeated_observations: observed.repeated_observations.unwrap_or(0)
+                                as usize,
                             user_confirmed: false,
                             user_corrected: false,
                             retrieval_ignored_rate: 0.0,
@@ -1324,6 +1570,7 @@ impl SleeptimeExecutor {
                                 updated.metadata.state_scope = Some(StateScope::Mid);
                                 promoted_mid += 1;
                             }
+
                             QualityRoute::PromoteToLongTerm | QualityRoute::IncludeInTraining => {
                                 updated.metadata.state_scope = Some(StateScope::Long);
                                 promoted_long += 1;
@@ -1331,6 +1578,7 @@ impl SleeptimeExecutor {
                                     training_candidates += 1;
                                 }
                             }
+
                             QualityRoute::Archive
                             | QualityRoute::ForgetCandidate
                             | QualityRoute::ForgetShortTerm => {
@@ -1339,21 +1587,38 @@ impl SleeptimeExecutor {
                                     .tags
                                     .push("quality:archive-candidate".into());
                                 archived += 1;
+                                if let Some(executor) = &self.lifecycle_executor {
+                                    match executor
+                                        .submit(
+                                            entry.uri.clone(),
+                                            agent_context_db_core::LifecycleAction::Archive,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => report.lifecycle_submitted += 1,
+                                        Err(_) => report.lifecycle_failed += 1,
+                                    }
+                                }
                             }
+
                             QualityRoute::Rehearse => {
                                 updated.metadata.tags.push("quality:rehearse".into());
                             }
+
                             QualityRoute::Revalidate => {
                                 updated.metadata.tags.push("quality:revalidate".into());
                             }
+
                             QualityRoute::ExcludeFromTraining => {
                                 updated
                                     .metadata
                                     .tags
                                     .push("quality:exclude-training".into());
                             }
+
                             _ => {}
                         }
+
                         if store.write(updated).await.is_ok() {
                             reassessed += 1;
                         }
@@ -1397,7 +1662,7 @@ impl SleeptimeExecutor {
                                 patch_count: 0,
                                 lineage: vec![],
                                 validity: e.metadata.validity.clone(),
-                                half_life_days: None,
+                                half_life: None,
                             },
                         })
                         .collect();
@@ -1405,6 +1670,7 @@ impl SleeptimeExecutor {
                     report.contradictions_found = violations.len();
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::EntanglementDetection => {
                     // 应用衰减，让长期不再共现的纠缠自然消退
                     self.entanglement.decay(0.05);
@@ -1416,17 +1682,20 @@ impl SleeptimeExecutor {
                     report.entanglements_detected = count;
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::IgnoranceMapUpdate => {
                     let spots = engine.ignorance.top_blind_spots(10);
                     report.blind_spots_updated = spots.len();
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::CalibrationUpdate => {
                     // 校准器只接受真实采纳/抑制反馈；批量巡检不能用 quality_score 反推标签。
                     // 真实反馈由 `on_adopted` 写入，避免把模型自评分训练成“采纳事实”。
                     report.calibration_samples = engine.calibrator.total_labeled_samples();
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::ContextRotPrune => {
                     let pruned = entries
                         .iter()
@@ -1435,6 +1704,7 @@ impl SleeptimeExecutor {
                     report.pruned = pruned;
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::BackwardEvolve => {
                     let products: Vec<ConsolidationProduct> = entries
                         .iter()
@@ -1464,25 +1734,26 @@ impl SleeptimeExecutor {
                                 patch_count: 0,
                                 lineage: vec![],
                                 validity: e.metadata.validity.clone(),
-                                half_life_days: None,
+                                half_life: None,
                             },
                         })
                         .collect();
                     if let Some(last) = products.last() {
                         let mut evolver = BackwardEvolver::new();
-                        if let Some(ref g) = self.graph {
-                            evolver = evolver.with_graph(g.clone());
-                        }
+                        evolver = evolver.with_graph(self.graph.clone());
                         let mut mutable = entries.clone();
                         let _updated = evolver.evolve_backward(last, &mut mutable).await;
                     }
+
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::SpacedRepetitionReview => {
                     let scheduler = SpacedRepetitionScheduler::default();
                     let tasks = scheduler.plan(&entries, Utc::now());
                     report.review_tasks = tasks.len();
-                    if let Some(store) = self.store.as_ref() {
+                    {
+                        let store = &self.store;
                         let by_uri = tasks
                             .iter()
                             .map(|task| (task.uri.clone(), task))
@@ -1506,8 +1777,10 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::CascadeInvalidation => {
                     let invalidated = entries
                         .iter()
@@ -1528,10 +1801,9 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     let mut invalidator = crate::entanglement::CascadeInvalidator::new(detector);
-                    if let Some(graph) = &self.graph {
-                        invalidator = invalidator.with_graph(graph.clone());
-                    }
+                    invalidator = invalidator.with_graph(self.graph.clone());
                     let mut mutable = entries.clone();
                     for entry in invalidated {
                         let plan = invalidator.plan_from_invalidated(&entry.uri).await;
@@ -1557,7 +1829,9 @@ impl SleeptimeExecutor {
                             .count();
                         invalidator.apply_to_entries(&mut mutable, &plan);
                     }
-                    if let Some(store) = self.store.as_ref() {
+
+                    {
+                        let store = &self.store;
                         for updated in mutable {
                             if updated
                                 .metadata
@@ -1569,19 +1843,20 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::KnowledgeHealthDiagnosis => {
                     let mut diagnostician = KnowledgeHealthDiagnostician::default();
-                    if let Some(graph) = &self.graph {
-                        diagnostician = diagnostician.with_graph(graph.clone());
-                    }
+                    diagnostician = diagnostician.with_graph(self.graph.clone());
                     let report_health = diagnostician.diagnose(&entries, Utc::now()).await;
                     report.health_issues = report_health.issues.len();
                     let mut mutable = entries.clone();
                     report.health_repairs_written =
                         diagnostician.apply_repairs(&mut mutable, &report_health);
-                    if let Some(store) = self.store.as_ref() {
+                    {
+                        let store = &self.store;
                         for updated in mutable {
                             if updated
                                 .metadata
@@ -1593,8 +1868,10 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::ActiveConsistencyGuard => {
                     let guardian = ActiveConsistencyGuardian::default();
                     let plan = guardian.plan(&entries, Utc::now());
@@ -1602,7 +1879,8 @@ impl SleeptimeExecutor {
                     let mut mutable = entries.clone();
                     report.consistency_guard_repairs =
                         guardian.apply(&mut mutable, &plan, Utc::now());
-                    if let Some(store) = self.store.as_ref() {
+                    {
+                        let store = &self.store;
                         for updated in mutable {
                             if updated.metadata.tags.iter().any(|tag| {
                                 tag.starts_with("consistency:")
@@ -1614,8 +1892,10 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::ActiveLearningLoop => {
                     let active_learning = ActiveLearningLoop::default();
                     let tasks = active_learning.plan(&entries, Utc::now());
@@ -1623,7 +1903,8 @@ impl SleeptimeExecutor {
                     let mut mutable = entries.clone();
                     report.active_learning_tasks_written =
                         active_learning.apply_tasks(&mut mutable, &tasks);
-                    if let Some(store) = self.store.as_ref() {
+                    {
+                        let store = &self.store;
                         for updated in mutable {
                             if updated
                                 .metadata
@@ -1635,8 +1916,10 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::EmbeddingDriftDetection => {
                     let monitor = EmbeddingDriftMonitor::default();
                     let drift = monitor.analyze(&entries, Utc::now());
@@ -1645,7 +1928,8 @@ impl SleeptimeExecutor {
                         drift.psi.max(drift.centroid_shift).max(drift.norm_kl);
                     let mut mutable = entries.clone();
                     report.embedding_drift_updates = monitor.apply(&mut mutable, &drift);
-                    if let Some(store) = self.store.as_ref() {
+                    {
+                        let store = &self.store;
                         for updated in mutable {
                             if updated
                                 .metadata
@@ -1657,15 +1941,18 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     report.tasks_executed += 1;
                 }
+
                 SleeptimeTask::CuriosityExploration => {
                     let explorer = CuriosityExplorer::default();
                     let tasks = explorer.plan(&entries, Utc::now());
                     report.curiosity_tasks = tasks.len();
                     let mut mutable = entries.clone();
                     report.curiosity_tasks_written = explorer.apply_tasks(&mut mutable, &tasks);
-                    if let Some(store) = self.store.as_ref() {
+                    {
+                        let store = &self.store;
                         for updated in mutable {
                             if updated
                                 .metadata
@@ -1677,17 +1964,62 @@ impl SleeptimeExecutor {
                             }
                         }
                     }
+
                     report.tasks_executed += 1;
                 }
             }
         }
-        report
+
+        if let Some(executor) = &self.lifecycle_executor {
+            let completed = executor.run_pending().await;
+            report.lifecycle_succeeded += completed
+                .iter()
+                .filter(|j| {
+                    matches!(
+                        j.state,
+                        crate::lifecycle_execution::LifecycleJobState::Succeeded
+                    )
+                })
+                .count();
+            report.lifecycle_failed += completed.len().saturating_sub(
+                completed
+                    .iter()
+                    .filter(|j| {
+                        matches!(
+                            j.state,
+                            crate::lifecycle_execution::LifecycleJobState::Succeeded
+                        )
+                    })
+                    .count(),
+            );
+        }
+
+        if let Some(last) = entries.last() {
+            state.cursor = Some(last.uri.clone());
+        }
+
+        state.last_error = None;
+        self.progress.save(&progress_key, &state).await?;
+        report.cursor = state.cursor.clone();
+        report.watermark = state.watermark.clone();
+        report.attempt = state.attempt;
+        report.completeness = if entries.len() < self.batch_limit {
+            1.0
+        } else {
+            0.0
+        };
+        Ok(report)
     }
 }
 
 /// Sleeptime 报告。
 #[derive(Debug, Clone, Default)]
 pub struct SleeptimeReport {
+    pub cursor: Option<ContextUri>,
+    pub watermark: Option<ContextUri>,
+    pub attempt: u32,
+    pub completeness: f32,
+    pub signal_completeness: f32,
     pub tasks_executed: usize,
     pub contradictions_found: usize,
     pub entanglements_detected: usize,
@@ -1714,6 +2046,9 @@ pub struct SleeptimeReport {
     pub embedding_drift_updates: usize,
     pub curiosity_tasks: usize,
     pub curiosity_tasks_written: usize,
+    pub lifecycle_submitted: usize,
+    pub lifecycle_succeeded: usize,
+    pub lifecycle_failed: usize,
 }
 
 // ===========================================================================
@@ -1744,6 +2079,12 @@ pub struct ConstraintViolation {
     pub uri: ContextUri,
     pub constraint: Constraint,
     pub description: String,
+}
+
+impl Default for ConsistencyChecker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConsistencyChecker {
@@ -1895,6 +2236,310 @@ impl ConsistencyChecker {
                 }
             }
         }
+
         violations
+    }
+}
+
+#[cfg(test)]
+mod sleeptime_tests {
+    use super::*;
+    use agent_context_db_core::{
+        ContentLevel, ContentPayload, ContentStore, ContextError, GraphRelation, GraphStore,
+        JsonSchema, LlmError, MvccVersion, Page, TenantId,
+    };
+    use agent_context_db_testkit::MemoryContextStore;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct MemoryProgress(Mutex<HashMap<String, SleeptimeProgress>>);
+    #[async_trait]
+    impl ProgressStore for MemoryProgress {
+        async fn load(&self, key: &str) -> Result<Option<SleeptimeProgress>> {
+            Ok(self.0.lock().get(key).cloned())
+        }
+        async fn save(&self, key: &str, progress: &SleeptimeProgress) -> Result<()> {
+            self.0.lock().insert(key.into(), progress.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingSignals {
+        calls: AtomicUsize,
+        value: EntrySignals,
+    }
+    #[async_trait]
+    impl SignalProvider for CountingSignals {
+        async fn signals(&self, _: &ContextUri) -> Result<EntrySignals> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.value.clone())
+        }
+    }
+
+    struct CountingGraph {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl GraphStore for CountingGraph {
+        async fn add_edge(&self, _: &ContextUri, _: &ContextUri, _: GraphRelation) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_edge(&self, _: &ContextUri, _: &ContextUri) -> Result<()> {
+            Ok(())
+        }
+        async fn neighbors(
+            &self,
+            _: &ContextUri,
+            _: Option<GraphRelation>,
+        ) -> Result<Vec<ContextUri>> {
+            Ok(vec![])
+        }
+        async fn batch_traverse(
+            &self,
+            _: &[ContextUri],
+            _: &[GraphRelation],
+            _: usize,
+        ) -> Result<Vec<(ContextUri, ContextUri, GraphRelation)>> {
+            Ok(vec![])
+        }
+        async fn centrality(&self, _: &ContextUri) -> Result<f32> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0.8)
+        }
+    }
+
+    struct NoopLlm;
+    #[async_trait]
+    impl LlmClient for NoopLlm {
+        async fn complete(&self, _: &str, _: &LlmOpts) -> std::result::Result<String, LlmError> {
+            Ok("{}".into())
+        }
+        async fn complete_json(
+            &self,
+            _: &str,
+            _: &JsonSchema,
+            _: &LlmOpts,
+        ) -> std::result::Result<String, LlmError> {
+            Ok("{}".into())
+        }
+    }
+
+    fn uri(value: &str) -> ContextUri {
+        ContextUri::parse(value).unwrap()
+    }
+    fn entry(value: &str) -> ContextEntry {
+        ContextEntry::new_text(uri(value), TenantId(Uuid::nil()), "memory")
+    }
+    async fn seeded_store(count: usize) -> Arc<MemoryContextStore> {
+        let store = Arc::new(MemoryContextStore::new());
+        for index in 0..count {
+            ContentStore::write(
+                &*store,
+                entry(&format!("uwu://tenant/agent/a/memories/{index:02}")),
+            )
+            .await
+            .unwrap();
+        }
+        store
+    }
+    fn executor(
+        store: Arc<dyn ContentStore>,
+        progress: Arc<dyn ProgressStore>,
+        signals: Arc<dyn SignalProvider>,
+        graph: Arc<dyn GraphStore>,
+        limit: usize,
+    ) -> SleeptimeExecutor {
+        let mut executor = SleeptimeExecutor::new(
+            uri("uwu://tenant/agent/a"),
+            store,
+            graph,
+            progress,
+            signals,
+            limit,
+        )
+        .unwrap();
+        executor.tasks = vec![];
+        executor
+    }
+    fn engine() -> ConsolidationEngine {
+        ConsolidationEngine::new(Arc::new(NoopLlm))
+    }
+
+    #[tokio::test]
+    async fn rejects_scope_outside_bound_agent() {
+        let store = seeded_store(1).await;
+        let executor = executor(
+            store.clone(),
+            Arc::new(MemoryProgress::default()),
+            Arc::new(CountingSignals::default()),
+            Arc::new(CountingGraph {
+                calls: AtomicUsize::new(0),
+            }),
+            1,
+        );
+        let error = executor
+            .run_once(&engine(), &uri("uwu://tenant/agent/b"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ContextError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn second_batch_is_not_starved_and_restart_resumes_progress() {
+        let store = seeded_store(3).await;
+        let progress = Arc::new(MemoryProgress::default());
+        let signals = Arc::new(CountingSignals::default());
+        let graph = Arc::new(CountingGraph {
+            calls: AtomicUsize::new(0),
+        });
+        let first = executor(
+            store.clone(),
+            progress.clone(),
+            signals.clone(),
+            graph.clone(),
+            2,
+        )
+        .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+        .await
+        .unwrap();
+        assert_eq!(first.cursor, Some(uri("uwu://tenant/agent/a/memories/01")));
+        let second = executor(store, progress, signals, graph, 2)
+            .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+            .await
+            .unwrap();
+        assert_eq!(second.cursor, Some(uri("uwu://tenant/agent/a/memories/02")));
+        assert_eq!(second.completeness, 1.0);
+    }
+
+    struct FailingStore;
+    #[async_trait]
+    impl ContentStore for FailingStore {
+        async fn read(&self, _: &ContextUri, _: ContentLevel) -> Result<ContentPayload> {
+            Err(ContextError::Storage("scan failed".into()))
+        }
+        async fn write(&self, _: ContextEntry) -> Result<MvccVersion> {
+            Err(ContextError::Storage("scan failed".into()))
+        }
+        async fn delete(&self, _: &ContextUri) -> Result<()> {
+            Ok(())
+        }
+        async fn rename(&self, _: &ContextUri, _: &ContextUri) -> Result<()> {
+            Ok(())
+        }
+        async fn batch_write(&self, _: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
+            Ok(vec![])
+        }
+        async fn scan_by_prefix(&self, _: &str, _: PageRequest) -> Result<Page<ContextEntry>> {
+            Err(ContextError::Storage("scan failed".into()))
+        }
+        async fn scan_by_type(
+            &self,
+            _: &str,
+            _: ContentType,
+            _: PageRequest,
+        ) -> Result<Page<ContextEntry>> {
+            Err(ContextError::Storage("scan failed".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_error_is_propagated_and_persisted() {
+        let progress = Arc::new(MemoryProgress::default());
+        let executor = executor(
+            Arc::new(FailingStore),
+            progress.clone(),
+            Arc::new(CountingSignals::default()),
+            Arc::new(CountingGraph {
+                calls: AtomicUsize::new(0),
+            }),
+            2,
+        );
+        let error = executor
+            .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ContextError::Storage(_)));
+        let saved = progress
+            .load("sleeptime:uwu://tenant/agent/a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.last_error.as_deref(), Some("storage: scan failed"));
+        assert_eq!(saved.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_signals_reduce_completeness_and_real_providers_are_called() {
+        let store = seeded_store(1).await;
+        let signals = Arc::new(CountingSignals {
+            calls: AtomicUsize::new(0),
+            value: EntrySignals {
+                downstream_success_rate: Some(0.9),
+                contradiction_count: Some(2),
+                corroboration_count: Some(3),
+                repeated_observations: Some(4),
+                tenant_priority: Some(0.8),
+                ..Default::default()
+            },
+        });
+        let graph = Arc::new(CountingGraph {
+            calls: AtomicUsize::new(0),
+        });
+        let report = executor(
+            store,
+            Arc::new(MemoryProgress::default()),
+            signals.clone(),
+            graph.clone(),
+            2,
+        )
+        .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+        .await
+        .unwrap();
+        assert!(report.signal_completeness < 1.0);
+        assert_eq!(signals.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Default)]
+    struct CountingLifecycle(AtomicUsize);
+    #[async_trait]
+    impl LifecycleExecutorPort for CountingLifecycle {
+        async fn run_pending(&self) -> Vec<crate::lifecycle_execution::LifecycleJob> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        }
+        async fn submit(
+            &self,
+            _: ContextUri,
+            _: agent_context_db_core::LifecycleAction,
+        ) -> Result<crate::lifecycle_execution::LifecycleJob> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_executor_is_wired_before_and_after_run() {
+        let store = seeded_store(0).await;
+        let lifecycle = Arc::new(CountingLifecycle::default());
+        let executor = executor(
+            store,
+            Arc::new(MemoryProgress::default()),
+            Arc::new(CountingSignals::default()),
+            Arc::new(CountingGraph {
+                calls: AtomicUsize::new(0),
+            }),
+            2,
+        )
+        .with_lifecycle_executor(lifecycle.clone());
+        executor
+            .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+            .await
+            .unwrap();
+        assert_eq!(lifecycle.0.load(Ordering::SeqCst), 2);
     }
 }

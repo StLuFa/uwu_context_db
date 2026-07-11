@@ -108,15 +108,13 @@ impl FederatedKnowledgeFabric {
             opts.intent,
             &self.privacy.policy,
         )?;
-        if self.access_grants.has_grants() {
-            self.access_grants.authorize(
-                &self.local_agent,
-                &query.domains,
-                self.privacy.policy.query_epsilon,
-            )?;
-        }
+        self.access_grants.authorize(
+            &self.local_agent,
+            &query.domains,
+            self.privacy.policy.query_epsilon,
+        )?;
 
-        let (sketch, receipt) = self
+        let (sketch, reservation) = self
             .privacy
             .protect_query(&self.local_agent, &query)
             .await?;
@@ -127,7 +125,7 @@ impl FederatedKnowledgeFabric {
         self.semantic_graph
             .boost_candidates(&query.domains, &sketch, &mut candidates);
         if !has_k_anonymity(candidates.len(), &self.privacy.policy) {
-            self.privacy.budget_ledger.refund(&receipt).await?;
+            let receipt = reservation.refund().await?;
             return Ok(ProgressiveMeshResult {
                 phase: MeshResultPhase::PartialFast,
                 hits: Vec::new(),
@@ -191,7 +189,7 @@ impl FederatedKnowledgeFabric {
             }
         }
         if responsive.is_empty() {
-            self.privacy.budget_ledger.refund(&receipt).await?;
+            let receipt = reservation.refund().await?;
             return Ok(ProgressiveMeshResult {
                 phase: MeshResultPhase::PartialFast,
                 hits: Vec::new(),
@@ -243,13 +241,14 @@ impl FederatedKnowledgeFabric {
         } else {
             (hits.len() as f32 / plan.final_top_k.max(1) as f32).clamp(0.0, 1.0)
         };
-        self.privacy.budget_ledger.commit(&receipt).await?;
-        self.persistence
-            .record_budget_receipt(receipt.clone())
-            .await?;
+        // Persist all fallible result state before committing the non-refundable charge.
         for (peer, state) in self.route_learning.snapshot() {
             self.persistence.record_route_state(peer, state).await?;
         }
+        self.persistence
+            .record_budget_receipt(reservation.receipt().clone())
+            .await?;
+        let receipt = reservation.commit().await?;
         Ok(ProgressiveMeshResult {
             phase: MeshResultPhase::PartialFast,
             hits,

@@ -111,13 +111,13 @@ impl CrossAgentDedup {
                         visited.insert(key);
 
                         let sim = VectorSimilarity::cosine(emb_a, emb_b);
-                        if sim >= self.threshold {
-                            if let (Ok(ua), Ok(ub)) = (
+                        if sim >= self.threshold
+                            && let (Ok(ua), Ok(ub)) = (
                                 ContextUri::parse(uri_a.clone()),
                                 ContextUri::parse(uri_b.clone()),
-                            ) {
-                                pairs.push((ua, ub, sim));
-                            }
+                            )
+                        {
+                            pairs.push((ua, ub, sim));
                         }
                     }
                 }

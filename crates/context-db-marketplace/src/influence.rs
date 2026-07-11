@@ -28,6 +28,12 @@ pub struct InfluenceAnalyzer {
     adoptions: parking_lot::RwLock<HashMap<MarketId, Vec<AgentId>>>,
 }
 
+impl Default for InfluenceAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InfluenceAnalyzer {
     pub fn new() -> Self {
         Self {
@@ -74,7 +80,7 @@ impl InfluenceAnalyzer {
         for entry in adoptions.keys() {
             push_unique_market_id(&mut all_entries, *entry);
         }
-        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        all_entries.sort_by_key(|a| a.0);
 
         if all_entries.is_empty() {
             return Vec::new();
@@ -83,13 +89,15 @@ impl InfluenceAnalyzer {
         let n = all_entries.len();
         let n_f = n as f32;
         let damping = 0.85;
-        let mut ranks: HashMap<MarketId, f32> =
-            all_entries.iter().map(|entry| (*entry, 1.0 / n_f)).collect();
+        let mut ranks: HashMap<MarketId, f32> = all_entries
+            .iter()
+            .map(|entry| (*entry, 1.0 / n_f))
+            .collect();
 
         for _ in 0..64 {
             let dangling_mass = all_entries
                 .iter()
-                .filter(|entry| outgoing.get(entry).map_or(true, Vec::is_empty))
+                .filter(|entry| outgoing.get(entry).is_none_or(Vec::is_empty))
                 .map(|entry| ranks.get(entry).copied().unwrap_or(0.0))
                 .sum::<f32>()
                 / n_f;
@@ -104,8 +112,8 @@ impl InfluenceAnalyzer {
                 for citing in inbound {
                     let out_degree = outgoing.get(citing).map(Vec::len).unwrap_or(0);
                     if out_degree > 0 {
-                        rank += damping * ranks.get(citing).copied().unwrap_or(0.0)
-                            / out_degree as f32;
+                        rank +=
+                            damping * ranks.get(citing).copied().unwrap_or(0.0) / out_degree as f32;
                     }
                 }
                 next.insert(*entry, rank);
@@ -139,8 +147,7 @@ impl InfluenceAnalyzer {
                     (citation_count as f32 / (citation_count + 5) as f32).clamp(0.0, 1.0);
                 InfluenceScore {
                     entry_id: *entry,
-                    pagerank: (ranks.get(entry).copied().unwrap_or(0.0) / max_rank)
-                        .clamp(0.0, 1.0),
+                    pagerank: (ranks.get(entry).copied().unwrap_or(0.0) / max_rank).clamp(0.0, 1.0),
                     adoption_count,
                     citation_count,
                     betweenness,

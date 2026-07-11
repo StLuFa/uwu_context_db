@@ -29,10 +29,14 @@ impl AccessGrant {
     }
 
     pub fn allows(&self, subject: &AgentId, domains: &[String], epsilon: f32) -> bool {
-        self.subject == *subject
+        !self.domains.is_empty()
+            && !domains.is_empty()
+            && self.subject == *subject
             && self.expires_at > Utc::now()
+            && epsilon.is_finite()
+            && epsilon >= 0.0
             && epsilon <= self.max_epsilon
-            && (self.domains.is_empty() || domains.iter().all(|d| self.domains.contains(d)))
+            && domains.iter().all(|d| self.domains.contains(d))
     }
 }
 
@@ -50,7 +54,9 @@ impl AccessGrantManager {
 
     pub fn authorize(&self, subject: &AgentId, domains: &[String], epsilon: f32) -> Result<()> {
         if domains.is_empty() {
-            return Ok(());
+            return Err(KnowledgeNetworkError::PolicyDenied(
+                "empty domain scope is not authorized".into(),
+            ));
         }
         let grants = self.grants.read();
         if grants
@@ -63,8 +69,35 @@ impl AccessGrantManager {
             "no active access grant for requested domains".into(),
         ))
     }
+}
 
-    pub fn has_grants(&self) -> bool {
-        !self.grants.read().is_empty()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_configuration_and_empty_domains_are_denied() {
+        let manager = AccessGrantManager::default();
+        let subject = AgentId::new("agent-a");
+        assert!(manager.authorize(&subject, &["rust".into()], 0.1).is_err());
+        assert!(manager.authorize(&subject, &[], 0.1).is_err());
+    }
+
+    #[test]
+    fn grant_requires_explicit_non_empty_domain_scope() {
+        let manager = AccessGrantManager::default();
+        let subject = AgentId::new("agent-a");
+        manager.issue(AccessGrant::new(
+            AgentId::new("issuer"),
+            subject.clone(),
+            vec!["rust".into()],
+            1.0,
+        ));
+        assert!(manager.authorize(&subject, &["rust".into()], 0.5).is_ok());
+        assert!(
+            manager
+                .authorize(&subject, &["public".into()], 0.5)
+                .is_err()
+        );
     }
 }

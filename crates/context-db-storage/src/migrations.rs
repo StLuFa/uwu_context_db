@@ -220,6 +220,85 @@ pub fn context_db_migrations() -> Vec<SqlMigration> {
             "#,
             None::<&str>,
         ),
+        SqlMigration::new(
+            10,
+            "add_current_entry_json",
+            r#"
+            ALTER TABLE context_entries
+                ADD COLUMN IF NOT EXISTS entry_json JSONB;
+
+            UPDATE context_entries AS current
+            SET entry_json = (
+                SELECT versions.entry_json
+                FROM context_versions AS versions
+                WHERE versions.uri = current.uri
+                ORDER BY versions.mvcc_version DESC
+                LIMIT 1
+            )
+            WHERE current.entry_json IS NULL
+              AND EXISTS (
+                SELECT 1 FROM context_versions AS versions
+                WHERE versions.uri = current.uri
+              );
+            "#,
+            None::<&str>,
+        ),
+        SqlMigration::new(
+            11,
+            "create_graph_and_blob_tables",
+            r#"
+            CREATE TABLE IF NOT EXISTS context_relations (
+                from_uri     TEXT NOT NULL,
+                to_uri       TEXT NOT NULL,
+                relation_kind TEXT NOT NULL,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (from_uri, to_uri, relation_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_relations_to
+                ON context_relations (to_uri, relation_kind);
+
+            CREATE TABLE IF NOT EXISTS context_blobs (
+                content_hash TEXT PRIMARY KEY,
+                data         BYTEA NOT NULL,
+                mime_type    TEXT NOT NULL,
+                size         BIGINT NOT NULL CHECK (size >= 0),
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            "#,
+            None::<&str>,
+        ),
+        // HEAD records whether it is attached to a branch. Rewrite and merge operations may only
+        // advance HEAD when that exact branch is attached; detached HEAD must remain independent.
+        SqlMigration::new(
+            12,
+            "attach_version_head_to_branch",
+            r#"
+            ALTER TABLE version_heads
+                ADD COLUMN IF NOT EXISTS attached_branch TEXT;
+            "#,
+            None::<&str>,
+        ),
+        SqlMigration::new(
+            13,
+            "create_context_index_outbox",
+            r#"
+            CREATE TABLE IF NOT EXISTS context_index_outbox (
+                id UUID PRIMARY KEY,
+                mutation_json JSONB NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending','processing','done','failed','dead')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at TIMESTAMPTZ NOT NULL,
+                lease_until TIMESTAMPTZ,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                finished_at TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_index_outbox_ready
+                ON context_index_outbox (status, available_at, created_at);
+            "#,
+            None::<&str>,
+        ),
     ]
 }
 

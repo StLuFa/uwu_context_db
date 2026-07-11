@@ -90,15 +90,15 @@ impl DiscoveryEngine {
 
         // === Tier 3: 联邦查询 ===
         let mut all_results = local;
-        if let Some(federation) = &self.federation {
-            if let Ok(remote) = federation.discover_federated(query.clone(), limit).await {
-                all_results.extend(
-                    remote
-                        .hits
-                        .into_iter()
-                        .map(|hit| market_entry_from_publication(hit.publication)),
-                );
-            }
+        if let Some(federation) = &self.federation
+            && let Ok(remote) = federation.discover_federated(query.clone(), limit).await
+        {
+            all_results.extend(
+                remote
+                    .hits
+                    .into_iter()
+                    .map(|hit| market_entry_from_publication(hit.publication)),
+            );
         }
 
         // 缓存结果
@@ -180,7 +180,7 @@ fn market_entry_from_publication(publication: PublicationMetadata) -> MarketEntr
         },
         epistemic_type: publication.epistemic_type,
         content_type: publication.content_type,
-        half_life_days: publication.half_life_days,
+        half_life: publication.half_life,
         created_at: publication.created_at,
         expires_at: publication.expires_at,
     }

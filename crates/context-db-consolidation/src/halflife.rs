@@ -5,8 +5,8 @@
 
 use crate::quality::QualityRoute;
 use agent_context_db_core::{
-    ConsolidationMeta, ConsolidationStatus, ContentType, ContextEntry, ContextUri, LineageEntry,
-    LlmClient, LlmOpts, MvccVersion, StateScope,
+    ConsolidationMeta, ConsolidationStatus, ContentType, ContextEntry, ContextUri, HalfLife,
+    LineageEntry, LlmClient, LlmOpts, MvccVersion, StateScope,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// 半衰期预测结果。
 #[derive(Debug, Clone)]
 pub struct HalfLifePrediction {
-    pub half_life_days: f64,
+    pub half_life: HalfLife,
     pub confidence: f32,
     pub reasoning: String,
 }
@@ -28,7 +28,7 @@ pub struct HalfLifePredictor {
 
 #[derive(Debug, Deserialize)]
 struct LlmHalfLifeResponse {
-    half_life_days: f64,
+    half_life: HalfLife,
     confidence: f32,
     reasoning: String,
 }
@@ -55,7 +55,7 @@ Consider these factors:
 - Technological context: is this tied to a specific version/era?
 
 Return a JSON object with these fields:
-{{"half_life_days": <number, -1 for near-infinite timeless truths>,
+{{"half_life": {{"kind":"finite","days":<positive number>}} or {{"kind":"infinite"}},
   "confidence": <0.0-1.0>,
   "reasoning": "<one sentence explaining the decision>"}}"#
         );
@@ -70,11 +70,21 @@ Return a JSON object with these fields:
             Ok(response) => {
                 // Try to parse LLM JSON response
                 if let Ok(parsed) = serde_json::from_str::<LlmHalfLifeResponse>(&response) {
-                    return HalfLifePrediction {
-                        half_life_days: parsed.half_life_days.max(1.0),
-                        confidence: parsed.confidence.clamp(0.0, 1.0),
-                        reasoning: parsed.reasoning,
+                    let half_life = match parsed.half_life {
+                        HalfLife::Infinite => Some(HalfLife::Infinite),
+                        HalfLife::Finite { days } => HalfLife::finite(days),
                     };
+                    if let Some(half_life) = half_life {
+                        return HalfLifePrediction {
+                            half_life,
+                            confidence: if parsed.confidence.is_finite() {
+                                parsed.confidence.clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            },
+                            reasoning: parsed.reasoning,
+                        };
+                    }
                 }
                 // Parse failed — use local decay profile
             }
@@ -188,24 +198,34 @@ Return a JSON object with these fields:
         };
 
         HalfLifePrediction {
-            half_life_days,
+            half_life: HalfLife::Finite {
+                days: half_life_days,
+            },
             confidence,
             reasoning,
         }
     }
 
     /// 查找已过半衰期的条目。
-    pub fn find_expired(&self, created_at: DateTime<Utc>, half_life_days: f64) -> bool {
-        Self::is_expired_at(created_at, half_life_days, Utc::now())
+    pub fn find_expired(&self, created_at: DateTime<Utc>, half_life: HalfLife) -> bool {
+        Self::is_expired_at(created_at, half_life, Utc::now())
     }
 
     pub fn is_expired_at(
         created_at: DateTime<Utc>,
-        half_life_days: f64,
+        half_life: HalfLife,
         now: DateTime<Utc>,
     ) -> bool {
-        let age_days = (now - created_at).num_hours().max(0) as f64 / 24.0;
-        age_days > half_life_days.max(0.1)
+        match half_life {
+            HalfLife::Infinite => false,
+            HalfLife::Finite { days } => HalfLife::finite(days).is_none_or(|validated| {
+                let HalfLife::Finite { days } = validated else {
+                    return false;
+                };
+                let age_days = (now - created_at).num_hours().max(0) as f64 / 24.0;
+                age_days > days
+            }),
+        }
     }
 }
 
@@ -346,12 +366,30 @@ impl SpacedRepetitionScheduler {
             return None;
         }
 
+        if matches!(
+            entry
+                .metadata
+                .consolidation
+                .as_ref()
+                .and_then(|meta| meta.half_life),
+            Some(HalfLife::Infinite)
+        ) {
+            return None;
+        }
         let state = review_state(entry).unwrap_or_else(|| ReviewMemoryState {
             half_life_days: entry
                 .metadata
                 .consolidation
                 .as_ref()
-                .and_then(|meta| meta.half_life_days)
+                .and_then(|meta| match meta.half_life {
+                    Some(HalfLife::Finite { days }) => HalfLife::finite(days).and_then(|value| {
+                        let HalfLife::Finite { days } = value else {
+                            return None;
+                        };
+                        Some(days)
+                    }),
+                    Some(HalfLife::Infinite) | None => None,
+                })
                 .unwrap_or(self.config.default_half_life_days),
             stability_days: self.config.default_stability_days,
             reinforcements: 0,
@@ -424,10 +462,10 @@ pub fn upsert_review_state(entry: &mut ContextEntry, state: ReviewMemoryState) {
             lineage: vec![],
             evidence_uris: vec![],
             corroboration: 0,
-            half_life_days: Some(state.half_life_days),
+            half_life: HalfLife::finite(state.half_life_days),
             entangled_with: vec![],
         });
-    meta.half_life_days = Some(state.half_life_days);
+    meta.half_life = HalfLife::finite(state.half_life_days);
     meta.lineage.push(LineageEntry {
         version: MvccVersion(0),
         timestamp: state.last_reviewed_at,
@@ -479,6 +517,37 @@ mod tests {
             },
         );
         entry
+    }
+
+    #[test]
+    fn half_life_validation_handles_non_finite_zero_negative_and_extreme_values() {
+        assert_eq!(HalfLife::finite(f64::NAN), None);
+        assert_eq!(HalfLife::finite(f64::INFINITY), None);
+        assert_eq!(HalfLife::finite(0.0), None);
+        assert_eq!(HalfLife::finite(-1.0), None);
+        assert_eq!(
+            HalfLife::finite(f64::MAX),
+            Some(HalfLife::Finite {
+                days: HalfLife::MAX_FINITE_DAYS
+            })
+        );
+    }
+
+    #[test]
+    fn infinite_half_life_never_expires_or_schedules_review() {
+        let now = Utc::now();
+        assert!(!HalfLifePredictor::is_expired_at(
+            now - Duration::days(1_000_000),
+            HalfLife::Infinite,
+            now,
+        ));
+        let mut entry = long_entry(10_000, 1.0, 0.1);
+        entry.metadata.consolidation.as_mut().unwrap().half_life = Some(HalfLife::Infinite);
+        assert!(
+            SpacedRepetitionScheduler::default()
+                .plan(&[entry], now)
+                .is_empty()
+        );
     }
 
     #[test]

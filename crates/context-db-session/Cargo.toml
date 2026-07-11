@@ -6,9 +6,10 @@ description = "agent-context-db L4 会话层：两阶段 commit SessionCompresso
 
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
+agent-context-db-parse = { path = "../context-db-parse" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 parking_lot = "0.12"
@@ -20,4 +21,4 @@ default = []
 
 [dev-dependencies]
 agent-context-db-testkit = { path = "../context-db-testkit" }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

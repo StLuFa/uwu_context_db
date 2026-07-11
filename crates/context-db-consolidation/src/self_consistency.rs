@@ -17,6 +17,8 @@ use crate::{ConsolidationProduct, ConsolidationProductMeta};
 #[derive(Debug, Clone)]
 pub struct SelfConsistencyConfig {
     pub samples: usize,
+    /// Minimum number of non-empty provider responses required for consensus.
+    pub min_valid_samples: usize,
     pub min_majority_ratio: f32,
     pub similarity_threshold: f32,
     pub base_temperature: f32,
@@ -27,6 +29,7 @@ impl Default for SelfConsistencyConfig {
     fn default() -> Self {
         Self {
             samples: 5,
+            min_valid_samples: 3,
             min_majority_ratio: 0.55,
             similarity_threshold: 0.62,
             base_temperature: 0.75,
@@ -45,7 +48,12 @@ pub struct ConsistencyVoteCluster {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfConsistencyReport {
+    /// Number requested from the provider.
+    pub requested_samples: usize,
+    /// Number of non-empty responses actually returned.
     pub sample_count: usize,
+    /// Fraction of requested samples that produced usable responses.
+    pub completeness: f32,
     pub majority_votes: usize,
     pub majority_ratio: f32,
     pub vote_entropy: f32,
@@ -91,18 +99,24 @@ impl SelfConsistencyConsolidator {
             prompt: PromptOptimization::default().target_tokens(1_200),
             ..Default::default()
         };
+        let requested_samples = prompts.len();
         let samples = match self.llm.batch_complete(&prompts, &opts).await {
             Ok(values) => values
                 .into_iter()
+                .take(requested_samples)
                 .map(|value| normalize_answer(&value))
                 .filter(|value| !value.is_empty())
                 .collect::<Vec<_>>(),
-            Err(_) => vec![content.clone()],
+            // A provider failure is zero evidence. Falling back to the input as
+            // a vote would let one synthetic sample masquerade as consensus.
+            Err(_) => Vec::new(),
         };
         let clusters = cluster_samples(&samples, self.config.similarity_threshold);
         let report = report_from_clusters(
             &clusters,
-            samples.len().max(1),
+            requested_samples,
+            samples.len(),
+            self.config.min_valid_samples,
             self.config.min_majority_ratio,
         );
         let winner = clusters
@@ -110,13 +124,15 @@ impl SelfConsistencyConsolidator {
             .map(|cluster| cluster.representative.clone())
             .unwrap_or(content);
         let majority_ratio = report.majority_ratio;
+        let completeness = report.completeness;
         let calibrated_confidence = if report.accepted {
             (entry.metadata.quality_score.unwrap_or(0.5) * 0.35
                 + majority_ratio * 0.45
                 + (1.0 - report.confidence_variance).clamp(0.0, 1.0) * 0.20)
                 .clamp(0.0, 1.0)
+                * completeness
         } else {
-            (majority_ratio * 0.55).clamp(0.0, 0.55)
+            (majority_ratio * completeness * 0.55).clamp(0.0, 0.55)
         };
         let quality_score = (entry.metadata.quality_score.unwrap_or(0.5) * 0.5
             + majority_ratio * 0.35
@@ -154,7 +170,7 @@ impl SelfConsistencyConsolidator {
                 patch_count: report.clusters.len(),
                 lineage: vec![],
                 validity: entry.metadata.validity.clone(),
-                half_life_days: None,
+                half_life: None,
             },
         };
         (product, report)
@@ -183,11 +199,16 @@ Return only the principle text, 1-3 sentences, no JSON and no markdown."#
 
 fn report_from_clusters(
     clusters: &[ConsistencyVoteCluster],
+    requested_samples: usize,
     sample_count: usize,
+    min_valid_samples: usize,
     min_majority_ratio: f32,
 ) -> SelfConsistencyReport {
     let majority_votes = clusters.first().map(|c| c.votes).unwrap_or(0);
-    let majority_ratio = majority_votes as f32 / sample_count.max(1) as f32;
+    // Missing responses count against consensus; provider completeness is part
+    // of the evidence contract, rather than an implementation detail.
+    let majority_ratio = majority_votes as f32 / requested_samples.max(1) as f32;
+    let completeness = sample_count as f32 / requested_samples.max(1) as f32;
     let vote_entropy = entropy(clusters, sample_count);
     let confidence_variance = clusters
         .first()
@@ -195,12 +216,14 @@ fn report_from_clusters(
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
     SelfConsistencyReport {
+        requested_samples,
         sample_count,
+        completeness,
         majority_votes,
         majority_ratio,
         vote_entropy,
         confidence_variance,
-        accepted: majority_ratio >= min_majority_ratio,
+        accepted: sample_count >= min_valid_samples.max(2) && majority_ratio >= min_majority_ratio,
         clusters: clusters.to_vec(),
     }
 }
@@ -343,6 +366,49 @@ mod tests {
         entry.metadata.content_type = Some(ContentType::Fact);
         entry.metadata.quality_score = Some(0.7);
         entry
+    }
+
+    struct PartialLlm;
+
+    #[async_trait]
+    impl LlmClient for PartialLlm {
+        async fn complete(&self, _prompt: &str, _opts: &LlmOpts) -> Result<String, LlmError> {
+            unreachable!()
+        }
+
+        async fn batch_complete(
+            &self,
+            _prompts: &[String],
+            _opts: &LlmOpts,
+        ) -> Result<Vec<String>, LlmError> {
+            Ok(vec!["one apparently unanimous answer".into()])
+        }
+
+        async fn complete_json(
+            &self,
+            _prompt: &str,
+            _schema: &agent_context_db_core::JsonSchema,
+            _opts: &LlmOpts,
+        ) -> Result<String, LlmError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_single_response_cannot_masquerade_as_consensus() {
+        let consolidator = SelfConsistencyConsolidator::with_config(
+            Arc::new(PartialLlm),
+            SelfConsistencyConfig::default(),
+        );
+        let (product, report) = consolidator.consolidate(&entry()).await;
+
+        assert_eq!(report.requested_samples, 5);
+        assert_eq!(report.sample_count, 1);
+        assert_eq!(report.completeness, 0.2);
+        assert_eq!(report.majority_ratio, 0.2);
+        assert!(!report.accepted);
+        assert!(product.confidence < 0.1);
+        assert_eq!(product.metadata.status, ConsolidationStatus::Stale);
     }
 
     #[tokio::test]

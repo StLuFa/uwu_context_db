@@ -331,6 +331,29 @@ pub struct ValidityRecord {
     pub invalidation_reason: Option<String>,
 }
 
+/// Explicit knowledge decay horizon. `Infinite` is never scheduled for age-based
+/// review; finite values are validated before entering persistence or APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HalfLife {
+    Infinite,
+    Finite { days: f64 },
+}
+
+impl HalfLife {
+    pub const MAX_FINITE_DAYS: f64 = 365_000.0;
+
+    pub fn finite(days: f64) -> Option<Self> {
+        if days.is_finite() && days > 0.0 {
+            Some(Self::Finite {
+                days: days.min(Self::MAX_FINITE_DAYS),
+            })
+        } else {
+            None
+        }
+    }
+}
+
 /// 巩固元数据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationMeta {
@@ -341,7 +364,7 @@ pub struct ConsolidationMeta {
     pub lineage: Vec<LineageEntry>,
     pub evidence_uris: Vec<crate::uri::ContextUri>,
     pub corroboration: usize,
-    pub half_life_days: Option<f64>,
+    pub half_life: Option<HalfLife>,
     pub entangled_with: Vec<crate::uri::ContextUri>,
 }
 
@@ -606,8 +629,10 @@ mod context_meta_custom_tests {
 
     #[test]
     fn custom_as_fails_on_shape_mismatch() {
-        let mut meta = ContextMeta::default();
-        meta.custom = serde_json::json!("not an object");
+        let meta = ContextMeta {
+            custom: serde_json::json!("not an object"),
+            ..Default::default()
+        };
         let r: serde_json::Result<Priority> = meta.custom_as();
         assert!(r.is_err());
     }
@@ -630,8 +655,10 @@ mod context_meta_custom_tests {
 
     #[test]
     fn set_custom_field_replaces_non_object() {
-        let mut meta = ContextMeta::default();
-        meta.custom = serde_json::json!("was string");
+        let mut meta = ContextMeta {
+            custom: serde_json::json!("was string"),
+            ..Default::default()
+        };
         meta.set_custom_field("k", &1u32).unwrap();
         assert_eq!(meta.custom_field::<u32>("k"), Some(1));
     }

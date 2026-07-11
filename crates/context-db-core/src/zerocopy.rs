@@ -21,6 +21,7 @@ pub trait ZeroCopyReader: Send + Sync {
 }
 
 /// 基于内存 ContextStore 的零拷贝适配。
+#[derive(Default)]
 pub struct ZeroCopyAdapter {
     entries: parking_lot::Mutex<HashMap<String, ContextEntry>>,
 }

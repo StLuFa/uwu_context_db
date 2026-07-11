@@ -70,10 +70,10 @@ impl QueryCompiler {
         }
         let mut results = Vec::new();
         for h in handles {
-            if let Ok((r, hits)) = h.await {
-                if let Ok(hits) = hits {
-                    results.push((r, hits));
-                }
+            if let Ok((r, hits)) = h.await
+                && let Ok(hits) = hits
+            {
+                results.push((r, hits));
             }
         }
         results
@@ -456,9 +456,12 @@ impl ParallelGenerator {
 // P6 检索物化视图 — 预计算常见路径
 // ═══════════════════════════════════════════════════════════════════════════
 
+type MaterializedCacheEntry = (Vec<ContextUri>, chrono::DateTime<chrono::Utc>);
+type MaterializedCache = HashMap<String, MaterializedCacheEntry>;
+
 /// 物化视图 — 缓存常见检索路径的结果。
 pub struct MaterializedView {
-    cache: parking_lot::Mutex<HashMap<String, (Vec<ContextUri>, chrono::DateTime<chrono::Utc>)>>,
+    cache: parking_lot::Mutex<MaterializedCache>,
     ttl_secs: i64,
     max_capacity: usize, // H.2: 容量上限，超限时 LRU 淘汰
 }
@@ -482,10 +485,10 @@ impl MaterializedView {
 
     pub fn get(&self, query: &str) -> Option<Vec<ContextUri>> {
         let cache = self.cache.lock();
-        if let Some((uris, expires)) = cache.get(query) {
-            if *expires > chrono::Utc::now() {
-                return Some(uris.clone());
-            }
+        if let Some((uris, expires)) = cache.get(query)
+            && *expires > chrono::Utc::now()
+        {
+            return Some(uris.clone());
         }
         None
     }
@@ -557,8 +560,11 @@ impl PartitionedRetriever {
                 let mut pattern = owned_pattern.clone();
                 pattern.scope = ContextUri::parse(format!("uwu://{tenant}")).ok();
                 tokio::spawn(async move {
-                    match fs.find(&pattern).await {
-                        Ok(uris) => Some((tenant, uris)),
+                    match fs
+                        .find(&pattern, agent_context_db_core::PageRequest::default())
+                        .await
+                    {
+                        Ok(uris) => Some((tenant, uris.items)),
                         Err(_) => None,
                     }
                 })

@@ -252,18 +252,18 @@ impl<V: VersionStore> TemporalReasoner<V> {
 
         let mut events = Vec::new();
         for commit in log {
-            if let AsOfTime::Timestamp(from_ts) = &from {
-                if commit.timestamp < *from_ts {
-                    continue;
-                }
+            if let AsOfTime::Timestamp(from_ts) = &from
+                && commit.timestamp < *from_ts
+            {
+                continue;
             }
-            if let AsOfTime::Timestamp(to_ts) = &to {
-                if commit.timestamp > *to_ts {
-                    continue;
-                }
+            if let AsOfTime::Timestamp(to_ts) = &to
+                && commit.timestamp > *to_ts
+            {
+                continue;
             }
 
-            let entries = vec![
+            let entries = [
                 commit
                     .metadata
                     .changes

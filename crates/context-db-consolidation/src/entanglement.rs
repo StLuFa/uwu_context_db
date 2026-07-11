@@ -293,7 +293,7 @@ mod tests {
     use uuid::Uuid;
 
     fn uri(id: &str) -> ContextUri {
-        ContextUri::parse(&format!("uwu://t/a/memory/fact/{id}")).unwrap()
+        ContextUri::parse(format!("uwu://t/a/memory/fact/{id}")).unwrap()
     }
 
     #[tokio::test]

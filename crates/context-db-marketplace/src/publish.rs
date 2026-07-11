@@ -2,7 +2,7 @@
 
 use crate::secure_aggregation::PrivateContribution;
 use crate::types::*;
-use agent_context_db_core::{ContentType, ContextUri, EpistemicType};
+use agent_context_db_core::{ContentType, ContextUri, EpistemicType, HalfLife};
 
 /// 可发布的巩固产物端口。具体产物类型由 consolidation 或宿主实现。
 pub trait PublishableProduct {
@@ -13,7 +13,7 @@ pub trait PublishableProduct {
     fn confidence(&self) -> f32;
     fn provenance(&self) -> Option<KnowledgeProvenance>;
     fn epistemic_type(&self) -> EpistemicType;
-    fn half_life_days(&self) -> Option<f64>;
+    fn half_life(&self) -> Option<HalfLife>;
 }
 
 /// 知识来源签名端口。具体实现由 KnowledgeNetwork 或宿主注入。
@@ -32,6 +32,12 @@ pub struct PublishGate {
     min_corroboration: CorroborationLevel,
 }
 
+impl Default for PublishGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PublishGate {
     pub fn new() -> Self {
         Self {
@@ -47,7 +53,8 @@ impl PublishGate {
     /// 2. corroboration ≥ CrossSession (≥2 independent sessions)
     /// 3. ShareLevel 不是 Private
     /// 4. 内容非空
-    pub fn try_publish(
+    // Unsigned construction is private so callers cannot bypass provenance signing.
+    fn build_entry(
         &self,
         product: &dyn PublishableProduct,
         corroboration: &CorroborationProof,
@@ -92,11 +99,14 @@ impl PublishGate {
             license: KnowledgeLicense::Attribution,
             epistemic_type: product.epistemic_type(),
             content_type,
-            half_life_days: product.half_life_days(),
+            half_life: product.half_life(),
             created_at,
-            expires_at: product
-                .half_life_days()
-                .map(|d| created_at + chrono::Duration::days(d as i64)),
+            expires_at: match product.half_life() {
+                Some(HalfLife::Finite { days }) => {
+                    Some(created_at + chrono::Duration::days(days.min(i64::MAX as f64) as i64))
+                }
+                Some(HalfLife::Infinite) | None => None,
+            },
         };
 
         Ok(entry)
@@ -110,7 +120,7 @@ impl PublishGate {
         domain: &str,
         signer: &dyn KnowledgeSigner,
     ) -> Result<MarketEntry, PublishError> {
-        let mut entry = self.try_publish(product, corroboration, publisher, domain)?;
+        let mut entry = self.build_entry(product, corroboration, publisher, domain)?;
         let payload = entry.provenance_payload();
         let provenance = signer
             .sign_knowledge_provenance(&payload)
@@ -205,8 +215,8 @@ mod tests {
             EpistemicType::Fact
         }
 
-        fn half_life_days(&self) -> Option<f64> {
-            Some(30.0)
+        fn half_life(&self) -> Option<HalfLife> {
+            Some(HalfLife::Finite { days: 30.0 })
         }
     }
 

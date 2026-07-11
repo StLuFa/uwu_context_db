@@ -1,6 +1,6 @@
 //! Redis 后端实现 — 可选（feature gate `redis-backend`）。
 //!
-//! 提供 ReadCache、EmbeddingCache、RateLimiter 的 Redis 实现（跨进程共享缓存/限流）。
+//! 提供 ReadCache、EmbeddingCache 的 Redis 实现（跨进程共享缓存）。
 //! 事件总线已迁移到 `uwu_event_mesh` + `uwu_nats_bridge`。
 //!
 //! 编译条件：
@@ -9,7 +9,6 @@
 //! ```
 
 use crate::embedding_cache::EmbeddingCache;
-use crate::rate_limiter::RateLimiter;
 use crate::read_cache::ReadCache;
 use crate::{ContentLevel, ContentPayload, ContextUri, Result};
 use async_trait::async_trait;
@@ -237,95 +236,5 @@ impl EmbeddingCache for RedisEmbeddingCache {
                 .await
                 .unwrap_or(());
         }
-    }
-}
-
-// ===========================================================================
-// RedisRateLimiter — Redis 令牌桶限流
-// ===========================================================================
-
-/// Redis 令牌桶限流器 — Lua 原子操作，跨进程共享 API 配额。
-pub struct RedisRateLimiter {
-    client: redis::Client,
-    key: String,
-    capacity: u32,
-    refill_interval_secs: u64,
-}
-
-/// 令牌桶 Lua 脚本 — 原子操作避免竞态。
-const TOKEN_BUCKET_LUA: &str = r#"
-local key = KEYS[1]
-local capacity = tonumber(ARGV[1])
-local interval = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-
-local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
-local tokens = tonumber(bucket[1]) or capacity
-local last_refill = tonumber(bucket[2]) or now
-
--- 补充令牌
-local elapsed = now - last_refill
-local refill = math.floor(elapsed / interval * capacity)
-tokens = math.min(capacity, tokens + refill)
-
-if tokens >= 1 then
-    tokens = tokens - 1
-    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
-    redis.call('EXPIRE', key, interval * 2)
-    return 1  -- 成功
-else
-    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
-    return 0  -- 限流
-end
-"#;
-
-impl RedisRateLimiter {
-    pub fn new(config: &RedisConfig, capacity: u32, refill_interval_secs: u64) -> Result<Self> {
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|e| crate::ContextError::Storage(format!("redis connect: {e}")))?;
-        Ok(Self {
-            client,
-            key: prefixed(&config.key_prefix, "ratelimit:llm"),
-            capacity,
-            refill_interval_secs,
-        })
-    }
-
-    async fn conn(&self) -> Result<redis::aio::MultiplexedConnection> {
-        self.client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| crate::ContextError::Storage(format!("redis conn: {e}")))
-    }
-}
-
-#[async_trait]
-impl RateLimiter for RedisRateLimiter {
-    async fn acquire(&self) -> Result<()> {
-        loop {
-            if self.try_acquire().await {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    async fn try_acquire(&self) -> bool {
-        let mut conn = match self.conn().await {
-            Ok(c) => c,
-            Err(_) => return true, // Fail open: 无法连 Redis 时放行
-        };
-        let now = chrono::Utc::now().timestamp();
-        let result: i32 = redis::cmd("EVAL")
-            .arg(TOKEN_BUCKET_LUA)
-            .arg(1) // number of keys
-            .arg(&self.key)
-            .arg(self.capacity)
-            .arg(self.refill_interval_secs)
-            .arg(now)
-            .query_async(&mut conn)
-            .await
-            .unwrap_or(1); // Fail open
-        result == 1
     }
 }

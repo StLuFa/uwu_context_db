@@ -26,25 +26,13 @@ pub fn update_config(handle: &ConfigHandle, mutate: impl FnOnce(&mut UwuConfig))
 }
 
 /// 上下文数据库统一配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UwuConfig {
     pub storage: StorageConfig,
     pub llm: LlmConfig,
     pub cache: CacheConfig,
     pub lifecycle: LifecycleConfig,
     pub retrieval: RetrievalConfig,
-}
-
-impl Default for UwuConfig {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-            llm: LlmConfig::default(),
-            cache: CacheConfig::default(),
-            lifecycle: LifecycleConfig::default(),
-            retrieval: RetrievalConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

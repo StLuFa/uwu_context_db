@@ -40,6 +40,12 @@ pub struct ExplainableLineage {
     max_depth: usize,
 }
 
+impl Default for ExplainableLineage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExplainableLineage {
     pub fn new() -> Self {
         Self {
@@ -120,7 +126,7 @@ impl ExplainableLineage {
         &'a self,
         fs: &'a dyn FsOps,
         uri: &'a ContextUri,
-        depth: usize,
+        _depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = EvidenceNode> + Send + 'a>> {
         Box::pin(async move {
             let (summary, timestamp) = match fs.read(uri, ContentLevel::L0).await {
@@ -138,11 +144,7 @@ impl ExplainableLineage {
             let session = extract_session_id(uri);
             // 递归 —— DerivedFrom / EvidenceOf 子引用暂不透过 FsOps 拿到，
             // 后续可接入 GraphStore 遍历。此处仅在 depth < max_depth 时占位。
-            let children = if depth + 1 < self.max_depth {
-                vec![]
-            } else {
-                vec![]
-            };
+            let children = vec![];
             EvidenceNode {
                 uri: uri.clone(),
                 content_summary: summary,

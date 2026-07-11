@@ -5,6 +5,12 @@ use crate::{CognitiveDelta, CognitivePreferencePair, PreferenceSource, Trajector
 /// 认知偏好提取器。
 pub struct CognitivePreferenceExtractor;
 
+impl Default for CognitivePreferenceExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CognitivePreferenceExtractor {
     pub fn new() -> Self {
         Self

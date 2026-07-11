@@ -5,19 +5,122 @@
 
 use crate::error::Result;
 use crate::model::{
-    ContentLevel, ContentPayload, ContextDiff, ContextEntry, DirEntry, FindPattern, GrepHit,
-    MvccVersion, TenantId, TreeNode, VersionEntry,
+    ContentLevel, ContentPayload, ContentType, ContextDiff, ContextEntry, DirEntry, FindPattern,
+    GrepHit, MvccVersion, TenantId, TreeNode, VersionEntry,
 };
 use crate::uri::ContextUri;
 use async_trait::async_trait;
 
+/// 所有分页接口允许的单页最大记录数。
+pub const MAX_PAGE_SIZE: usize = 1_000;
+
+/// 基于稳定排序键的 keyset 分页请求。`after` 是上一页返回的 `next_cursor`。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PageRequest {
+    pub after: Option<String>,
+    pub limit: usize,
+}
+
+impl PageRequest {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            after: None,
+            limit: limit.clamp(1, MAX_PAGE_SIZE),
+        }
+    }
+
+    pub fn after(mut self, cursor: impl Into<String>) -> Self {
+        self.after = Some(cursor.into());
+        self
+    }
+
+    pub fn effective_limit(&self) -> usize {
+        self.limit.clamp(1, MAX_PAGE_SIZE)
+    }
+}
+
+impl Default for PageRequest {
+    fn default() -> Self {
+        Self::new(MAX_PAGE_SIZE)
+    }
+}
+
+/// 一页结果。仅当后续记录确实存在时 `next_cursor` 才非空。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+impl<T> Page<T> {
+    pub fn new(items: Vec<T>, next_cursor: Option<String>) -> Self {
+        Self { items, next_cursor }
+    }
+
+    pub fn map_items<U>(self, map: impl FnOnce(Vec<T>) -> Vec<U>) -> Page<U> {
+        Page {
+            items: map(self.items),
+            next_cursor: self.next_cursor,
+        }
+    }
+}
+
+impl<T> IntoIterator for Page<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+impl<T> FromIterator<T> for Page<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self {
+            items: iter.into_iter().collect(),
+            next_cursor: None,
+        }
+    }
+}
+
+impl<T> Default for Page<T> {
+    fn default() -> Self {
+        Self::new(Vec::new(), None)
+    }
+}
+
+impl<T> std::ops::Deref for Page<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<T> std::ops::DerefMut for Page<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.items
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Page<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
 /// 端口 1：只读 FS 寻址（检索层唯一依赖此端口）。
 #[async_trait]
 pub trait FsOps: Send + Sync {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>>;
-    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>>;
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>>;
+    async fn find(&self, pattern: &FindPattern, page: PageRequest) -> Result<Page<ContextUri>>;
     async fn grep(&self, regex: &str, scope: &ContextUri) -> Result<Vec<GrepHit>>;
-    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode>;
+    async fn tree(
+        &self,
+        root: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>>;
     async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload>;
 }
 
@@ -40,7 +143,11 @@ pub trait ContentRepo: Send + Sync {
 /// 端口 3：版本操作（M2 独立 crate，feature 开关；M0/M1 可用空实现）。
 #[async_trait]
 pub trait VersionOps: Send + Sync {
-    async fn version_history(&self, uri: &ContextUri) -> Result<Vec<VersionEntry>>;
+    async fn version_history(
+        &self,
+        uri: &ContextUri,
+        page: PageRequest,
+    ) -> Result<Page<VersionEntry>>;
     async fn rollback(&self, uri: &ContextUri, to: MvccVersion) -> Result<()>;
     async fn diff(&self, uri: &ContextUri, a: MvccVersion, b: MvccVersion) -> Result<ContextDiff>;
 }
@@ -48,7 +155,7 @@ pub trait VersionOps: Send + Sync {
 /// 端口 4：租户隔离。
 #[async_trait]
 pub trait TenantOps: Send + Sync {
-    async fn list_tenants(&self) -> Result<Vec<TenantId>>;
+    async fn list_tenants(&self, page: PageRequest) -> Result<Page<TenantId>>;
 }
 
 /// 便利 supertrait 别名：需要"完整存储"能力的调用方用它，
@@ -68,15 +175,37 @@ pub trait ContentStore: Send + Sync {
     async fn delete(&self, uri: &ContextUri) -> Result<()>;
     async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()>;
     async fn batch_write(&self, entries: &[ContextEntry]) -> Result<Vec<MvccVersion>>;
-    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>>;
+    /// Returns entries in URI order whose URI is exactly `prefix` or is in its subtree.
+    async fn scan_by_prefix(&self, prefix: &str, page: PageRequest) -> Result<Page<ContextEntry>>;
+    /// Returns at most `limit` entries of `content_type` in URI order within `prefix`.
+    ///
+    /// Implementations must apply the type predicate before the limit. This contract is
+    /// intentionally separate from `scan_by_prefix`: callers must never emulate it by
+    /// limiting a broader scan and filtering the truncated result.
+    async fn scan_by_type(
+        &self,
+        prefix: &str,
+        content_type: ContentType,
+        page: PageRequest,
+    ) -> Result<Page<ContextEntry>>;
 }
 
 /// 目录浏览（从 FsOps 拆分）。
 #[async_trait]
 pub trait BrowsingOps: Send + Sync {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>>;
-    async fn tree(&self, dir: &ContextUri, depth: usize) -> Result<TreeNode>;
-    async fn find(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<ContextUri>>;
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>>;
+    async fn tree(
+        &self,
+        dir: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>>;
+    async fn find(
+        &self,
+        scope: &ContextUri,
+        pattern: &str,
+        page: PageRequest,
+    ) -> Result<Page<ContextUri>>;
     async fn grep(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<GrepHit>>;
 }
 
@@ -101,7 +230,7 @@ pub trait GraphStore: Send + Sync {
 }
 
 /// 图关系类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum GraphRelation {
     EvolvedFrom,
     EvolvedTo,

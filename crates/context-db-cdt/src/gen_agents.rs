@@ -264,14 +264,8 @@ fn compute_importance(outcome: EpisodeOutcome, steps: usize, knowledge_count: us
 fn make_agent_uri(base: &ContextUri, kind: &str, index: usize, content: &str) -> ContextUri {
     let hash = blake3::hash(content.as_bytes()).to_hex();
     let short = &hash[..8];
-    ContextUri::parse(&format!(
-        "{}/{}/{:02}-{}",
-        base.as_str(),
-        kind,
-        index,
-        short
-    ))
-    .unwrap_or_else(|_| ContextUri::parse("uwu://t/agent/gen/profile/fallback").unwrap())
+    ContextUri::parse(format!("{}/{}/{:02}-{}", base.as_str(), kind, index, short))
+        .unwrap_or_else(|_| ContextUri::parse("uwu://t/agent/gen/profile/fallback").unwrap())
 }
 
 #[cfg(test)]

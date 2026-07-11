@@ -128,12 +128,27 @@ impl TypeScanOp {
         ctx: &ExecContext,
     ) -> Result<RecordBatch> {
         let prefix = prefix_for_scope(scope);
-        let mut batch = scan_prefix(&prefix, limit, 0.9, ctx).await?;
-        batch
-            .records
-            .retain(|hit| hit.content_type == Some(*content_type));
-        batch.stats.rows_scanned = batch.records.len();
-        Ok(batch)
+        let content = ctx.content.as_ref().ok_or_else(|| {
+            ContextError::Unsupported("type scan requires ContentStore predicate pushdown".into())
+        })?;
+        let entries = content
+            .scan_by_type(
+                &prefix,
+                *content_type,
+                agent_context_db_core::PageRequest::new(limit),
+            )
+            .await?;
+        let rows_scanned = entries.len();
+        Ok(RecordBatch {
+            records: entries
+                .into_iter()
+                .map(|entry| hit_from_entry(entry, ContentLevel::L0, 0.9))
+                .collect(),
+            stats: ExecStats {
+                rows_scanned,
+                ..Default::default()
+            },
+        })
     }
 }
 
@@ -192,7 +207,13 @@ impl VectorSearchOp {
         let mut hits = Vec::with_capacity(index_hits.len());
         for h in index_hits {
             let mut hit = if let Some(content) = &ctx.content {
-                match content.scan_by_prefix(&h.uri.to_string(), 1).await {
+                match content
+                    .scan_by_prefix(
+                        &h.uri.to_string(),
+                        agent_context_db_core::PageRequest::new(1),
+                    )
+                    .await
+                {
                     Ok(mut entries) => entries
                         .pop()
                         .map(|entry| hit_from_entry(entry, ContentLevel::L0, h.score))
@@ -345,6 +366,10 @@ impl GraphTraverseOp {
 }
 
 /// 并行执行算子。
+///
+/// 契约为 fail-fast completeness：只有全部子计划成功时才产生合并结果；任一业务错误或
+/// task join 错误都会使整个 Parallel 失败。尤其是 Intersect 不会用缺失的子结果计算
+/// 伪空集，Union/Dedup/First 也不会把“全部失败”伪装成成功的空结果。
 pub struct ParallelOp;
 
 impl ParallelOp {
@@ -362,9 +387,10 @@ impl ParallelOp {
 
         let mut all_hits = Vec::new();
         for handle in handles {
-            if let Ok(Ok(batch)) = handle.await {
-                all_hits.extend(batch.records);
-            }
+            let batch = handle.await.map_err(|error| {
+                ContextError::Storage(format!("parallel child task failed: {error}"))
+            })??;
+            all_hits.extend(batch.records);
         }
 
         let merged = match merge {
@@ -414,7 +440,9 @@ async fn scan_prefix(
     ctx: &ExecContext,
 ) -> Result<RecordBatch> {
     if let Some(content) = &ctx.content {
-        let entries = content.scan_by_prefix(prefix, limit).await?;
+        let entries = content
+            .scan_by_prefix(prefix, agent_context_db_core::PageRequest::new(limit))
+            .await?;
         let rows_scanned = entries.len();
         return Ok(RecordBatch {
             records: entries
@@ -435,10 +463,13 @@ async fn scan_prefix(
     })?;
     let uris = ctx
         .fs
-        .find(&agent_context_db_core::FindPattern {
-            scope: Some(scope),
-            ..Default::default()
-        })
+        .find(
+            &agent_context_db_core::FindPattern {
+                scope: Some(scope),
+                ..Default::default()
+            },
+            agent_context_db_core::PageRequest::new(limit),
+        )
         .await?;
     let rows_scanned = uris.len().min(limit);
     let mut records = Vec::with_capacity(rows_scanned);
@@ -572,7 +603,10 @@ fn sparse_graph_hit(
 
 async fn load_graph_hit(uri: &ContextUri, ctx: &ExecContext) -> Option<RetrievalHit> {
     let content = ctx.content.as_ref()?;
-    let mut entries = content.scan_by_prefix(&uri.to_string(), 1).await.ok()?;
+    let mut entries = content
+        .scan_by_prefix(&uri.to_string(), agent_context_db_core::PageRequest::new(1))
+        .await
+        .ok()?;
     entries
         .pop()
         .map(|entry| hit_from_entry(entry, ContentLevel::L0, 0.6))
@@ -677,6 +711,100 @@ mod tests {
         entry.metadata.quality_score = Some(quality);
         entry.metadata.tags = vec!["p2".into()];
         entry
+    }
+
+    #[tokio::test]
+    async fn type_scan_applies_predicate_before_limit() {
+        let store = Arc::new(MemoryContextStore::new());
+        ContentRepo::write(
+            store.as_ref(),
+            entry(
+                "uwu://t/agent/a/memories/a-error",
+                "error",
+                ContentType::Error,
+                0.5,
+            ),
+        )
+        .await
+        .unwrap();
+        ContentRepo::write(
+            store.as_ref(),
+            entry(
+                "uwu://t/agent/a/memories/z-fact",
+                "fact",
+                ContentType::Fact,
+                0.9,
+            ),
+        )
+        .await
+        .unwrap();
+        let ctx = ExecContext {
+            fs: store.clone(),
+            content: Some(store),
+            index: None,
+            graph: None,
+        };
+        let plan = PhysicalPlan::TypeScan {
+            content_type: ContentType::Fact,
+            scope: Some(ScopeFilter::UriPrefix("uwu://t/agent/a/memories".into())),
+            limit: 1,
+        };
+
+        let batch = plan.execute(&ctx).await.unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(
+            batch.records[0].uri.as_str(),
+            "uwu://t/agent/a/memories/z-fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_fails_when_all_children_fail() {
+        let store = Arc::new(MemoryContextStore::new());
+        let ctx = ExecContext {
+            fs: store,
+            content: None,
+            index: None,
+            graph: None,
+        };
+        let child = PhysicalPlan::TypeScan {
+            content_type: ContentType::Fact,
+            scope: None,
+            limit: 1,
+        };
+        let plan = PhysicalPlan::Parallel {
+            plans: vec![child.clone(), child],
+            merge: QueryMergeStrategy::Union,
+        };
+
+        assert!(plan.execute(&ctx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn parallel_intersect_fails_on_partial_child_failure() {
+        let store = Arc::new(MemoryContextStore::new());
+        let ctx = ExecContext {
+            fs: store,
+            content: None,
+            index: None,
+            graph: None,
+        };
+        let plan = PhysicalPlan::Parallel {
+            plans: vec![
+                PhysicalPlan::FullScan {
+                    scope: None,
+                    limit: 1,
+                },
+                PhysicalPlan::TypeScan {
+                    content_type: ContentType::Fact,
+                    scope: None,
+                    limit: 1,
+                },
+            ],
+            merge: QueryMergeStrategy::Intersect,
+        };
+
+        assert!(plan.execute(&ctx).await.is_err());
     }
 
     #[tokio::test]

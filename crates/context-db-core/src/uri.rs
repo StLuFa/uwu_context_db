@@ -16,7 +16,7 @@ pub const SCHEME: &str = "uwu://";
 // ===========================================================================
 
 /// URI 查询参数 — 支持时态查询、层级选择、分支切换。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct QueryParams {
     /// 时态查询：获取特定时间点的版本。
     pub as_of: Option<AsOfTime>,
@@ -26,17 +26,6 @@ pub struct QueryParams {
     pub branch: Option<String>,
     /// 结果数量限制。
     pub limit: Option<usize>,
-}
-
-impl Default for QueryParams {
-    fn default() -> Self {
-        Self {
-            as_of: None,
-            level: None,
-            branch: None,
-            limit: None,
-        }
-    }
 }
 
 /// 时态定位点。
@@ -123,7 +112,7 @@ impl UriInner {
         let tenant = path[0].clone();
 
         // Parse query parameters
-        let query = query_str.and_then(|qs| parse_query_string(qs));
+        let query = query_str.and_then(parse_query_string);
 
         Ok(Self {
             tenant,

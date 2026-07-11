@@ -96,13 +96,10 @@ Return a JSON object with these fields:
         // 读取每条轨迹的内容
         let mut traj_texts = Vec::new();
         for uri in &trajectories {
-            if let Ok(content) = self.fs.read(uri, ContentLevel::L1).await {
-                match content {
-                    agent_context_db_core::ContentPayload::Text { dense, .. } => {
-                        traj_texts.push(dense)
-                    }
-                    _ => {}
-                }
+            if let Ok(content) = self.fs.read(uri, ContentLevel::L1).await
+                && let agent_context_db_core::ContentPayload::Text { dense, .. } = content
+            {
+                traj_texts.push(dense)
             }
         }
 
@@ -176,17 +173,25 @@ Return a JSON object with:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_context_db_core::ContentPayload;
+    use agent_context_db_core::{ContentPayload, Page, PageRequest};
 
     /// Mock FsOps that returns canned content.
     struct MockFs(String);
     #[async_trait]
     impl FsOps for MockFs {
-        async fn ls(&self, _: &ContextUri) -> Result<Vec<agent_context_db_core::DirEntry>> {
-            Ok(vec![])
+        async fn ls(
+            &self,
+            _: &ContextUri,
+            _: PageRequest,
+        ) -> Result<Page<agent_context_db_core::DirEntry>> {
+            Ok(Page::new(vec![], None))
         }
-        async fn find(&self, _: &agent_context_db_core::FindPattern) -> Result<Vec<ContextUri>> {
-            Ok(vec![])
+        async fn find(
+            &self,
+            _: &agent_context_db_core::FindPattern,
+            _: PageRequest,
+        ) -> Result<Page<ContextUri>> {
+            Ok(Page::new(vec![], None))
         }
         async fn grep(
             &self,
@@ -195,12 +200,20 @@ mod tests {
         ) -> Result<Vec<agent_context_db_core::GrepHit>> {
             Ok(vec![])
         }
-        async fn tree(&self, r: &ContextUri, _: usize) -> Result<agent_context_db_core::TreeNode> {
-            Ok(agent_context_db_core::TreeNode {
-                uri: r.clone(),
-                is_dir: true,
-                children: vec![],
-            })
+        async fn tree(
+            &self,
+            r: &ContextUri,
+            _: usize,
+            _: PageRequest,
+        ) -> Result<Page<agent_context_db_core::TreeNode>> {
+            Ok(Page::new(
+                vec![agent_context_db_core::TreeNode {
+                    uri: r.clone(),
+                    is_dir: true,
+                    children: vec![],
+                }],
+                None,
+            ))
         }
         async fn read(&self, _: &ContextUri, _: ContentLevel) -> Result<ContentPayload> {
             Ok(ContentPayload::Text {

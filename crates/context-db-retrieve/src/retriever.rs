@@ -164,7 +164,7 @@ impl ContextRetriever {
             trace.steps.push(TraceStep::IntentAnalysis {
                 raw: query.to_string(),
                 num_queries: decision.candidates.len(),
-                decision: Some(decision.clone()),
+                decision: Some(Box::new(decision.clone())),
             });
         }
 
@@ -385,7 +385,7 @@ impl RuleBasedPlanner {
 impl QueryPlanner for RuleBasedPlanner {
     async fn parse(&self, query: &str, ctx: &RetrieveContext) -> Result<LogicalPlan> {
         let lower = query.to_lowercase();
-        let scope = ContextUri::parse(&format!(
+        let scope = ContextUri::parse(format!(
             "uwu://{}/agent/{}",
             ctx.user_id.as_deref().unwrap_or(&self.default_tenant),
             ctx.agent_id.as_deref().unwrap_or(&self.default_agent),

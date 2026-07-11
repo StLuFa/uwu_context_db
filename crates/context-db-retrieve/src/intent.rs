@@ -956,16 +956,15 @@ impl CompiledIntentPolicy {
             }
         }
 
-        if candidate_rules.is_empty() {
-            if let Some(default_idx) = self
+        if candidate_rules.is_empty()
+            && let Some(default_idx) = self
                 .pack
                 .intent
                 .iter()
                 .position(|rule| rule.kind == IntentKind::SemanticSearch)
-            {
-                candidate_rules.insert(default_idx);
-                states[default_idx].breakdown.context += 0.2;
-            }
+        {
+            candidate_rules.insert(default_idx);
+            states[default_idx].breakdown.context += 0.2;
         }
 
         for idx in &candidate_rules {

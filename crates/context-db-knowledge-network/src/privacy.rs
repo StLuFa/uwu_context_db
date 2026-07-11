@@ -66,6 +66,14 @@ impl RdpCharge {
         }
     }
 
+    pub fn laplace(epsilon: f64) -> Self {
+        Self {
+            orders: RDP_ORDERS.to_vec(),
+            // An epsilon-DP mechanism is also (alpha, epsilon)-RDP for every alpha.
+            epsilons: vec![epsilon.max(0.0); RDP_ORDERS.len()],
+        }
+    }
+
     pub fn zero() -> Self {
         Self {
             orders: RDP_ORDERS.to_vec(),
@@ -118,7 +126,10 @@ impl PrivacyCost {
     pub fn for_query(policy: &DpPolicy) -> Self {
         let sigma = gaussian_sigma(policy.query_epsilon, policy.delta, policy.clip_norm);
         let rdp = if policy.enabled {
-            RdpCharge::gaussian(policy.clip_norm as f64, sigma as f64)
+            let mut composed = RdpCharge::gaussian(policy.clip_norm as f64, sigma as f64);
+            composed.add_assign(&RdpCharge::laplace(policy.response_epsilon as f64));
+            composed.add_assign(&RdpCharge::laplace(policy.relay_epsilon as f64));
+            composed
         } else {
             RdpCharge::zero()
         };
@@ -167,6 +178,62 @@ pub trait PrivacyBudgetLedger: Send + Sync {
     ) -> Result<PrivacyReceipt>;
     async fn commit(&self, receipt: &PrivacyReceipt) -> Result<()>;
     async fn refund(&self, receipt: &PrivacyReceipt) -> Result<()>;
+}
+
+/// Owns a reservation until it is committed; dropping it refunds on error or cancellation.
+pub struct PrivacyReservationGuard {
+    ledger: Arc<dyn PrivacyBudgetLedger>,
+    receipt: Option<PrivacyReceipt>,
+}
+
+impl PrivacyReservationGuard {
+    fn new(ledger: Arc<dyn PrivacyBudgetLedger>, receipt: PrivacyReceipt) -> Self {
+        Self {
+            ledger,
+            receipt: Some(receipt),
+        }
+    }
+
+    pub fn receipt(&self) -> &PrivacyReceipt {
+        self.receipt.as_ref().expect("active privacy reservation")
+    }
+
+    pub async fn commit(mut self) -> Result<PrivacyReceipt> {
+        let mut receipt = self
+            .receipt
+            .as_ref()
+            .expect("active privacy reservation")
+            .clone();
+        self.ledger.commit(&receipt).await?;
+        receipt.committed_at = Some(Utc::now());
+        self.receipt = None;
+        Ok(receipt)
+    }
+
+    pub async fn refund(mut self) -> Result<PrivacyReceipt> {
+        let receipt = self
+            .receipt
+            .as_ref()
+            .expect("active privacy reservation")
+            .clone();
+        self.ledger.refund(&receipt).await?;
+        self.receipt = None;
+        Ok(receipt)
+    }
+}
+
+impl Drop for PrivacyReservationGuard {
+    fn drop(&mut self) {
+        let Some(receipt) = self.receipt.take() else {
+            return;
+        };
+        let ledger = Arc::clone(&self.ledger);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = ledger.refund(&receipt).await;
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -376,12 +443,13 @@ impl PrivacyGuard {
         &self,
         actor: &AgentId,
         query: &DiscoveryQuery,
-    ) -> Result<(PrivateQuerySketch, PrivacyReceipt)> {
+    ) -> Result<(PrivateQuerySketch, PrivacyReservationGuard)> {
         let cost = PrivacyCost::for_query(&self.policy);
         let receipt = self
             .budget_ledger
             .reserve(actor, BudgetScope::Query, cost)
             .await?;
+        let reservation = PrivacyReservationGuard::new(Arc::clone(&self.budget_ledger), receipt);
         let projected = if self.policy.enabled {
             self.mechanism
                 .protect_embedding(&query.query_embedding, &self.policy)
@@ -414,7 +482,7 @@ impl PrivacyGuard {
                 quality_bucket_min: (query.min_quality.clamp(0.0, 1.0) * 10.0) as u8,
                 issued_at: Utc::now(),
             },
-            receipt,
+            reservation,
         ))
     }
 }
@@ -501,19 +569,14 @@ mod tests {
         };
         let cost = PrivacyCost::for_query(&policy);
         let mut accepted = 0;
-        loop {
-            match ledger
-                .reserve(&actor, BudgetScope::Query, cost.clone())
-                .await
-            {
-                Ok(receipt) => {
-                    ledger.commit(&receipt).await.unwrap();
-                    accepted += 1;
-                    if accepted > 100 {
-                        panic!("RDP ledger accepted too many composed queries");
-                    }
-                }
-                Err(_) => break,
+        while let Ok(receipt) = ledger
+            .reserve(&actor, BudgetScope::Query, cost.clone())
+            .await
+        {
+            ledger.commit(&receipt).await.unwrap();
+            accepted += 1;
+            if accepted > 100 {
+                panic!("RDP ledger accepted too many composed queries");
             }
         }
         assert!(accepted >= 1);
@@ -544,10 +607,11 @@ mod tests {
             DpPolicy::default(),
             Arc::new(InMemoryPrivacyBudgetLedger::default()),
         );
-        let (_sketch, receipt) = guard
+        let (_sketch, reservation) = guard
             .protect_query(&AgentId::new("agent-a"), &query())
             .await
             .unwrap();
+        let receipt = reservation.receipt();
         assert_eq!(receipt.cost.mechanism, DpMechanismKind::Gaussian);
         assert!(
             receipt

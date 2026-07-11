@@ -32,6 +32,12 @@ pub struct CrossAgentPhylogeny {
     lineages: parking_lot::RwLock<HashMap<MarketId, LineageNode>>,
 }
 
+impl Default for CrossAgentPhylogeny {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CrossAgentPhylogeny {
     pub fn new() -> Self {
         Self {

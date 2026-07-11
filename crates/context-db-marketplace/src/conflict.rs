@@ -416,10 +416,10 @@ fn parse_verdict(raw: &str) -> Option<DebateVerdict> {
 
 fn extract_json_object(text: &str) -> String {
     let trimmed = text.trim();
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            return trimmed[start..=end].to_string();
-        }
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}')
+    {
+        return trimmed[start..=end].to_string();
     }
     trimmed.to_string()
 }
@@ -550,7 +550,7 @@ mod tests {
             license: KnowledgeLicense::Attribution,
             epistemic_type: EpistemicType::Fact,
             content_type: ContentType::Fact,
-            half_life_days: None,
+            half_life: None,
             created_at: chrono::Utc::now(),
             expires_at: None,
         }

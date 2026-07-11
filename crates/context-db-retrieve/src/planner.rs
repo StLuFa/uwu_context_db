@@ -603,10 +603,10 @@ fn intent_cost_multiplier(plan: &PhysicalPlan, hint: Option<&IntentPlannerHint>)
 
 /// 如果谓词只包含 TypeEquals，返回该类型。
 fn predicate_type_only(predicate: &Predicate) -> Option<ContentType> {
-    if predicate.conditions.len() == 1 {
-        if let Condition::TypeEquals(ct) = &predicate.conditions[0] {
-            return Some(*ct);
-        }
+    if predicate.conditions.len() == 1
+        && let Condition::TypeEquals(ct) = &predicate.conditions[0]
+    {
+        return Some(*ct);
     }
     None
 }

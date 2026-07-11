@@ -203,7 +203,7 @@ fn entry_from_crystal(
         }],
         evidence_uris: crystal.evidence.clone(),
         corroboration: crystal.evidence.len(),
-        half_life_days: Some(180.0),
+        half_life: Some(agent_context_db_core::HalfLife::Finite { days: 180.0 }),
         entangled_with: crystal.evidence.clone(),
     });
     let _ = entry
@@ -241,7 +241,7 @@ fn entry_from_dream_insight(
         }],
         evidence_uris: vec![],
         corroboration: 1,
-        half_life_days: Some(90.0),
+        half_life: Some(agent_context_db_core::HalfLife::Finite { days: 90.0 }),
         entangled_with: vec![],
     });
     let _ = entry.metadata.set_custom_field("dream_insight", &insight);
@@ -1036,7 +1036,7 @@ fn build_causal_samples(
     mut log: Vec<crate::Commit>,
     config: &CausalDiscoveryConfig,
 ) -> CausalSamples {
-    log.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    log.sort_by_key(|a| a.timestamp);
 
     let mut frequencies: HashMap<ContextUri, usize> = HashMap::new();
     let mut touched_by_commit = Vec::new();
@@ -1260,7 +1260,7 @@ fn ges_parents_for_effect(
             };
             if best
                 .as_ref()
-                .map_or(true, |old| parent.bic_gain > old.bic_gain)
+                .is_none_or(|old| parent.bic_gain > old.bic_gain)
             {
                 best = Some(parent);
             }
@@ -1428,9 +1428,9 @@ fn apply_intervention(graph: &CausalGraph, intervention: CausalIntervention) -> 
     }
 
     while let Some((node, direct, total, confidence, path)) = queue.pop_front() {
-        let replace = best.get(&node).map_or(true, |old| {
-            total.abs() * confidence > old.total_effect.abs() * old.confidence
-        });
+        let replace = best
+            .get(&node)
+            .is_none_or(|old| total.abs() * confidence > old.total_effect.abs() * old.confidence);
         if replace {
             best.insert(
                 node.clone(),
@@ -1527,10 +1527,10 @@ fn extract_json_array(text: &str) -> String {
             return after[..end].trim().to_string();
         }
     }
-    if let Some(start) = text.find('[') {
-        if let Some(end) = text.rfind(']') {
-            return text[start..=end].to_string();
-        }
+    if let Some(start) = text.find('[')
+        && let Some(end) = text.rfind(']')
+    {
+        return text[start..=end].to_string();
     }
     // fallback: wrap in array
     format!("[{}]", text)
@@ -1615,7 +1615,7 @@ mod tests {
             co_occurrence: 0.1,
             confidence: 0.24,
         };
-        let mut v = vec![h2, h1];
+        let mut v = [h2, h1];
         v.sort_by(|a, b| {
             b.confidence
                 .partial_cmp(&a.confidence)
@@ -1718,7 +1718,7 @@ mod tests {
 
     fn test_samples(rows: Vec<Vec<ContextUri>>) -> CausalSamples {
         let mut variables = rows.iter().flatten().cloned().collect::<Vec<_>>();
-        variables.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        variables.sort_by_key(|a| a.to_string());
         variables.dedup();
         let variable_index = variables
             .iter()

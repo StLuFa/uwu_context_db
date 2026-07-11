@@ -68,8 +68,6 @@ pub enum CandidateAction {
     Skip,
     Create,
     Merge,
-    Delete,
-    None,
 }
 
 // ===========================================================================

@@ -45,6 +45,12 @@ pub struct CommunityDetector {
     min_agents: usize,
 }
 
+impl Default for CommunityDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommunityDetector {
     pub fn new() -> Self {
         Self { min_agents: 2 }
@@ -103,7 +109,10 @@ impl CommunityDetector {
                 };
                 let mut label_scores: HashMap<AgentId, f32> = HashMap::new();
                 for (neighbor, weight) in neighbors {
-                    let label = labels.get(neighbor).cloned().unwrap_or_else(|| neighbor.clone());
+                    let label = labels
+                        .get(neighbor)
+                        .cloned()
+                        .unwrap_or_else(|| neighbor.clone());
                     *label_scores.entry(label).or_default() += *weight;
                 }
                 let Some((best_label, _)) = label_scores.into_iter().max_by(|a, b| {
@@ -147,7 +156,10 @@ impl CommunityDetector {
                 }
                 let mut domains = domain_scores.into_iter().collect::<Vec<_>>();
                 domains.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                let domains = domains.into_iter().map(|(domain, _)| domain).collect::<Vec<_>>();
+                let domains = domains
+                    .into_iter()
+                    .map(|(domain, _)| domain)
+                    .collect::<Vec<_>>();
                 let domain_set = domains.iter().collect::<HashSet<_>>();
                 let entry_count = entries
                     .iter()
@@ -184,10 +196,13 @@ impl CommunityDetector {
                     .cloned()
                     .map(move |domain| (domain, idx))
             })
-            .fold(HashMap::<String, Vec<usize>>::new(), |mut acc, (domain, idx)| {
-                acc.entry(domain).or_default().push(idx);
-                acc
-            });
+            .fold(
+                HashMap::<String, Vec<usize>>::new(),
+                |mut acc, (domain, idx)| {
+                    acc.entry(domain).or_default().push(idx);
+                    acc
+                },
+            );
         for (domain, ids) in domain_to_communities {
             if ids.len() < 2 {
                 continue;
@@ -196,15 +211,19 @@ impl CommunityDetector {
                 continue;
             };
             for idx in ids {
-                communities[idx].bridge_entries.extend(entry_ids.iter().copied());
                 communities[idx]
                     .bridge_entries
-                    .sort_by(|left, right| left.0.cmp(&right.0));
+                    .extend(entry_ids.iter().copied());
+                communities[idx].bridge_entries.sort_by_key(|left| left.0);
                 communities[idx].bridge_entries.dedup();
             }
         }
 
-        communities.sort_by(|a, b| b.entry_count.cmp(&a.entry_count).then_with(|| a.id.cmp(&b.id)));
+        communities.sort_by(|a, b| {
+            b.entry_count
+                .cmp(&a.entry_count)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         communities
     }
 }
@@ -249,6 +268,12 @@ pub struct SpeciationTracker {
     entries: parking_lot::RwLock<HashMap<MarketId, MarketEntry>>,
     forks: parking_lot::RwLock<HashMap<(MarketId, AgentId), MarketId>>,
     speciation_threshold: f32,
+}
+
+impl Default for SpeciationTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SpeciationTracker {
@@ -386,7 +411,7 @@ mod tests {
             license: KnowledgeLicense::Attribution,
             epistemic_type: EpistemicType::Heuristic,
             content_type: ContentType::Skill,
-            half_life_days: Some(90.0),
+            half_life: Some(agent_context_db_core::HalfLife::Finite { days: 90.0 }),
             created_at: chrono::Utc::now(),
             expires_at: None,
         }

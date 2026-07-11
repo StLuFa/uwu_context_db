@@ -91,6 +91,12 @@ pub struct CognitiveStateDelta {
     pub graph_density_delta: f32,
 }
 
+impl Default for PolicyModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PolicyModule {
     pub fn new() -> Self {
         Self
@@ -173,6 +179,12 @@ impl PolicyModule {
 
 /// Value Module — 评估"当前认知状态有多健康"。
 pub struct ValueModule;
+
+impl Default for ValueModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ValueModule {
     pub fn new() -> Self {

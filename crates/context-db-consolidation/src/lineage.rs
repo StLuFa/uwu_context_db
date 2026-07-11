@@ -24,6 +24,12 @@ pub struct PhylogenyTree {
     pub depth: usize,
 }
 
+impl Default for LineageTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LineageTracker {
     pub fn new() -> Self {
         Self

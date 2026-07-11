@@ -140,6 +140,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -165,6 +166,9 @@ version = "0.0.0"
 dependencies = [
  "agent-context-db-core",
  "async-trait",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -217,6 +221,7 @@ name = "agent-context-db-session"
 version = "0.0.0"
 dependencies = [
  "agent-context-db-core",
+ "agent-context-db-parse",
  "agent-context-db-testkit",
  "async-trait",
  "base64 0.22.1",
@@ -234,6 +239,7 @@ name = "agent-context-db-storage"
 version = "0.0.0"
 dependencies = [
  "agent-context-db-core",
+ "agent-context-db-testkit",
  "agent-context-db-version",
  "async-trait",
  "blake3",
@@ -6669,6 +6675,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

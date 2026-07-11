@@ -74,6 +74,11 @@ pub struct FitnessScore {
     pub penalty: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffspringValidationStatus {
+    Pending,
+}
+
 #[derive(Debug, Clone)]
 pub struct EvolutionOffspring {
     pub action: EvolutionAction,
@@ -81,6 +86,9 @@ pub struct EvolutionOffspring {
     pub lineage: LineageNode,
     pub parent_ids: Vec<MarketId>,
     pub fitness: f32,
+    pub validation_status: OffspringValidationStatus,
+    /// Publication must independently satisfy all checks after the text changed.
+    pub required_validations: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -227,8 +235,11 @@ impl MemeticEvolutionEngine {
         let mut child = parent.clone();
         child.id = MarketId::new();
         child.principle = self.mutated_principle(parent).await;
-        child.quality_score = (parent.quality_score * 0.96 + fitness * 0.04).clamp(0.0, 1.0);
-        child.confidence = (parent.confidence * 0.92 + fitness * 0.05).clamp(0.0, 1.0);
+        // Changed content cannot inherit evidence, maturity, quality, or confidence.
+        child.evidence_uris.clear();
+        child.corroboration = CorroborationProof::new();
+        child.quality_score = 0.0;
+        child.confidence = 0.0;
         child.domain = format!("{}/variant", parent.domain);
         child.created_at = Utc::now();
         child.provenance = None;
@@ -246,6 +257,8 @@ impl MemeticEvolutionEngine {
             lineage,
             parent_ids: vec![parent.id],
             fitness,
+            validation_status: OffspringValidationStatus::Pending,
+            required_validations: vec!["consistency", "provenance", "adoption"],
         }
     }
 
@@ -263,12 +276,13 @@ impl MemeticEvolutionEngine {
         child.publisher = left.publisher.clone();
         child.domain = common_domain(&left.domain, &right.domain);
         child.principle = merged.principle;
-        child.evidence_uris = merged.evidence_uris;
-        child.quality_score = (merged.quality_score * 0.75 + fitness * 0.25).clamp(0.0, 1.0);
-        child.confidence = (merged.confidence * 0.85 + fitness * 0.10).clamp(0.0, 1.0);
+        // Parent citations may guide generation but do not validate the merged claim.
+        child.evidence_uris.clear();
+        child.quality_score = 0.0;
+        child.confidence = 0.0;
         child.created_at = Utc::now();
         child.provenance = None;
-        child.corroboration = stronger_corroboration(&left.corroboration, &right.corroboration);
+        child.corroboration = CorroborationProof::new();
 
         let parent_ids = vec![left.id, right.id];
         let lineage = LineageNode {
@@ -284,6 +298,8 @@ impl MemeticEvolutionEngine {
             lineage,
             parent_ids,
             fitness,
+            validation_status: OffspringValidationStatus::Pending,
+            required_validations: vec!["consistency", "provenance", "adoption"],
         }
     }
 
@@ -349,9 +365,7 @@ fn structured_mutation(parent: &MarketEntry) -> String {
         CorroborationLevel::CrossSession | CorroborationLevel::CrossAgent => {
             "prefer it when a new case has comparable cross-context signals"
         }
-        CorroborationLevel::Established => {
-            "apply it by default unless a contradiction is attached"
-        }
+        CorroborationLevel::Established => "apply it by default unless a contradiction is attached",
     };
 
     if lower.contains("always") || lower.contains("never") {
@@ -360,7 +374,11 @@ fn structured_mutation(parent: &MarketEntry) -> String {
             parent.domain, principle, evidence_clause, corroboration_clause
         );
     }
-    if lower.contains("when ") || lower.contains("if ") || principle.contains('当') || principle.contains("如果") {
+    if lower.contains("when ")
+        || lower.contains("if ")
+        || principle.contains('当')
+        || principle.contains("如果")
+    {
         return format!(
             "Within domain '{}', apply '{}' only after checking preconditions, evidence freshness, and contradiction links; {}.",
             parent.domain, principle, corroboration_clause
@@ -404,26 +422,6 @@ fn common_domain(left: &str, right: &str) -> String {
     }
 }
 
-fn stronger_corroboration(
-    left: &CorroborationProof,
-    right: &CorroborationProof,
-) -> CorroborationProof {
-    let mut out = left.clone();
-    for agent in &right.corroborators {
-        if !out.corroborators.contains(agent) {
-            out.corroborators.push(agent.clone());
-        }
-    }
-    out.total_count = left.total_count.max(right.total_count);
-    out.independent_sources = out
-        .corroborators
-        .len()
-        .max(left.independent_sources)
-        .max(right.independent_sources);
-    out.level = left.level.max(right.level);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,7 +444,7 @@ mod tests {
             license: KnowledgeLicense::Attribution,
             epistemic_type: EpistemicType::Heuristic,
             content_type: ContentType::Skill,
-            half_life_days: Some(120.0),
+            half_life: Some(agent_context_db_core::HalfLife::Finite { days: 120.0 }),
             created_at: Utc::now(),
             expires_at: None,
         }
@@ -506,5 +504,23 @@ mod tests {
             .any(|o| o.action == EvolutionAction::Crossover && o.parent_ids == vec![a.id, b.id]));
         assert_eq!(report.culled.len(), 1);
         assert_eq!(report.culled[0].action, LineageAction::Deprecated);
+        for offspring in &report.offspring {
+            assert_eq!(
+                offspring.validation_status,
+                OffspringValidationStatus::Pending
+            );
+            assert_eq!(
+                offspring.required_validations,
+                vec!["consistency", "provenance", "adoption"]
+            );
+            assert!(offspring.entry.evidence_uris.is_empty());
+            assert_eq!(
+                offspring.entry.corroboration.level,
+                CorroborationLevel::Unverified
+            );
+            assert_eq!(offspring.entry.confidence, 0.0);
+            assert_eq!(offspring.entry.quality_score, 0.0);
+            assert!(offspring.entry.provenance.is_none());
+        }
     }
 }

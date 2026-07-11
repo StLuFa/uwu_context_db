@@ -74,17 +74,22 @@ impl SemanticAxis {
     /// 由于 `VectorIndex` 只返回命中 URI/score，不暴露原始向量，质心只做质量归一化；
     /// 新类簇仍由上游 `add_cluster` 在有新标签或新质心时显式创建。
     pub async fn recluster(&self, content_type: ContentType) -> usize {
-        let mut clusters = self.clusters.write();
-        let type_clusters = clusters.entry(content_type).or_default();
+        // 第一阶段只复制查询所需快照，不让同步锁跨越 await。
+        let cluster_snapshot = self
+            .clusters
+            .read()
+            .get(&content_type)
+            .cloned()
+            .unwrap_or_default();
+        let existing_count = cluster_snapshot.len();
+        let mut updates = Vec::with_capacity(existing_count);
 
-        let existing_count = type_clusters.len();
-
-        for cluster in type_clusters.iter_mut() {
+        for (index, cluster) in cluster_snapshot.into_iter().enumerate() {
             let hits = self
                 .index
                 .search(
                     "context",
-                    cluster.centroid.clone(),
+                    cluster.centroid,
                     64,
                     Some(serde_json::json!({
                         "content_type": content_type.as_path_segment()
@@ -92,6 +97,16 @@ impl SemanticAxis {
                 )
                 .await
                 .unwrap_or_default();
+            updates.push((index, hits));
+        }
+
+        // 第二阶段重新加锁并应用结果；并发新增类簇会被保留。
+        let mut clusters = self.clusters.write();
+        let type_clusters = clusters.entry(content_type).or_default();
+        for (index, hits) in updates {
+            let Some(cluster) = type_clusters.get_mut(index) else {
+                continue;
+            };
             if !hits.is_empty() {
                 let mut ranked = hits
                     .into_iter()
@@ -107,21 +122,23 @@ impl SemanticAxis {
                 if !ranked.is_empty() {
                     let score_mass = ranked.iter().map(|(_, score)| *score).sum::<f32>();
                     cluster.members = ranked.into_iter().map(|(uri, _)| uri).collect();
-                    normalize_centroid(&mut cluster.centroid, score_mass / cluster.members.len() as f32);
+                    normalize_centroid(
+                        &mut cluster.centroid,
+                        score_mass / cluster.members.len() as f32,
+                    );
                 }
             } else if cluster.members.len() > 1 {
                 normalize_centroid(&mut cluster.centroid, 0.5);
             }
         }
 
-        // 更新 cluster_paths
-        let mut paths = self.cluster_paths.write();
-        paths.clear();
-        for (_i, cluster) in type_clusters.iter().enumerate() {
-            if !cluster.members.is_empty() {
-                paths.insert(cluster.label.clone(), cluster.members.clone());
-            }
-        }
+        let rebuilt_paths = type_clusters
+            .iter()
+            .filter(|cluster| !cluster.members.is_empty())
+            .map(|cluster| (cluster.label.clone(), cluster.members.clone()))
+            .collect();
+        drop(clusters);
+        *self.cluster_paths.write() = rebuilt_paths;
 
         existing_count
     }

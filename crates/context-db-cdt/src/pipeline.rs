@@ -96,7 +96,7 @@ impl CognitiveTrainingPipeline {
                 // 成功轨迹 → 正梯度
                 let ct = ContentType::Skill; // 从 trajectory 推断
                 let grad = CognitiveGradient {
-                    source_uri: ContextUri::parse(&format!(
+                    source_uri: ContextUri::parse(format!(
                         "uwu://t/a/memory/skill/{}",
                         &pref.chosen.task_id
                     ))
@@ -393,18 +393,21 @@ impl CognitiveTrainingPipeline {
     }
 
     fn lifecycle_action_for_product(&self, product: &ConsolidationProduct) -> LifecycleAction {
-        let mut meta = ContextMeta::default();
-        meta.content_type = Some(product.content_type);
-        meta.epistemic_type = Some(product.epistemic_type);
-        meta.quality_score = Some(product.quality_score);
-        meta.validity = product.metadata.validity.clone();
-        meta.tags = match product.metadata.status {
-            ConsolidationStatus::Pending => vec!["pending".into()],
-            ConsolidationStatus::InProgress => vec!["in-progress".into()],
-            ConsolidationStatus::Converged => vec!["converged".into()],
-            ConsolidationStatus::Stale => vec!["stale".into()],
+        let meta = ContextMeta {
+            content_type: Some(product.content_type),
+            epistemic_type: Some(product.epistemic_type),
+            quality_score: Some(product.quality_score),
+            validity: product.metadata.validity.clone(),
+            tags: match product.metadata.status {
+                ConsolidationStatus::Pending => vec!["pending".into()],
+                ConsolidationStatus::InProgress => vec!["in-progress".into()],
+                ConsolidationStatus::Converged => vec!["converged".into()],
+                ConsolidationStatus::Stale => vec!["stale".into()],
+            },
+            ..Default::default()
         };
-        self.lifecycle.evaluate_entry(&[] as &[AccessEvent], &meta)
+        self.lifecycle
+            .evaluate_entry(&[] as &[AccessEvent], &meta, None, None)
     }
 
     /// 基于训练报告进行门控决策：是否替换当前策略。

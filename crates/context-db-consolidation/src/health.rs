@@ -81,18 +81,10 @@ pub struct KnowledgeHealthReport {
     pub issues: Vec<NodeHealth>,
 }
 
+#[derive(Default)]
 pub struct KnowledgeHealthDiagnostician {
     config: KnowledgeHealthConfig,
     graph: Option<Arc<dyn GraphStore>>,
-}
-
-impl Default for KnowledgeHealthDiagnostician {
-    fn default() -> Self {
-        Self {
-            config: KnowledgeHealthConfig::default(),
-            graph: None,
-        }
-    }
 }
 
 impl KnowledgeHealthDiagnostician {
@@ -294,16 +286,9 @@ pub struct ConsistencyGuardPlan {
     pub tasks: Vec<ConsistencyGuardTask>,
 }
 
+#[derive(Default)]
 pub struct ActiveConsistencyGuardian {
     config: ConsistencyGuardianConfig,
-}
-
-impl Default for ActiveConsistencyGuardian {
-    fn default() -> Self {
-        Self {
-            config: ConsistencyGuardianConfig::default(),
-        }
-    }
 }
 
 impl ActiveConsistencyGuardian {
@@ -468,20 +453,11 @@ pub struct ActiveLearningObservation {
     pub note: String,
 }
 
+#[derive(Default)]
 pub struct ActiveLearningLoop {
     planner: ActiveLearningPlanner,
     scorer: HorizonAwareQualityScorer,
     config: ActiveLearningExecutionConfig,
-}
-
-impl Default for ActiveLearningLoop {
-    fn default() -> Self {
-        Self {
-            planner: ActiveLearningPlanner::default(),
-            scorer: HorizonAwareQualityScorer::default(),
-            config: ActiveLearningExecutionConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -536,16 +512,9 @@ pub struct EmbeddingDriftReport {
     pub snapshot: Option<EmbeddingDistributionSnapshot>,
 }
 
+#[derive(Default)]
 pub struct EmbeddingDriftMonitor {
     config: EmbeddingDriftConfig,
-}
-
-impl Default for EmbeddingDriftMonitor {
-    fn default() -> Self {
-        Self {
-            config: EmbeddingDriftConfig::default(),
-        }
-    }
 }
 
 impl EmbeddingDriftMonitor {
@@ -678,16 +647,9 @@ pub struct CuriosityTask {
     pub reason: String,
 }
 
+#[derive(Default)]
 pub struct CuriosityExplorer {
     config: CuriosityExplorerConfig,
-}
-
-impl Default for CuriosityExplorer {
-    fn default() -> Self {
-        Self {
-            config: CuriosityExplorerConfig::default(),
-        }
-    }
 }
 
 impl CuriosityExplorer {
@@ -1072,12 +1034,11 @@ fn dependency_counts(entries: &[&ContextEntry]) -> HashMap<ContextUri, usize> {
                 *counts.entry(uri.clone()).or_insert(0) += 1;
             }
         }
-        if let Some(validity) = &entry.metadata.validity {
-            if let Some(uri) = &validity.invalidated_by {
-                if known.contains(uri) {
-                    *counts.entry(uri.clone()).or_insert(0) += 1;
-                }
-            }
+        if let Some(validity) = &entry.metadata.validity
+            && let Some(uri) = &validity.invalidated_by
+            && known.contains(uri)
+        {
+            *counts.entry(uri.clone()).or_insert(0) += 1;
         }
     }
     counts
@@ -1100,9 +1061,11 @@ fn is_epistemic_claim(entry: &ContextEntry) -> bool {
 }
 
 fn is_currently_valid(entry: &ContextEntry, now: DateTime<Utc>) -> bool {
-    entry.metadata.validity.as_ref().map_or(true, |validity| {
-        validity.valid_until.map_or(true, |until| until > now)
-    })
+    entry
+        .metadata
+        .validity
+        .as_ref()
+        .is_none_or(|validity| validity.valid_until.is_none_or(|until| until > now))
 }
 
 fn same_evidence(a: &ContextEntry, b: &ContextEntry) -> bool {
@@ -1319,7 +1282,7 @@ mod tests {
             }],
             evidence_uris,
             corroboration,
-            half_life_days: None,
+            half_life: None,
             entangled_with,
         }
     }

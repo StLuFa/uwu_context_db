@@ -158,14 +158,14 @@ impl CdtConsolidationBridge {
     }
 
     pub fn product_from_signal(&self, signal: &CdtConsolidationSignal) -> ConsolidationProduct {
-        let (
+        let ProductDetails {
             superseded_claim,
             error_pattern,
             default_hypothesis_outcome,
             preconditions,
             expected_outcome,
             related_policy_uris,
-        ) = product_details(signal);
+        } = product_details(signal);
         let hypothesis_outcome = signal
             .hypothesis_outcome
             .map(|outcome| match outcome {
@@ -206,7 +206,9 @@ impl CdtConsolidationBridge {
                     invalidated_by: None,
                     invalidation_reason: None,
                 }),
-                half_life_days: Some(30.0 + signal.quality_score.clamp(0.0, 1.0) as f64 * 60.0),
+                half_life: Some(agent_context_db_core::HalfLife::Finite {
+                    days: 30.0 + signal.quality_score.clamp(0.0, 1.0) as f64 * 60.0,
+                }),
             },
         }
     }
@@ -237,7 +239,9 @@ impl CdtConsolidationBridge {
             }],
             evidence_uris: signal.evidence_uris.clone(),
             corroboration: signal.evidence_uris.len(),
-            half_life_days: Some(30.0 + signal.quality_score.clamp(0.0, 1.0) as f64 * 60.0),
+            half_life: Some(agent_context_db_core::HalfLife::Finite {
+                days: 30.0 + signal.quality_score.clamp(0.0, 1.0) as f64 * 60.0,
+            }),
             entangled_with: signal.contradiction_uris.clone(),
         });
         let _ = entry
@@ -333,7 +337,7 @@ impl CdtConsolidationBridge {
     fn make_uri(&self, content_type: &str, index: usize, content: &str) -> ContextUri {
         let hash = blake3::hash(content.as_bytes()).to_hex();
         let short = &hash[..8];
-        ContextUri::parse(&format!(
+        ContextUri::parse(format!(
             "uwu://{}/memory/{}/{:02}-{}",
             self.agent_scope, content_type, index, short
         ))
@@ -341,36 +345,36 @@ impl CdtConsolidationBridge {
     }
 }
 
-fn product_details(
-    signal: &CdtConsolidationSignal,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<ProductHypothesisOutcome>,
-    Option<String>,
-    Option<String>,
-    Vec<ContextUri>,
-) {
+#[derive(Default)]
+struct ProductDetails {
+    superseded_claim: Option<String>,
+    error_pattern: Option<String>,
+    default_hypothesis_outcome: Option<ProductHypothesisOutcome>,
+    preconditions: Option<String>,
+    expected_outcome: Option<String>,
+    related_policy_uris: Vec<ContextUri>,
+}
+
+fn product_details(signal: &CdtConsolidationSignal) -> ProductDetails {
     match signal.content_type {
-        ContentType::Error => (None, Some(signal.content.clone()), None, None, None, vec![]),
-        ContentType::Hypothesis => (
-            None,
-            None,
-            Some(ProductHypothesisOutcome::Inconclusive),
-            None,
-            None,
-            vec![],
-        ),
-        ContentType::Skill | ContentType::Procedure => (
-            None,
-            None,
-            None,
-            Some("derived from CDT accepted trajectory".into()),
-            Some(signal.content.clone()),
-            vec![],
-        ),
-        ContentType::Reflection => (None, None, None, None, None, signal.evidence_uris.clone()),
-        _ => (None, None, None, None, None, vec![]),
+        ContentType::Error => ProductDetails {
+            error_pattern: Some(signal.content.clone()),
+            ..Default::default()
+        },
+        ContentType::Hypothesis => ProductDetails {
+            default_hypothesis_outcome: Some(ProductHypothesisOutcome::Inconclusive),
+            ..Default::default()
+        },
+        ContentType::Skill | ContentType::Procedure => ProductDetails {
+            preconditions: Some("derived from CDT accepted trajectory".into()),
+            expected_outcome: Some(signal.content.clone()),
+            ..Default::default()
+        },
+        ContentType::Reflection => ProductDetails {
+            related_policy_uris: signal.evidence_uris.clone(),
+            ..Default::default()
+        },
+        _ => ProductDetails::default(),
     }
 }
 

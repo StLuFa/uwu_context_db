@@ -1,31 +1,33 @@
 # agent-context-db-session
 
-两阶段 commit 会话压缩。
+持久化、幂等、可重试并支持进程重启恢复的会话压缩状态机。
 
-## 流程
+## 状态与流程
 
+```text
+enqueue: messages.jsonl + Pending task record
+run/retry/recover: Processing(attempt)
+  -> MemoryExtractor::extract
+  -> MemoryExtractor::deduplicate
+  -> SemanticProcessor::generate_abstract
+  -> SemanticProcessor::aggregate_upward
+  -> memory_diff.json
+  -> .done
+  -> Done
+failure: Failed(message, attempt, failed_at, retryable)
 ```
-Phase1 (同步): 归档消息 → 写 messages.jsonl → 返回 task_id
-Phase2 (异步): MemoryExtractor::extract → deduplicate → SemanticProcessor::generate
-               → 写入 ContextStore → memory_diff.json → .done 标记
-```
 
-## 核心类型
+任务 ID 由 `session_id + compression_index + archive_dir` 确定性生成。任务记录和输出均写入注入的 `SessionTaskStore`；重建 `SessionCompressorImpl` 后可通过 `poll` 查询，通过 `recover` 恢复 Pending、Processing 或 Failed 任务。已完成任务再次执行 `run` 会直接返回持久化的 `DoneMarker`，不会重复执行语义管线。
+
+## API
 
 ```rust
-pub trait SessionCompressor: Send + Sync {
-    async fn commit_phase1(&self, session: &SessionHandle) -> Result<CommitTaskId>;
-    async fn commit_phase2(&self, task_id: CommitTaskId) -> Result<DoneMarker>;
-    async fn poll_task(&self, task_id: CommitTaskId) -> Result<TaskStatus>;
-}
-
-pub struct SessionHandle {
-    pub session_id: Uuid, pub user_id: String, pub agent_id: String,
-    pub messages: Vec<SessionMessage>, pub compression_index: u64,
-    pub archive_dir: ContextUri,
-}
+let compressor = SessionCompressorImpl::new(store, extractor, semantic);
+let task_id = compressor.enqueue(&session).await?;
+let status = compressor.poll(&session, task_id).await?;
+let done = compressor.run(&session).await?;
+let done = compressor.retry(&session, task_id).await?;
+let done = compressor.recover(&session).await?;
 ```
 
-## 实现
-
-`SessionCompressorImpl` — Phase1 归档到 ContentRepo，Phase2 标记完成。语义处理由上层编排注入。
+`MemoryExtractor` 和 `SemanticProcessor` 是正式编排依赖，构造 compressor 时必须提供，不存在只写完成标记而跳过语义处理的 API。

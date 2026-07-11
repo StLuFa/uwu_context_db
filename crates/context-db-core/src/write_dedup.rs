@@ -3,11 +3,12 @@
 //! The decorator is intentionally store-agnostic: it wraps any `ContentStore`,
 //! scans the target URI scope, and suppresses near-duplicate writes before they
 //! can trigger downstream embedding/consolidation work.
+use crate::{Page, PageRequest};
 
 use async_trait::async_trait;
 
 use crate::{
-    BrowsingOps, ContentLevel, ContentPayload, ContentRepo, ContentStore, ContextDiff,
+    BrowsingOps, ContentLevel, ContentPayload, ContentRepo, ContentStore, ContentType, ContextDiff,
     ContextEntry, ContextError, ContextUri, DirEntry, FindPattern, FsOps, GrepHit, MvccVersion,
     Result, TenantId, TenantOps, TreeNode, VersionEntry, VersionOps,
 };
@@ -65,20 +66,25 @@ impl<R> FsOps for SemanticWriteDedupStore<R>
 where
     R: FsOps + Send + Sync,
 {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
-        self.inner.ls(dir).await
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
+        self.inner.ls(dir, page).await
     }
 
-    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>> {
-        self.inner.find(pattern).await
+    async fn find(&self, pattern: &FindPattern, page: PageRequest) -> Result<Page<ContextUri>> {
+        self.inner.find(pattern, page).await
     }
 
     async fn grep(&self, regex: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
         self.inner.grep(regex, scope).await
     }
 
-    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
-        self.inner.tree(root, depth).await
+    async fn tree(
+        &self,
+        root: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
+        self.inner.tree(root, depth, page).await
     }
 
     async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload> {
@@ -91,16 +97,26 @@ impl<R> BrowsingOps for SemanticWriteDedupStore<R>
 where
     R: BrowsingOps + Send + Sync,
 {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
-        self.inner.ls(dir).await
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
+        self.inner.ls(dir, page).await
     }
 
-    async fn tree(&self, dir: &ContextUri, depth: usize) -> Result<TreeNode> {
-        self.inner.tree(dir, depth).await
+    async fn tree(
+        &self,
+        dir: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
+        self.inner.tree(dir, depth, page).await
     }
 
-    async fn find(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<ContextUri>> {
-        self.inner.find(scope, pattern).await
+    async fn find(
+        &self,
+        scope: &ContextUri,
+        pattern: &str,
+        page: PageRequest,
+    ) -> Result<Page<ContextUri>> {
+        self.inner.find(scope, pattern, page).await
     }
 
     async fn grep(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<GrepHit>> {
@@ -113,8 +129,12 @@ impl<R> VersionOps for SemanticWriteDedupStore<R>
 where
     R: VersionOps + Send + Sync,
 {
-    async fn version_history(&self, uri: &ContextUri) -> Result<Vec<VersionEntry>> {
-        self.inner.version_history(uri).await
+    async fn version_history(
+        &self,
+        uri: &ContextUri,
+        page: PageRequest,
+    ) -> Result<Page<VersionEntry>> {
+        self.inner.version_history(uri, page).await
     }
 
     async fn rollback(&self, uri: &ContextUri, to: MvccVersion) -> Result<()> {
@@ -131,8 +151,8 @@ impl<R> TenantOps for SemanticWriteDedupStore<R>
 where
     R: TenantOps + Send + Sync,
 {
-    async fn list_tenants(&self) -> Result<Vec<TenantId>> {
-        self.inner.list_tenants().await
+    async fn list_tenants(&self, page: PageRequest) -> Result<Page<TenantId>> {
+        self.inner.list_tenants(page).await
     }
 }
 
@@ -169,8 +189,17 @@ where
         Ok(versions)
     }
 
-    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
-        self.inner.scan_by_prefix(prefix, limit).await
+    async fn scan_by_prefix(&self, prefix: &str, page: PageRequest) -> Result<Page<ContextEntry>> {
+        self.inner.scan_by_prefix(prefix, page).await
+    }
+
+    async fn scan_by_type(
+        &self,
+        prefix: &str,
+        content_type: ContentType,
+        page: PageRequest,
+    ) -> Result<Page<ContextEntry>> {
+        self.inner.scan_by_type(prefix, content_type, page).await
     }
 }
 
@@ -212,7 +241,9 @@ async fn find_duplicate(
     }
 
     let prefix = dedup_scope_prefix(&entry.uri);
-    let existing_entries = store.scan_by_prefix(&prefix, config.scan_limit).await?;
+    let existing_entries = store
+        .scan_by_prefix(&prefix, PageRequest::new(config.scan_limit))
+        .await?;
 
     let mut best: Option<WriteDedupDecision> = None;
     for existing in existing_entries {
@@ -385,22 +416,48 @@ mod tests {
             Ok(versions)
         }
 
-        async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
-            Ok(self
+        async fn scan_by_prefix(
+            &self,
+            prefix: &str,
+            page: PageRequest,
+        ) -> Result<Page<ContextEntry>> {
+            let entries = self
                 .entries
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|entry| entry.uri.to_string().starts_with(prefix))
-                .take(limit)
+                .take(page.effective_limit())
                 .cloned()
-                .collect())
+                .collect();
+            Ok(Page::new(entries, None))
+        }
+
+        async fn scan_by_type(
+            &self,
+            prefix: &str,
+            content_type: ContentType,
+            page: PageRequest,
+        ) -> Result<Page<ContextEntry>> {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.uri.to_string().starts_with(prefix))
+                .filter(|entry| entry.metadata.content_type == Some(content_type))
+                .take(page.effective_limit())
+                .cloned()
+                .collect();
+            Ok(Page::new(entries, None))
         }
     }
 
     fn entry(uri: &str, text: &str) -> ContextEntry {
-        let mut metadata = ContextMeta::default();
-        metadata.content_type = Some(ContentType::Fact);
+        let metadata = ContextMeta {
+            content_type: Some(ContentType::Fact),
+            ..Default::default()
+        };
         ContextEntry {
             uri: ContextUri::parse(uri).unwrap(),
             tenant: TenantId(Uuid::nil()),

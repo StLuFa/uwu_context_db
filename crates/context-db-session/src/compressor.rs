@@ -1,425 +1,300 @@
-//! `SessionCompressorImpl`：两阶段 commit 会话压缩器实现。
-//!
-//! - Phase1（同步）：归档消息 → 写入 FS → 返回 task_id
-//! - Phase2（异步）：语义处理（去重 → L0/L1 生成 → 写 .done 标记）
-
-use agent_context_db_core::{
-    ContentPayload, ContentRepo, ContentType, ContextEntry, ContextMeta, ContextUri, MediaType,
-    MvccVersion, Result, TenantId,
-};
-use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::Arc;
+//! 持久化会话压缩状态机及正式语义编排。
 
 use crate::{
-    CommitTaskId, DoneMarker, MemoryChange, MemoryDiff, SessionCompressor, SessionHandle,
-    TaskStatus,
+    CommitTaskId, DoneMarker, FailureMetadata, MemoryChange, MemoryDiff, SessionHandle, TaskStatus,
 };
+use agent_context_db_core::{
+    ContentLevel, ContentPayload, ContentRepo, ContextEntry, ContextError, ContextMeta, ContextUri,
+    FsOps, MediaType, MvccVersion, Result, TenantId,
+};
+use agent_context_db_parse::{CandidateAction, MemoryExtractor, SemanticProcessor};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, sync::Arc};
 
-/// 会话压缩器实现。
-///
-/// Phase1 将消息写入 FS 归档目录；Phase2 执行完整的语义管线：
-/// 记忆提取 → 去重 → L0/L1 生成 → 写 memory_diff → 标记完成。
-pub struct SessionCompressorImpl {
-    store: Arc<dyn ContentRepo>,
-    /// Phase1 → Phase2 间暂存的会话句柄。
-    pending: Mutex<HashMap<CommitTaskId, PendingSession>>,
+pub trait SessionTaskStore: ContentRepo + FsOps {}
+impl<T: ContentRepo + FsOps> SessionTaskStore for T {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskRecord {
+    task_id: CommitTaskId,
+    session: SessionHandle,
+    archive_uri: ContextUri,
+    status: TaskStatus,
+    attempt: u32,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub struct PendingSession {
-    pub handle: SessionHandle,
-    pub archive_uri: ContextUri,
+pub struct SessionCompressorImpl {
+    store: Arc<dyn SessionTaskStore>,
+    extractor: Arc<dyn MemoryExtractor>,
+    semantic: Arc<dyn SemanticProcessor>,
+    active: Mutex<HashSet<CommitTaskId>>,
 }
 
 impl SessionCompressorImpl {
-    pub fn new(store: Arc<dyn ContentRepo>) -> Self {
+    pub fn new(
+        store: Arc<dyn SessionTaskStore>,
+        extractor: Arc<dyn MemoryExtractor>,
+        semantic: Arc<dyn SemanticProcessor>,
+    ) -> Self {
         Self {
             store,
-            pending: Mutex::new(HashMap::new()),
+            extractor,
+            semantic,
+            active: Mutex::new(HashSet::new()),
         }
     }
 
-    /// 获取暂存的会话句柄（供上层编排 Phase2 语义处理）。
-    pub fn take_pending(&self, task_id: &CommitTaskId) -> Option<PendingSession> {
-        self.pending.lock().remove(task_id)
-    }
-
-    /// 归档 URI：`{archive_dir}/{compression_index}/messages.jsonl`
     pub fn archive_file_uri(session: &SessionHandle) -> ContextUri {
         session
             .archive_dir
             .join(&session.compression_index.to_string())
             .join("messages.jsonl")
     }
-}
 
-fn session_preview(session: &SessionHandle, max_chars: usize) -> String {
-    let mut preview = String::new();
-    for msg in &session.messages {
-        if !preview.is_empty() {
-            preview.push('\n');
-        }
-        preview.push_str(match msg.role {
-            crate::Role::User => "user: ",
-            crate::Role::Assistant => "assistant: ",
-            crate::Role::System => "system: ",
-            crate::Role::Tool => "tool: ",
-        });
-        preview.push_str(&msg.content);
-        if preview.chars().count() >= max_chars {
-            return preview.chars().take(max_chars).collect();
-        }
+    fn state_uri(session: &SessionHandle, task_id: CommitTaskId) -> ContextUri {
+        session
+            .archive_dir
+            .join("tasks")
+            .join(&format!("{}.json", task_id.0))
     }
-    preview
-}
 
-fn encode_compressed_jsonl(jsonl: &str) -> String {
-    match zstd::encode_all(jsonl.as_bytes(), 3) {
-        Ok(compressed) => format!("zstd+base64:{}", BASE64.encode(compressed)),
-        Err(_) => format!("plain:{}", jsonl),
+    fn diff_uri(session: &SessionHandle) -> ContextUri {
+        session
+            .archive_dir
+            .join(&session.compression_index.to_string())
+            .join("memory_diff.json")
     }
-}
 
-#[async_trait]
-impl SessionCompressor for SessionCompressorImpl {
-    async fn commit_phase1(&self, session: &SessionHandle) -> Result<CommitTaskId> {
-        let task_id = CommitTaskId::new();
+    fn done_uri(session: &SessionHandle) -> ContextUri {
+        session
+            .archive_dir
+            .join(&session.compression_index.to_string())
+            .join(".done")
+    }
+
+    fn task_id(session: &SessionHandle) -> CommitTaskId {
+        let key = format!(
+            "{}:{}:{}",
+            session.session_id, session.compression_index, session.archive_dir
+        );
+        CommitTaskId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            key.as_bytes(),
+        ))
+    }
+
+    pub async fn enqueue(&self, session: &SessionHandle) -> Result<CommitTaskId> {
+        let task_id = Self::task_id(session);
+        if self
+            .load_record(&Self::state_uri(session, task_id))
+            .await
+            .is_ok()
+        {
+            return Ok(task_id);
+        }
         let archive_uri = Self::archive_file_uri(session);
-
-        // 将消息序列化为 JSONL
-        let mut jsonl = String::new();
-        for msg in &session.messages {
-            let line = serde_json::to_string(msg).unwrap_or_default();
-            jsonl.push_str(&line);
-            jsonl.push('\n');
-        }
-
-        // 写入归档条目
-        let abstract_text = format!(
-            "session {} compression #{} with {} messages",
-            session.session_id,
-            session.compression_index,
-            session.messages.len()
-        );
-        let dense_preview = session_preview(session, 2048);
-        let compressed_full = encode_compressed_jsonl(&jsonl);
-        let entry = ContextEntry {
-            uri: archive_uri.clone(),
-            tenant: TenantId(uuid::Uuid::nil()),
-            payload: ContentPayload::Text {
-                sparse: abstract_text,
-                dense: dense_preview,
-                full: compressed_full,
-            },
-            media_type: MediaType::Text,
-            metadata: ContextMeta::default(),
-            mvcc_version: MvccVersion(0),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            derivation: None,
-        };
-
-        self.store.write(entry).await?;
-
-        // 暂存会话句柄供 Phase2 使用
-        self.pending.lock().insert(
+        self.store
+            .write(text_entry(archive_uri.clone(), archive_payload(session)?))
+            .await?;
+        let now = chrono::Utc::now();
+        let record = TaskRecord {
             task_id,
-            PendingSession {
-                handle: session.clone(),
-                archive_uri,
-            },
-        );
-
+            session: session.clone(),
+            archive_uri,
+            status: TaskStatus::Pending,
+            attempt: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        self.save_record(&record).await?;
         Ok(task_id)
     }
 
-    async fn commit_phase2(&self, task_id: CommitTaskId) -> Result<DoneMarker> {
-        // Phase2：上层负责在 Phase1 和 Phase2 之间调用语义管线
-        // (MemoryExtractor + SemanticProcessor)，完成后再调用此方法标记完成。
-        let pending = self.take_pending(&task_id).ok_or_else(|| {
-            agent_context_db_core::ContextError::NotFound(format!(
-                "no pending session for task {task_id:?}"
-            ))
-        })?;
-
-        // 写 memory_diff（由上层预先生成）
-        let memory_diff_uri = pending
-            .handle
-            .archive_dir
-            .join(&pending.handle.compression_index.to_string())
-            .join("memory_diff.json");
-
-        // 写 .done 标记
-        let done_uri = pending
-            .handle
-            .archive_dir
-            .join(&pending.handle.compression_index.to_string())
-            .join(".done");
-
-        let done_marker = DoneMarker {
-            task_id,
-            finished_at: chrono::Utc::now(),
-            abstract_uri: pending.archive_uri.clone(),
-            overview_uri: pending.archive_uri.clone(),
-            memory_diff_uri: Some(memory_diff_uri),
-        };
-
-        let done_text = format!("done: {done_marker:?}");
-        let done_entry = ContextEntry {
-            uri: done_uri,
-            tenant: TenantId(uuid::Uuid::nil()),
-            payload: ContentPayload::Text {
-                sparse: done_text.clone(),
-                dense: done_text.clone(),
-                full: done_text,
-            },
-            media_type: MediaType::Text,
-            metadata: ContextMeta::default(),
-            mvcc_version: MvccVersion(0),
-            created_at: done_marker.finished_at,
-            updated_at: done_marker.finished_at,
-            derivation: None,
-        };
-
-        self.store.write(done_entry).await?;
-
-        Ok(done_marker)
+    pub async fn run(&self, session: &SessionHandle) -> Result<DoneMarker> {
+        let task_id = self.enqueue(session).await?;
+        self.process(session, task_id).await
     }
 
-    async fn poll_task(&self, task_id: CommitTaskId) -> Result<TaskStatus> {
-        match self.pending.lock().get(&task_id) {
-            Some(_) => Ok(TaskStatus::Processing),
-            None => Ok(TaskStatus::Failed(
-                "task not found or already completed".into(),
-            )),
+    pub async fn retry(
+        &self,
+        session: &SessionHandle,
+        task_id: CommitTaskId,
+    ) -> Result<DoneMarker> {
+        self.process(session, task_id).await
+    }
+
+    pub async fn recover(&self, session: &SessionHandle) -> Result<DoneMarker> {
+        let task_id = Self::task_id(session);
+        self.process(session, task_id).await
+    }
+
+    pub async fn poll(&self, session: &SessionHandle, task_id: CommitTaskId) -> Result<TaskStatus> {
+        Ok(self
+            .load_record(&Self::state_uri(session, task_id))
+            .await?
+            .status)
+    }
+
+    async fn process(&self, session: &SessionHandle, task_id: CommitTaskId) -> Result<DoneMarker> {
+        let state_uri = Self::state_uri(session, task_id);
+        let mut record = self.load_record(&state_uri).await?;
+        if let TaskStatus::Done(done) = record.status {
+            return Ok(done);
         }
+        if !self.active.lock().insert(task_id) {
+            return Err(ContextError::VersionConflict(
+                "compression task is already processing".into(),
+            ));
+        }
+        let result = self.process_inner(&mut record).await;
+        self.active.lock().remove(&task_id);
+        result
+    }
+
+    async fn process_inner(&self, record: &mut TaskRecord) -> Result<DoneMarker> {
+        record.attempt += 1;
+        record.updated_at = chrono::Utc::now();
+        record.status = TaskStatus::Processing {
+            attempt: record.attempt,
+            started_at: record.updated_at,
+        };
+        self.save_record(record).await?;
+
+        let result = self.execute_pipeline(record).await;
+        match result {
+            Ok(done) => {
+                // All artifacts are durable before this single persisted terminal transition.
+                record.status = TaskStatus::Done(done.clone());
+                record.updated_at = done.finished_at;
+                self.save_record(record).await?;
+                Ok(done)
+            }
+            Err(error) => {
+                record.updated_at = chrono::Utc::now();
+                record.status = TaskStatus::Failed(FailureMetadata {
+                    message: error.to_string(),
+                    attempt: record.attempt,
+                    failed_at: record.updated_at,
+                    retryable: true,
+                });
+                self.save_record(record).await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_pipeline(&self, record: &TaskRecord) -> Result<DoneMarker> {
+        let candidates = self.extractor.extract(&record.archive_uri).await?;
+        let decisions = self.extractor.deduplicate(candidates).await?;
+        let mut diff = MemoryDiff::default();
+        for decision in decisions {
+            match decision.action {
+                CandidateAction::Create => {
+                    let target_uri = decision
+                        .candidate
+                        .source_uri
+                        .join(&format!("memories/{}", uuid::Uuid::new_v4()));
+                    let abstract_text = self.semantic.generate_abstract(&target_uri).await?;
+                    diff.adds.push(MemoryChange {
+                        uri: target_uri,
+                        content_type: decision.candidate.content_type,
+                        before: None,
+                        after: Some(serde_json::json!({"abstract": abstract_text})),
+                        reason: decision.reason,
+                    });
+                }
+                CandidateAction::Merge => diff.updates.push(MemoryChange {
+                    uri: decision.merge_target.ok_or_else(|| {
+                        ContextError::Storage("validated merge decision lost merge target".into())
+                    })?,
+                    content_type: decision.candidate.content_type,
+                    before: None,
+                    after: Some(serde_json::json!({"merged": true})),
+                    reason: decision.reason,
+                }),
+                CandidateAction::Skip => {}
+            }
+        }
+        let parent = record
+            .archive_uri
+            .parent()
+            .ok_or_else(|| ContextError::InvalidUri("archive has no parent".into()))?;
+        let overview = self.semantic.aggregate_upward(&parent).await?;
+        let diff_uri = Self::diff_uri(&record.session);
+        self.store
+            .write(text_entry(diff_uri.clone(), serde_json::to_string(&diff)?))
+            .await?;
+        let done = DoneMarker {
+            task_id: record.task_id,
+            finished_at: chrono::Utc::now(),
+            abstract_uri: record.archive_uri.clone(),
+            overview_uri: parent,
+            memory_diff_uri: diff_uri,
+        };
+        self.store
+            .write(text_entry(
+                Self::done_uri(&record.session),
+                serde_json::to_string(&done)?,
+            ))
+            .await?;
+        let _ = overview;
+        Ok(done)
+    }
+
+    async fn load_record(&self, uri: &ContextUri) -> Result<TaskRecord> {
+        let payload = self.store.read(uri, ContentLevel::L2).await?;
+        let text = payload_text(payload);
+        serde_json::from_str(&text).map_err(Into::into)
+    }
+
+    async fn save_record(&self, record: &TaskRecord) -> Result<()> {
+        let uri = Self::state_uri(&record.session, record.task_id);
+        self.store
+            .write(text_entry(uri, serde_json::to_string(record)?))
+            .await?;
+        Ok(())
     }
 }
 
-// ===========================================================================
-// 高层编排函数（组合 SessionCompressor + 语义管线）
-// ===========================================================================
-
-/// 完整的两阶段 commit 编排：Phase1 归档 → Phase2 语义处理 → 标记完成。
-///
-/// `extractor` 和 `semantic` 由上层注入。
-/// 管线流程：
-///   1. Phase1: 归档消息到 FS
-///   2. 提取记忆候选项
-///   3. 去重（合并/跳过/新建）
-///   4. 生成 L0 摘要（每条新/更新的记忆）
-///   5. 生成 L1 概览（聚合到父目录）
-///   6. 写 memory_diff.json
-///   7. Phase2: 标记完成
-pub async fn run_full_compression(
-    compressor: &SessionCompressorImpl,
-    extractor: &dyn MemoryExtractorShim,
-    semantic: &dyn SemanticProcessorShim,
-    session: &SessionHandle,
-) -> Result<DoneMarker> {
-    // Phase1: 归档
-    let task_id = compressor.commit_phase1(session).await?;
-
-    let pending = compressor
-        .take_pending(&task_id)
-        .ok_or_else(|| agent_context_db_core::ContextError::NotFound("task disappeared".into()))?;
-
-    // Phase2: 语义处理管线
-
-    // 1. 提取记忆候选项
-    let candidates = extractor.extract(&pending.archive_uri).await?;
-
-    // 2. 去重
-    let decisions = extractor.deduplicate(candidates).await?;
-
-    // 3. 分流：新建 / 合并 / 跳过
-    let mut memory_diff = MemoryDiff::default();
-    for dec in &decisions {
-        match dec.action {
-            ShimAction::Create => {
-                // 为新记忆生成 L0 摘要
-                let _abstract_ = semantic.generate_abstract(&dec.target_uri).await?;
-                memory_diff.adds.push(MemoryChange {
-                    uri: dec.target_uri.clone(),
-                    content_type: dec.content_type,
-                    before: None,
-                    after: Some(serde_json::json!({"abstract": _abstract_})),
-                    reason: dec.reason.clone(),
-                });
-            }
-            ShimAction::Merge => {
-                memory_diff.updates.push(MemoryChange {
-                    uri: dec.target_uri.clone(),
-                    content_type: dec.content_type,
-                    before: None,
-                    after: Some(serde_json::json!({"merged": true})),
-                    reason: dec.reason.clone(),
-                });
-            }
-            ShimAction::Skip => {
-                // 不需要操作
-            }
-        }
+fn payload_text(payload: ContentPayload) -> String {
+    match payload {
+        ContentPayload::Text { full, .. } => full,
+        _ => String::new(),
     }
+}
 
-    // 4. 聚合 L1 概览（对归档目录的父目录）
-    if let Some(parent) = pending.archive_uri.parent() {
-        let _ = semantic.aggregate_upward(&parent).await;
-    }
-
-    // 5. 写 memory_diff 到归档
-    let diff_uri = pending
-        .handle
-        .archive_dir
-        .join(&pending.handle.compression_index.to_string())
-        .join("memory_diff.json");
-    let diff_json = serde_json::to_string(&memory_diff)?;
-
-    let abstract_text = format!(
-        "memory diff: {} adds, {} updates, {} deletes",
-        memory_diff.adds.len(),
-        memory_diff.updates.len(),
-        memory_diff.deletes.len()
-    );
-    let diff_entry = ContextEntry {
-        uri: diff_uri,
+fn text_entry(uri: ContextUri, text: String) -> ContextEntry {
+    let now = chrono::Utc::now();
+    ContextEntry {
+        uri,
         tenant: TenantId(uuid::Uuid::nil()),
         payload: ContentPayload::Text {
-            sparse: abstract_text,
-            dense: diff_json,
-            full: String::new(),
+            sparse: text.clone(),
+            dense: text.clone(),
+            full: text,
         },
         media_type: MediaType::Text,
         metadata: ContextMeta::default(),
         mvcc_version: MvccVersion(0),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: now,
+        updated_at: now,
         derivation: None,
-    };
-    compressor.store.write(diff_entry).await?;
-
-    // 6. Phase2: 标记完成
-    let done = compressor.commit_phase2(task_id).await?;
-    Ok(done)
+    }
 }
 
-// ===========================================================================
-// Phase2 语义处理的 trait shim（避免 session 直接依赖 parse crate）
-// ===========================================================================
-
-/// 去重决策（shim 版本，不含 parse crate 的 MemoryCandidate）。
-#[derive(Debug, Clone)]
-pub struct ShimCandidateAction {
-    pub target_uri: ContextUri,
-    pub content_type: ContentType,
-    pub action: ShimAction,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShimAction {
-    Skip,
-    Create,
-    Merge,
-}
-
-/// Phase2 记忆提取 trait shim。
-///
-/// 避免 session crate 直接依赖 parse crate。
-/// 实际实现在 context-db-parse crate 中，由 composition root 注入。
-#[async_trait]
-pub trait MemoryExtractorShim: Send + Sync {
-    /// 从归档中提取记忆候选项（返回候选内容列表）。
-    async fn extract(&self, archive: &ContextUri) -> Result<Vec<String>>;
-
-    /// 对候选项集合去重，返回每个候选项的决策。
-    async fn deduplicate(&self, candidates: Vec<String>) -> Result<Vec<ShimCandidateAction>>;
-}
-
-/// Phase2 语义处理 trait shim。
-///
-/// 避免 session crate 直接依赖 parse crate。
-#[async_trait]
-pub trait SemanticProcessorShim: Send + Sync {
-    /// 为 URI 生成 L0 摘要。
-    async fn generate_abstract(&self, uri: &ContextUri) -> Result<String>;
-
-    /// 自底向上聚合：为目录生成 L1 概览，返回生成的文本。
-    async fn aggregate_upward(&self, root: &ContextUri) -> Result<String>;
+fn archive_payload(session: &SessionHandle) -> Result<String> {
+    let mut jsonl = String::new();
+    for message in &session.messages {
+        jsonl.push_str(&serde_json::to_string(message)?);
+        jsonl.push('\n');
+    }
+    let compressed = zstd::encode_all(jsonl.as_bytes(), 3).map_err(ContextError::Io)?;
+    Ok(format!("zstd+base64:{}", BASE64.encode(compressed)))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Role, SessionMessage};
-    use agent_context_db_core::FsOps;
-
-    fn make_session() -> SessionHandle {
-        SessionHandle {
-            session_id: uuid::Uuid::new_v4(),
-            user_id: "u1".into(),
-            agent_id: "a1".into(),
-            messages: vec![
-                SessionMessage {
-                    role: Role::User,
-                    content: "hello".into(),
-                    timestamp: chrono::Utc::now(),
-                    metadata: serde_json::Value::Null,
-                },
-                SessionMessage {
-                    role: Role::Assistant,
-                    content: "hi there".into(),
-                    timestamp: chrono::Utc::now(),
-                    metadata: serde_json::Value::Null,
-                },
-            ],
-            compression_index: 0,
-            archive_dir: ContextUri::parse("uwu://t1/sessions/s1/archive").unwrap(),
-        }
-    }
-
-    #[test]
-    fn archive_uri_contains_index_and_filename() {
-        let s = make_session();
-        let uri = SessionCompressorImpl::archive_file_uri(&s);
-        assert!(uri.to_string().contains("messages.jsonl"));
-        assert!(uri.to_string().contains("/0/"));
-    }
-
-    #[tokio::test]
-    async fn phase1_stores_preview_and_compressed_full_archive() {
-        let store = std::sync::Arc::new(agent_context_db_testkit::MemoryContextStore::new());
-        let compressor = SessionCompressorImpl::new(store.clone());
-        let session = make_session();
-        compressor.commit_phase1(&session).await.unwrap();
-
-        let payload = store
-            .read(
-                &SessionCompressorImpl::archive_file_uri(&session),
-                agent_context_db_core::ContentLevel::L2,
-            )
-            .await
-            .unwrap();
-        let ContentPayload::Text {
-            sparse,
-            dense,
-            full,
-        } = payload
-        else {
-            panic!("expected text payload");
-        };
-        assert!(sparse.contains("compression #0"));
-        assert!(dense.contains("user: hello"));
-        assert!(!dense.contains("{\"role\""));
-        assert!(full.starts_with("zstd+base64:"));
-    }
-
-    #[test]
-    fn shim_action_display() {
-        assert_eq!(ShimAction::Skip as u8, 0);
-        assert_eq!(ShimAction::Create as u8, 1);
-        assert_eq!(ShimAction::Merge as u8, 2);
-    }
-}
+mod tests;

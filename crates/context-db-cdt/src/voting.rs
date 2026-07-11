@@ -65,7 +65,7 @@ impl EvolvableInsight {
     /// 从 Reflexion 语义梯度生成可演化 insight。
     pub fn from_gradient(index: usize, gradient: &SemanticGradient) -> Self {
         let uri = gradient.source_uri.clone().unwrap_or_else(|| {
-            ContextUri::parse(&format!(
+            ContextUri::parse(format!(
                 "uwu://t/agent/a/memories/reflection/generated-{index}"
             ))
             .expect("generated reflection URI must parse")
@@ -110,6 +110,12 @@ impl EvolvableInsight {
 pub struct InsightEvolutionEngine {
     deprecate_threshold: f32,
     merge_threshold: f32,
+}
+
+impl Default for InsightEvolutionEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InsightEvolutionEngine {

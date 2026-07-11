@@ -46,6 +46,12 @@ pub struct ImmuneProtocol {
     similarity_threshold: f32,
 }
 
+impl Default for ImmuneProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImmuneProtocol {
     pub fn new() -> Self {
         Self {
@@ -81,14 +87,14 @@ impl ImmuneProtocol {
         self.antibodies.write().push(antibody.clone());
 
         // 广播到 EventMesh → 所有订阅 Agent 自动加载
-        if let Some(ref mesh) = self.event_mesh {
-            if let Ok(payload) = serde_json::to_value(&antibody) {
-                let mesh = mesh.clone();
-                if let Ok(topic) = Topic::new("immune.broadcast") {
-                    tokio::spawn(async move {
-                        let _ = mesh.emit(&topic, payload).await;
-                    });
-                }
+        if let Some(ref mesh) = self.event_mesh
+            && let Ok(payload) = serde_json::to_value(&antibody)
+        {
+            let mesh = mesh.clone();
+            if let Ok(topic) = Topic::new("immune.broadcast") {
+                tokio::spawn(async move {
+                    let _ = mesh.emit(&topic, payload).await;
+                });
             }
         }
 

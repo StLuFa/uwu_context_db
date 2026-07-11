@@ -3,6 +3,7 @@
 //! 每个 Agent 维护自己的 registry shard，无中心目录。
 //! 联邦查询通过 EventMesh broadcast + 各 shard 返回匹配结果。
 
+use crate::feedback::FeedbackRegistry;
 use crate::types::*;
 use agent_context_db_core::{EventMesh, Topic, VectorIndex};
 use std::collections::HashMap;
@@ -48,41 +49,53 @@ impl FederatedRegistry {
 
     // ── 发布 ──────────────────────────────
 
-    pub fn publish(&self, entry: MarketEntry) {
+    pub async fn publish(
+        &self,
+        entry: MarketEntry,
+        embedding: agent_context_db_core::EmbeddingVector,
+    ) -> agent_context_db_core::Result<()> {
+        if embedding.vector.is_empty() || embedding.vector.iter().any(|value| !value.is_finite()) {
+            return Err(agent_context_db_core::ContextError::Storage(
+                "market publication requires a non-empty finite embedding".into(),
+            ));
+        }
         // 注册到向量索引
         let uri = agent_context_db_core::ContextUri::parse(format!(
             "uwu://market/{}/{}",
             entry.publisher, entry.id.0
         ))
         .expect("marketplace URI is well-formed");
-        let _ = self.local_index.upsert(
-            "market",
-            agent_context_db_core::IndexPoint {
-                uri: uri.clone(),
-                vector: vec![0.0; 128], // actual embedding from product
-                embedding_model_id: None,
-                embedding_dim: None,
-                embedding_version: None,
-                payload: serde_json::json!({
-                    "market_id": entry.id.0.to_string(),
-                    "domain": entry.domain,
-                    "quality": entry.quality_score,
-                }),
-            },
-        );
+        self.local_index
+            .upsert(
+                "market",
+                agent_context_db_core::IndexPoint {
+                    uri: uri.clone(),
+                    vector: embedding.vector,
+                    embedding_model_id: Some(embedding.model_id),
+                    embedding_dim: Some(embedding.dim),
+                    embedding_version: Some(embedding.version),
+                    payload: serde_json::json!({
+                        "market_id": entry.id.0.to_string(),
+                        "domain": entry.domain,
+                        "quality": entry.quality_score,
+                    }),
+                },
+            )
+            .await?;
         self.publications.write().insert(entry.id, entry.clone());
 
         // 广播到 EventMesh
         if let Some(mesh) = self.event_mesh.clone() {
             let topic_str = format!("market.publish.{}", entry.domain);
-            if let Ok(topic) = Topic::new(topic_str) {
-                if let Ok(json) = serde_json::to_value(&entry) {
-                    tokio::spawn(async move {
-                        let _ = mesh.emit(&topic, json).await;
-                    });
-                }
+            if let Ok(topic) = Topic::new(topic_str)
+                && let Ok(json) = serde_json::to_value(&entry)
+            {
+                tokio::spawn(async move {
+                    let _ = mesh.emit(&topic, json).await;
+                });
             }
         }
+        Ok(())
     }
 
     /// 获取我的发布。
@@ -194,6 +207,22 @@ impl FederatedRegistry {
             peers: self.peers.read().len(),
             subscriptions: self.subscriptions.read().len(),
         }
+    }
+}
+
+impl FeedbackRegistry for FederatedRegistry {
+    fn publisher_for(&self, entry_id: &MarketId) -> Option<AgentId> {
+        if let Some(entry) = self.publications.read().get(entry_id) {
+            return Some(entry.publisher.clone());
+        }
+        self.adoptions
+            .read()
+            .get(entry_id)
+            .map(|entry| entry.publisher.clone())
+    }
+
+    fn has_consumption(&self, entry_id: &MarketId, consumer: &AgentId) -> bool {
+        consumer == &self.my_agent && self.adoptions.read().contains_key(entry_id)
     }
 }
 

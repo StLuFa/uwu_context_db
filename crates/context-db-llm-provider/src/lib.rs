@@ -12,8 +12,12 @@ use agent_context_db_core::{
 };
 use async_trait::async_trait;
 use reqwest::{
-    Client, StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+    Client, StatusCode, Url,
+    header::{
+        AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderMap,
+        HeaderName, HeaderValue, PROXY_AUTHORIZATION, SET_COOKIE, TRANSFER_ENCODING,
+    },
+    redirect::Policy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -100,6 +104,7 @@ impl LlmProviderConfig {
         let timeout = Duration::from_secs(self.timeout_secs.unwrap_or(60));
         Client::builder()
             .timeout(timeout)
+            .redirect(Policy::none())
             .build()
             .map_err(|e| LlmError::Provider(format!("build http client: {e}")))
     }
@@ -282,7 +287,7 @@ impl AnthropicLlmClient {
         )?;
         post_json(
             &self.client,
-            &join_url(&self.base_url, &self.messages_path),
+            join_endpoint(&self.base_url, &self.messages_path)?.as_str(),
             headers,
             body,
         )
@@ -317,7 +322,8 @@ impl AnthropicLlmClient {
             .unwrap_or(OPENAI_EMBEDDINGS_PATH);
         let headers = bearer_headers(&self.config.headers, self.config.api_key()?.as_deref())?;
         let body = json!({ "model": model, "input": texts });
-        let value = post_json(&self.client, &join_url(base_url, path), headers, body).await?;
+        let endpoint = join_endpoint(base_url, path)?;
+        let value = post_json(&self.client, endpoint.as_str(), headers, body).await?;
         extract_embeddings(&value, model, texts.len())
     }
 }
@@ -456,7 +462,7 @@ impl OpenAiCompatibleClient {
         let headers = bearer_headers(&self.config.headers, self.config.api_key()?.as_deref())?;
         post_json(
             &self.client,
-            &join_url(&self.base_url, &self.chat_path),
+            join_endpoint(&self.base_url, &self.chat_path)?.as_str(),
             headers,
             body,
         )
@@ -472,7 +478,7 @@ impl OpenAiCompatibleClient {
         let headers = bearer_headers(&self.config.headers, self.config.api_key()?.as_deref())?;
         post_json(
             &self.client,
-            &join_url(base_url, &self.embedding_path),
+            join_endpoint(base_url, &self.embedding_path)?.as_str(),
             headers,
             body,
         )
@@ -564,9 +570,30 @@ fn provider_headers(
         if name.starts_with("x-context-db-") {
             continue;
         }
+        let parsed_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| LlmError::Provider(format!("invalid header name {name}: {e}")))?;
+        if is_forbidden_custom_header(&parsed_name) {
+            return Err(LlmError::Provider(format!(
+                "custom provider header {name} is not allowed"
+            )));
+        }
         insert_header(&mut headers, name, value)?;
     }
     Ok(headers)
+}
+
+fn is_forbidden_custom_header(name: &HeaderName) -> bool {
+    matches!(
+        name,
+        &AUTHORIZATION
+            | &PROXY_AUTHORIZATION
+            | &COOKIE
+            | &SET_COOKIE
+            | &HOST
+            | &CONTENT_LENGTH
+            | &TRANSFER_ENCODING
+            | &CONNECTION
+    )
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(), LlmError> {
@@ -617,15 +644,75 @@ fn status_error(status: StatusCode, body: String) -> LlmError {
     }
 }
 
-fn join_url(base: &str, path: &str) -> String {
-    if path.starts_with("http://") || path.starts_with("https://") {
-        return path.into();
+fn join_endpoint(base: &str, path: &str) -> Result<Url, LlmError> {
+    let base = Url::parse(base)
+        .map_err(|e| LlmError::Provider(format!("invalid provider base_url: {e}")))?;
+    validate_base_url(&base)?;
+
+    let relative = path.trim();
+    if relative.is_empty() {
+        return Err(LlmError::Provider("provider path must not be empty".into()));
     }
-    format!(
-        "{}/{}",
-        base.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
+    if Url::parse(relative).is_ok() || relative.starts_with("//") {
+        return Err(LlmError::Provider(
+            "provider path must be relative to base_url".into(),
+        ));
+    }
+
+    let mut endpoint = base.clone();
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    let base_path = endpoint.path().trim_end_matches('/');
+    let joined_path = format!("{base_path}/{}", relative.trim_start_matches('/'));
+    endpoint.set_path(&joined_path);
+    Ok(endpoint)
+}
+
+fn validate_base_url(url: &Url) -> Result<(), LlmError> {
+    if url.scheme() != "https" {
+        return Err(LlmError::Provider(
+            "provider base_url must use HTTPS".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(LlmError::Provider(
+            "provider base_url must not contain userinfo".into(),
+        ));
+    }
+    let host = url
+        .host()
+        .ok_or_else(|| LlmError::Provider("provider base_url must contain a host".into()))?;
+    if !is_public_host(host) {
+        return Err(LlmError::Provider(
+            "provider base_url must not target localhost, private, or link-local addresses".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_public_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => {
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified())
+        }
+        url::Host::Ipv6(ip) => {
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local())
+        }
+        url::Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            !domain.eq_ignore_ascii_case("localhost")
+                && !domain.to_ascii_lowercase().ends_with(".localhost")
+                && !domain.to_ascii_lowercase().ends_with(".local")
+        }
+    }
 }
 
 fn extract_openai_text(value: &Value) -> Result<String, LlmError> {
@@ -794,5 +881,37 @@ mod tests {
     fn rejects_partial_batch_embedding_response() {
         let value = json!({"data":[{"index":0,"embedding":[1.0]}]});
         assert!(extract_embeddings(&value, "text-embedding-test", 2).is_err());
+    }
+
+    #[test]
+    fn joins_only_relative_paths_without_changing_origin() {
+        let endpoint = join_endpoint("https://api.example.com/proxy", "/v1/chat").unwrap();
+        assert_eq!(endpoint.as_str(), "https://api.example.com/proxy/v1/chat");
+        assert!(join_endpoint("https://api.example.com", "https://evil.example/v1").is_err());
+        assert!(join_endpoint("https://api.example.com", "//evil.example/v1").is_err());
+    }
+
+    #[test]
+    fn rejects_insecure_and_non_public_base_urls() {
+        assert!(join_endpoint("http://api.example.com", "/v1/chat").is_err());
+        assert!(join_endpoint("https://127.0.0.1", "/v1/chat").is_err());
+        assert!(join_endpoint("https://169.254.1.1", "/v1/chat").is_err());
+        assert!(join_endpoint("https://10.0.0.1", "/v1/chat").is_err());
+        assert!(join_endpoint("https://[fe80::1]", "/v1/chat").is_err());
+        assert!(join_endpoint("https://service.local", "/v1/chat").is_err());
+    }
+
+    #[test]
+    fn custom_headers_cannot_override_credentials_or_transport() {
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "host",
+            "content-length",
+        ] {
+            let custom = BTreeMap::from([(name.to_string(), "attacker-value".to_string())]);
+            assert!(bearer_headers(&custom, Some("trusted-key")).is_err());
+        }
     }
 }

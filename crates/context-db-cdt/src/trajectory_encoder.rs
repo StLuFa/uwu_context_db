@@ -249,7 +249,7 @@ impl TrajectoryEncoder {
     fn make_uri(&self, ctype: &str, index: usize, content: &str) -> ContextUri {
         let hash = blake3::hash(content.as_bytes()).to_hex();
         let short = &hash[..8];
-        ContextUri::parse(&format!(
+        ContextUri::parse(format!(
             "uwu://{}/memory/{}/{}/{:02}-{}",
             self.agent_scope,
             ctype,
@@ -258,7 +258,7 @@ impl TrajectoryEncoder {
             short
         ))
         .unwrap_or_else(|_| {
-            ContextUri::parse(&format!(
+            ContextUri::parse(format!(
                 "uwu://{}/memory/{}/fallback-{}",
                 self.agent_scope,
                 ctype,

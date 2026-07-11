@@ -21,6 +21,12 @@ pub struct CognitiveSelfPlay {
     value: ValueModule,
 }
 
+impl Default for CognitiveSelfPlay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CognitiveSelfPlay {
     pub fn new() -> Self {
         Self {

@@ -1,8 +1,10 @@
 //! ContextPack 导出导入（F7）+ 路径级 ACL（F8）。
+use crate::{Page, PageRequest};
 
 use crate::{
-    BrowsingOps, ContentLevel, ContentPayload, ContentRepo, ContentStore, ContextEntry,
-    ContextError, ContextUri, DirEntry, FindPattern, FsOps, GrepHit, MvccVersion, Result, TreeNode,
+    BrowsingOps, ContentLevel, ContentPayload, ContentRepo, ContentStore, ContentType,
+    ContextEntry, ContextError, ContextUri, DirEntry, FindPattern, FsOps, GrepHit, MvccVersion,
+    Result, TreeNode,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -398,20 +400,20 @@ impl<R> FsOps for AclProtectedStore<R>
 where
     R: FsOps + Send + Sync,
 {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
         self.require_read(dir)?;
-        let entries = self.inner.ls(dir).await?;
+        let entries = self.inner.ls(dir, page).await?;
         Ok(entries
             .into_iter()
             .filter(|entry| self.can_read(&entry.uri))
             .collect())
     }
 
-    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>> {
+    async fn find(&self, pattern: &FindPattern, page: PageRequest) -> Result<Page<ContextUri>> {
         if let Some(scope) = &pattern.scope {
             self.require_read(scope)?;
         }
-        let uris = self.inner.find(pattern).await?;
+        let uris = self.inner.find(pattern, page).await?;
         Ok(uris.into_iter().filter(|uri| self.can_read(uri)).collect())
     }
 
@@ -424,10 +426,17 @@ where
             .collect())
     }
 
-    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
+    async fn tree(
+        &self,
+        root: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
         self.require_read(root)?;
-        let mut tree = self.inner.tree(root, depth).await?;
-        filter_tree(&mut tree, |uri| self.can_read(uri));
+        let mut tree = self.inner.tree(root, depth, page).await?;
+        for node in &mut tree.items {
+            filter_tree(node, |uri| self.can_read(uri));
+        }
         Ok(tree)
     }
 
@@ -510,17 +519,36 @@ where
         self.inner.batch_write(entries).await
     }
 
-    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
+    async fn scan_by_prefix(&self, prefix: &str, page: PageRequest) -> Result<Page<ContextEntry>> {
         let scope = ContextUri::parse(prefix.trim_end_matches('/')).map_err(|err| {
             ContextError::InvalidUri(format!("ACL scan_by_prefix scope parse failed: {err}"))
         })?;
         self.require_read(&scope)?;
         Ok(self
             .inner
-            .scan_by_prefix(prefix, limit)
+            .scan_by_prefix(prefix, page)
             .await?
             .into_iter()
-            .filter(|entry| self.can_read(&entry.uri))
+            .filter(|entry| self.require_read(&entry.uri).is_ok())
+            .collect())
+    }
+
+    async fn scan_by_type(
+        &self,
+        prefix: &str,
+        content_type: ContentType,
+        page: PageRequest,
+    ) -> Result<Page<ContextEntry>> {
+        let scope = ContextUri::parse(prefix.trim_end_matches('/')).map_err(|err| {
+            ContextError::InvalidUri(format!("ACL scan_by_type scope parse failed: {err}"))
+        })?;
+        self.require_read(&scope)?;
+        Ok(self
+            .inner
+            .scan_by_type(prefix, content_type, page)
+            .await?
+            .into_iter()
+            .filter(|entry| self.require_read(&entry.uri).is_ok())
             .collect())
     }
 }
@@ -530,25 +558,37 @@ impl<R> BrowsingOps for AclProtectedStore<R>
 where
     R: BrowsingOps + Send + Sync,
 {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
         self.require_read(dir)?;
-        let entries = self.inner.ls(dir).await?;
+        let entries = self.inner.ls(dir, page).await?;
         Ok(entries
             .into_iter()
             .filter(|entry| self.can_read(&entry.uri))
             .collect())
     }
 
-    async fn tree(&self, dir: &ContextUri, depth: usize) -> Result<TreeNode> {
+    async fn tree(
+        &self,
+        dir: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
         self.require_read(dir)?;
-        let mut tree = self.inner.tree(dir, depth).await?;
-        filter_tree(&mut tree, |uri| self.can_read(uri));
+        let mut tree = self.inner.tree(dir, depth, page).await?;
+        for node in &mut tree.items {
+            filter_tree(node, |uri| self.can_read(uri));
+        }
         Ok(tree)
     }
 
-    async fn find(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<ContextUri>> {
+    async fn find(
+        &self,
+        scope: &ContextUri,
+        pattern: &str,
+        page: PageRequest,
+    ) -> Result<Page<ContextUri>> {
         self.require_read(scope)?;
-        let uris = self.inner.find(scope, pattern).await?;
+        let uris = self.inner.find(scope, pattern, page).await?;
         Ok(uris.into_iter().filter(|uri| self.can_read(uri)).collect())
     }
 
@@ -700,9 +740,17 @@ mod tests {
             async fn scan_by_prefix(
                 &self,
                 _prefix: &str,
-                _limit: usize,
-            ) -> Result<Vec<ContextEntry>> {
-                Ok(Vec::new())
+                _page: PageRequest,
+            ) -> Result<Page<ContextEntry>> {
+                Ok(Page::new(Vec::new(), None))
+            }
+            async fn scan_by_type(
+                &self,
+                _prefix: &str,
+                _content_type: ContentType,
+                _page: PageRequest,
+            ) -> Result<Page<ContextEntry>> {
+                Ok(Page::new(Vec::new(), None))
             }
         }
 

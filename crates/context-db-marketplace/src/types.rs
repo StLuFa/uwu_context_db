@@ -219,7 +219,7 @@ pub struct PublicationMetadata {
     pub license: LicenseInfo,
     pub epistemic_type: EpistemicType,
     pub content_type: ContentType,
-    pub half_life_days: Option<f64>,
+    pub half_life: Option<agent_context_db_core::HalfLife>,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -306,7 +306,7 @@ pub struct MarketEntry {
     pub license: KnowledgeLicense,
     pub epistemic_type: EpistemicType,
     pub content_type: ContentType,
-    pub half_life_days: Option<f64>,
+    pub half_life: Option<agent_context_db_core::HalfLife>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 过期时间（半衰期驱动）
@@ -341,7 +341,7 @@ impl MarketEntry {
             license: self.license.clone().into(),
             epistemic_type: self.epistemic_type,
             content_type: self.content_type,
-            half_life_days: self.half_life_days,
+            half_life: self.half_life,
             created_at: self.created_at,
             expires_at: self.expires_at,
         }

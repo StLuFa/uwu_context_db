@@ -189,7 +189,7 @@ impl CurriculumGenerator {
         let known: HashSet<&str> = known_uris.iter().map(|uri| uri.as_str()).collect();
         let edges = graph
             .batch_traverse(
-                &[target.clone()],
+                std::slice::from_ref(target),
                 &[GraphRelation::DerivedFrom, GraphRelation::EvidenceOf],
                 1,
             )

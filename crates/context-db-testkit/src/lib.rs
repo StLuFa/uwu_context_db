@@ -5,16 +5,17 @@
 //! - [`MemoryVersionStore`]：`VersionStore`（Commit/Branch/Tag DAG）
 //!
 //! 生产环境由 `agent-context-db-storage` 注入 PG + Qdrant 后端。
+use agent_context_db_core::{Page, PageRequest};
 
 pub mod version;
 
 pub use version::MemoryVersionStore;
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContentRepo, ContentStore, ContextDiff, ContextEntry,
-    ContextError, ContextUri, DirEntry, FindPattern, FsOps, GraphRelation, GraphStore, GrepHit,
-    MvccVersion, Result, TenantId, TenantOps, TreeNode, VersionEntry, VersionOps,
-    sanitize_entry_for_write,
+    ContentLevel, ContentPayload, ContentRepo, ContentStore, ContentType, ContextDiff,
+    ContextEntry, ContextError, ContextUri, DirEntry, FindPattern, FsOps, GraphRelation,
+    GraphStore, GrepHit, MvccVersion, Result, TenantId, TenantOps, TreeNode, VersionEntry,
+    VersionOps, sanitize_entry_for_write,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -44,6 +45,24 @@ impl MemoryContextStore {
     pub fn put_l2_blob(&self, uri: &str, bytes: Vec<u8>) {
         self.l2_blobs.lock().insert(uri.to_string(), bytes);
     }
+}
+
+/// 对已经按稳定键排序的结果执行 keyset 分页。
+///
+/// 多取一条仅用于判断后续页是否存在；游标始终是本页最后一条的键。
+fn keyset_page<T>(items: Vec<T>, page: &PageRequest, key: impl Fn(&T) -> String) -> Page<T> {
+    let limit = page.effective_limit();
+    let mut selected: Vec<T> = items
+        .into_iter()
+        .filter(|item| page.after.as_ref().is_none_or(|after| key(item) > *after))
+        .take(limit + 1)
+        .collect();
+    let has_more = selected.len() > limit;
+    if has_more {
+        selected.pop();
+    }
+    let next_cursor = has_more.then(|| key(selected.last().expect("a full page is non-empty")));
+    Page::new(selected, next_cursor)
 }
 
 #[async_trait]
@@ -163,7 +182,7 @@ impl ContentRepo for MemoryContextStore {
 
 #[async_trait]
 impl FsOps for MemoryContextStore {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
         let prefix = format!("{}/", dir.to_string().trim_end_matches('/'));
         let map = self.entries.lock();
         let mut out = Vec::new();
@@ -182,17 +201,18 @@ impl FsOps for MemoryContextStore {
                 });
             }
         }
-        Ok(out)
+        out.sort_by(|a, b| a.uri.cmp(&b.uri));
+        Ok(keyset_page(out, &page, |entry| entry.uri.to_string()))
     }
 
-    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>> {
+    async fn find(&self, pattern: &FindPattern, page: PageRequest) -> Result<Page<ContextUri>> {
         let map = self.entries.lock();
         let scope = pattern
             .scope
             .as_ref()
             .map(|u| u.to_string())
             .unwrap_or_default();
-        Ok(map
+        let mut uris: Vec<_> = map
             .iter()
             .filter(|(uri, _)| uri.starts_with(&scope))
             .filter(|(_, versions)| match pattern.content_type {
@@ -204,7 +224,9 @@ impl FsOps for MemoryContextStore {
                 None => true,
             })
             .filter_map(|(uri, _)| ContextUri::parse(uri.clone()).ok())
-            .collect())
+            .collect();
+        uris.sort();
+        Ok(keyset_page(uris, &page, ToString::to_string))
     }
 
     async fn grep(&self, regex: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
@@ -233,7 +255,12 @@ impl FsOps for MemoryContextStore {
         Ok(hits)
     }
 
-    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
+    async fn tree(
+        &self,
+        root: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
         let prefix = format!("{}/", root.to_string().trim_end_matches('/'));
         let map = self.entries.lock();
 
@@ -245,11 +272,15 @@ impl FsOps for MemoryContextStore {
             .collect();
 
         let children = build_memory_tree(&prefix, &uris, 0, depth);
-        Ok(TreeNode {
-            uri: root.clone(),
-            is_dir: true,
-            children,
-        })
+        Ok(keyset_page(
+            vec![TreeNode {
+                uri: root.clone(),
+                is_dir: true,
+                children,
+            }],
+            &page,
+            |node| node.uri.to_string(),
+        ))
     }
 
     async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload> {
@@ -273,14 +304,14 @@ impl FsOps for MemoryContextStore {
                 full: l0,
             },
             ContentLevel::L2 => {
-                if let Some(bytes) = self.l2_blobs.lock().get(&uri.to_string()) {
-                    if !bytes.is_empty() {
-                        return Ok(ContentPayload::Text {
-                            sparse: l0,
-                            dense: l1,
-                            full: String::from_utf8(bytes.clone()).unwrap_or_default(),
-                        });
-                    }
+                if let Some(bytes) = self.l2_blobs.lock().get(&uri.to_string())
+                    && !bytes.is_empty()
+                {
+                    return Ok(ContentPayload::Text {
+                        sparse: l0,
+                        dense: l1,
+                        full: String::from_utf8(bytes.clone()).unwrap_or_default(),
+                    });
                 }
                 match &e.payload {
                     ContentPayload::Text { full, .. } => ContentPayload::Text {
@@ -317,7 +348,7 @@ impl ContentStore for MemoryContextStore {
         <Self as ContentRepo>::batch_write(self, entries).await
     }
 
-    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
+    async fn scan_by_prefix(&self, prefix: &str, page: PageRequest) -> Result<Page<ContextEntry>> {
         let map = self.entries.lock();
         let mut entries: Vec<_> = map
             .iter()
@@ -325,15 +356,35 @@ impl ContentStore for MemoryContextStore {
             .filter_map(|(_, versions)| versions.last().cloned())
             .collect();
         entries.sort_by(|a, b| a.uri.cmp(&b.uri));
-        entries.truncate(limit);
-        Ok(entries)
+        Ok(keyset_page(entries, &page, |entry| entry.uri.to_string()))
+    }
+
+    async fn scan_by_type(
+        &self,
+        prefix: &str,
+        content_type: ContentType,
+        page: PageRequest,
+    ) -> Result<Page<ContextEntry>> {
+        let map = self.entries.lock();
+        let mut entries: Vec<_> = map
+            .iter()
+            .filter(|(uri, _)| uri.starts_with(prefix))
+            .filter_map(|(_, versions)| versions.last().cloned())
+            .filter(|entry| entry.metadata.content_type == Some(content_type))
+            .collect();
+        entries.sort_by(|a, b| a.uri.cmp(&b.uri));
+        Ok(keyset_page(entries, &page, |entry| entry.uri.to_string()))
     }
 }
 
 #[async_trait]
 impl VersionOps for MemoryContextStore {
-    async fn version_history(&self, uri: &ContextUri) -> Result<Vec<VersionEntry>> {
-        Ok(self
+    async fn version_history(
+        &self,
+        uri: &ContextUri,
+        page: PageRequest,
+    ) -> Result<Page<VersionEntry>> {
+        let versions = self
             .entries
             .lock()
             .get(&uri.to_string())
@@ -346,7 +397,10 @@ impl VersionOps for MemoryContextStore {
                     })
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(keyset_page(versions, &page, |entry| {
+            format!("{:020}", entry.version.0)
+        }))
     }
 
     async fn rollback(&self, uri: &ContextUri, to: MvccVersion) -> Result<()> {
@@ -368,14 +422,14 @@ impl VersionOps for MemoryContextStore {
 
     async fn diff(&self, uri: &ContextUri, a: MvccVersion, b: MvccVersion) -> Result<ContextDiff> {
         Ok(ContextDiff {
-            summary: format!("{}: v{:?} → v{:?}", uri.to_string(), a, b),
+            summary: format!("{}: v{:?} → v{:?}", uri, a, b),
         })
     }
 }
 
 #[async_trait]
 impl TenantOps for MemoryContextStore {
-    async fn list_tenants(&self) -> Result<Vec<TenantId>> {
+    async fn list_tenants(&self, page: PageRequest) -> Result<Page<TenantId>> {
         let map = self.entries.lock();
         let mut set: Vec<TenantId> = map
             .values()
@@ -383,7 +437,7 @@ impl TenantOps for MemoryContextStore {
             .collect();
         set.sort_by_key(|t| t.0);
         set.dedup_by_key(|t| t.0);
-        Ok(set)
+        Ok(keyset_page(set, &page, |tenant| tenant.0.to_string()))
     }
 }
 
@@ -476,7 +530,10 @@ mod tests {
 
         // ls parent dir
         let dir = ContextUri::parse("uwu://t/agent/a/memories/cases").unwrap();
-        assert_eq!(store.ls(&dir).await.unwrap().len(), 1);
+        assert_eq!(
+            store.ls(&dir, PageRequest::default()).await.unwrap().len(),
+            1
+        );
 
         // grep
         let hits = store
@@ -529,10 +586,177 @@ mod tests {
         ContentRepo::write(&store, entry(&uri.to_string(), "v2"))
             .await
             .unwrap();
-        assert_eq!(store.version_history(&uri).await.unwrap().len(), 2);
+        assert_eq!(
+            store
+                .version_history(&uri, PageRequest::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
 
         store.rollback(&uri, v1).await.unwrap();
-        assert_eq!(store.version_history(&uri).await.unwrap().len(), 3);
+        assert_eq!(
+            store
+                .version_history(&uri, PageRequest::default())
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn all_page_requests_use_stable_keyset_pagination() {
+        let store = MemoryContextStore::new();
+        let tenant_a = TenantId(Uuid::from_u128(1));
+        let tenant_b = TenantId(Uuid::from_u128(2));
+        for (index, tenant) in [tenant_a, tenant_a, tenant_b, tenant_b, tenant_b]
+            .into_iter()
+            .enumerate()
+        {
+            let mut value = entry(
+                &format!("uwu://t/agent/a/memories/cases/c{index}"),
+                &format!("v{index}"),
+            );
+            value.tenant = tenant;
+            value.metadata.content_type = Some(if index % 2 == 0 {
+                ContentType::Fact
+            } else {
+                ContentType::Belief
+            });
+            ContentRepo::write(&store, value).await.unwrap();
+        }
+
+        async fn collect_uris<F, Fut>(mut load: F) -> Vec<String>
+        where
+            F: FnMut(PageRequest) -> Fut,
+            Fut: std::future::Future<Output = Result<Page<ContextUri>>>,
+        {
+            let mut cursor = None;
+            let mut all = Vec::new();
+            loop {
+                let request = cursor.as_ref().map_or_else(
+                    || PageRequest::new(2),
+                    |value| PageRequest::new(2).after(value),
+                );
+                let page = load(request).await.unwrap();
+                all.extend(page.items.into_iter().map(|uri| uri.to_string()));
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            all
+        }
+
+        let scope = ContextUri::parse("uwu://t/agent/a/memories/cases").unwrap();
+        let pattern = FindPattern {
+            scope: Some(scope.clone()),
+            content_type: None,
+            name_glob: None,
+            max_depth: None,
+        };
+        let found = collect_uris(|page| store.find(&pattern, page)).await;
+        assert_eq!(found.len(), 5);
+        assert!(found.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let first = store.ls(&scope, PageRequest::new(2)).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let second = store
+            .ls(
+                &scope,
+                PageRequest::new(2).after(first.next_cursor.unwrap()),
+            )
+            .await
+            .unwrap();
+        let third = store
+            .ls(
+                &scope,
+                PageRequest::new(2).after(second.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(third.len(), 1);
+        assert!(third.next_cursor.is_none());
+
+        let prefix = scope.to_string();
+        let scan = store
+            .scan_by_prefix(&prefix, PageRequest::new(2))
+            .await
+            .unwrap();
+        assert_eq!(scan.len(), 2);
+        assert!(scan.next_cursor.is_some());
+        let typed = store
+            .scan_by_type(&prefix, ContentType::Fact, PageRequest::new(2))
+            .await
+            .unwrap();
+        assert_eq!(typed.len(), 2);
+        let typed_end = store
+            .scan_by_type(
+                &prefix,
+                ContentType::Fact,
+                PageRequest::new(2).after(typed.next_cursor.unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(typed_end.len(), 1);
+        assert!(typed_end.next_cursor.is_none());
+
+        let tenants = store.list_tenants(PageRequest::new(1)).await.unwrap();
+        assert_eq!(tenants.len(), 1);
+        let tenant_end = store
+            .list_tenants(PageRequest::new(1).after(tenants.next_cursor.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(tenant_end.len(), 1);
+        assert!(tenant_end.next_cursor.is_none());
+
+        let version_uri = ContextUri::parse(&found[0]).unwrap();
+        for text in ["v2", "v3"] {
+            ContentRepo::write(&store, entry(version_uri.as_str(), text))
+                .await
+                .unwrap();
+        }
+        let versions = store
+            .version_history(&version_uri, PageRequest::new(2))
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        let version_end = store
+            .version_history(
+                &version_uri,
+                PageRequest::new(2).after(versions.next_cursor.unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(version_end.len(), 1);
+        assert!(version_end.next_cursor.is_none());
+
+        let tree = store
+            .tree(&scope, 2, PageRequest::new(usize::MAX))
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 1);
+        assert!(tree.next_cursor.is_none());
+        let tree_end = store
+            .tree(&scope, 2, PageRequest::new(1).after(scope.to_string()))
+            .await
+            .unwrap();
+        assert!(tree_end.is_empty());
+        assert!(tree_end.next_cursor.is_none());
+
+        let hard_limited = keyset_page(
+            (0..1_001).collect::<Vec<_>>(),
+            &PageRequest {
+                after: None,
+                limit: usize::MAX,
+            },
+            |value| format!("{value:04}"),
+        );
+        assert_eq!(hard_limited.len(), agent_context_db_core::MAX_PAGE_SIZE);
+        assert!(hard_limited.next_cursor.is_some());
     }
 
     #[tokio::test]

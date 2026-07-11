@@ -3,7 +3,7 @@
 //! 使用 `LlmClient` 为条目生成摘要（L0 ~100 tokens）和概览（L1 ~2k tokens）。
 
 use agent_context_db_core::{
-    ContentLevel, ContentPayload, ContextUri, FsOps, LlmClient, LlmOpts, Result,
+    ContentLevel, ContentPayload, ContextUri, FsOps, JsonSchema, LlmClient, LlmOpts, Result,
 };
 use async_trait::async_trait;
 use moka::future::Cache;
@@ -145,7 +145,10 @@ Respond with ONLY the overview text.
         // 3. 将所有子摘要合成父目录的 L1 概览
         // 4. 返回生成的 L1 概览，由调用方决定是否写入存储
 
-        let entries = self.fs.ls(root).await?;
+        let entries = self
+            .fs
+            .ls(root, agent_context_db_core::PageRequest::default())
+            .await?;
 
         let mut child_abstracts: Vec<(ContextUri, String)> = Vec::new();
 
@@ -253,29 +256,26 @@ Return your response as a JSON object:
                     ..Default::default()
                 };
 
-                let response = self.llm.complete(&prompt, &opts).await.map_err(|e| {
+                let response = self
+                    .llm
+                    .complete_json(&prompt, &multimodal_result_schema(), &opts)
+                    .await
+                    .map_err(|e| {
+                        agent_context_db_core::ContextError::Storage(format!(
+                            "llm multimodal_to_text: {e}"
+                        ))
+                    })?;
+                let result: MultimodalResult = serde_json::from_str(&response).map_err(|e| {
                     agent_context_db_core::ContextError::Storage(format!(
-                        "llm multimodal_to_text: {e}"
+                        "llm multimodal_to_text returned invalid structured response: {e}"
                     ))
                 })?;
-
-                // Parse JSON response
-                #[derive(serde::Deserialize)]
-                struct MultimodalResult {
-                    abstract_: String,
-                    #[serde(default)]
-                    overview: String,
+                if result.abstract_text.trim().is_empty() || result.overview.trim().is_empty() {
+                    return Err(agent_context_db_core::ContextError::Storage(
+                        "llm multimodal_to_text returned empty abstract or overview".into(),
+                    ));
                 }
-
-                // Try to extract JSON from response (may be wrapped in markdown)
-                let json_str = extract_json_object(&response);
-                match serde_json::from_str::<MultimodalResult>(&json_str) {
-                    Ok(mr) => Ok((mr.abstract_, mr.overview)),
-                    Err(_) => {
-                        // Fallback: treat entire response as abstract + empty overview
-                        Ok((response.trim().to_string(), String::new()))
-                    }
-                }
+                Ok((result.abstract_text, result.overview))
             }
             Ok(ContentPayload::Text { sparse, dense, .. }) => {
                 Ok((sparse.chars().take(200).collect(), dense))
@@ -291,6 +291,26 @@ Return your response as a JSON object:
 // ===========================================================================
 // 辅助函数
 // ===========================================================================
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultimodalResult {
+    #[serde(rename = "abstract")]
+    abstract_text: String,
+    overview: String,
+}
+
+fn multimodal_result_schema() -> JsonSchema {
+    JsonSchema::new(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "abstract": { "type": "string", "minLength": 1 },
+            "overview": { "type": "string", "minLength": 1 }
+        },
+        "required": ["abstract", "overview"],
+        "additionalProperties": false
+    }))
+}
 
 fn summary_cache_key(kind: &str, uri: &ContextUri, content: &str) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -366,25 +386,6 @@ fn detect_content_type(bytes: &[u8]) -> &'static str {
     "binary"
 }
 
-/// 从 LLM 响应中提取 JSON 对象（可能包裹在 markdown code block 中）。
-fn extract_json_object(text: &str) -> String {
-    let text = text.trim();
-    // Try to find ```json ... ``` block
-    if let Some(start) = text.find("```json") {
-        let after_start = &text[start + 7..];
-        if let Some(end) = after_start.find("```") {
-            return after_start[..end].trim().to_string();
-        }
-    }
-    // Try to find bare { ... }
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text.rfind('}') {
-            return text[start..=end].to_string();
-        }
-    }
-    text.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,16 +427,30 @@ mod tests {
     }
 
     #[test]
-    fn extract_json_from_markdown() {
-        let md = "```json\n{\"abstract_\": \"hi\"}\n```";
-        assert_eq!(extract_json_object(md), "{\"abstract_\": \"hi\"}");
+    fn multimodal_contract_uses_abstract_json_name() {
+        let result: MultimodalResult =
+            serde_json::from_str(r#"{"abstract":"concise","overview":"detailed"}"#).unwrap();
+        assert_eq!(result.abstract_text, "concise");
+        assert_eq!(result.overview, "detailed");
+
+        let schema = multimodal_result_schema().schema;
+        assert!(schema["properties"].get("abstract").is_some());
+        assert!(schema["properties"].get("abstract_").is_none());
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["abstract", "overview"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
-    fn extract_json_bare() {
-        assert_eq!(
-            extract_json_object(r#"{"abstract_": "ok", "overview": "nice"}"#),
-            r#"{"abstract_": "ok", "overview": "nice"}"#
+    fn multimodal_contract_rejects_legacy_or_incomplete_payloads() {
+        assert!(
+            serde_json::from_str::<MultimodalResult>(
+                r#"{"abstract_":"legacy","overview":"detailed"}"#
+            )
+            .is_err()
         );
+        assert!(serde_json::from_str::<MultimodalResult>(r#"{"abstract":"concise"}"#).is_err());
     }
 }

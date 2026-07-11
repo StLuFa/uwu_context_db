@@ -194,12 +194,11 @@ impl CognitiveTreeSearch {
     }
 
     async fn expand_actions(&self, state: &CognitiveState, depth: usize) -> Vec<ActionCandidate> {
-        if let Some(llm) = &self.llm {
-            if let Ok(actions) = llm_expand_actions(llm.as_ref(), state, depth).await {
-                if !actions.is_empty() {
-                    return self.policy.prioritize(actions);
-                }
-            }
+        if let Some(llm) = &self.llm
+            && let Ok(actions) = llm_expand_actions(llm.as_ref(), state, depth).await
+            && !actions.is_empty()
+        {
+            return self.policy.prioritize(actions);
         }
         self.policy.generate(state)
     }
@@ -378,10 +377,10 @@ fn extract_json_array(text: &str) -> String {
             return after[..end].trim().to_string();
         }
     }
-    if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
-            return trimmed[start..=end].to_string();
-        }
+    if let Some(start) = trimmed.find('[')
+        && let Some(end) = trimmed.rfind(']')
+    {
+        return trimmed[start..=end].to_string();
     }
     "[]".into()
 }

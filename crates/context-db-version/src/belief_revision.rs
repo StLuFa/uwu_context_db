@@ -429,7 +429,7 @@ fn minimal_contraction_set(
     }
 
     let mut contracted = contracted.into_iter().collect::<Vec<_>>();
-    contracted.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    contracted.sort_by_key(|a| a.to_string());
     contracted
 }
 
@@ -581,10 +581,10 @@ fn parse_neural_extraction(raw: &str) -> Option<NeuralBeliefExtraction> {
 
 fn extract_json_object(text: &str) -> String {
     let text = text.trim();
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text.rfind('}') {
-            return text[start..=end].to_string();
-        }
+    if let Some(start) = text.find('{')
+        && let Some(end) = text.rfind('}')
+    {
+        return text[start..=end].to_string();
     }
     text.to_string()
 }
@@ -679,7 +679,7 @@ fn literal_from_claim(claim: &str, polarity: BeliefPolarity) -> Option<BeliefLit
 }
 
 fn split_sentences(text: &str) -> Vec<&str> {
-    text.split(|c| matches!(c, '.' | ';' | '\n' | '。' | '；'))
+    text.split(['.', ';', '\n', '。', '；'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()

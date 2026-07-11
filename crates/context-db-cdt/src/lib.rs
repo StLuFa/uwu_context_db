@@ -417,7 +417,7 @@ mod gradient_gate_tests {
                     invalidated_by: None,
                     invalidation_reason: None,
                 }),
-                half_life_days: Some(30.0),
+                half_life: Some(agent_context_db_core::HalfLife::Finite { days: 30.0 }),
             },
         }
     }
@@ -665,14 +665,14 @@ pub fn feedback_evaluation_to_memories(
 
     // 成功 case → Skill 记忆
     for success in &eval.successes {
-        let uri = ContextUri::parse(&format!(
+        let uri = ContextUri::parse(format!(
             "uwu://{}/memory/skill/epoch-{}/{:x}",
             agent_scope,
             eval.epoch,
             success.skill_extracted.len()
         ))
         .unwrap_or_else(|_| {
-            ContextUri::parse(&format!("uwu://{}/memory/skill/fallback", agent_scope)).unwrap()
+            ContextUri::parse(format!("uwu://{}/memory/skill/fallback", agent_scope)).unwrap()
         });
 
         let entry = ContextEntry::new_text(uri, tenant, &success.skill_extracted);
@@ -681,14 +681,14 @@ pub fn feedback_evaluation_to_memories(
 
     // 失败 case → Error 记忆
     for failure in &eval.failures {
-        let uri = ContextUri::parse(&format!(
+        let uri = ContextUri::parse(format!(
             "uwu://{}/memory/error/epoch-{}/{:x}",
             agent_scope,
             eval.epoch,
             failure.description.len()
         ))
         .unwrap_or_else(|_| {
-            ContextUri::parse(&format!("uwu://{}/memory/error/fallback", agent_scope)).unwrap()
+            ContextUri::parse(format!("uwu://{}/memory/error/fallback", agent_scope)).unwrap()
         });
 
         let entry = ContextEntry::new_text(uri, tenant, &failure.analysis);

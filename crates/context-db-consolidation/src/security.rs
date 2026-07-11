@@ -33,6 +33,12 @@ pub struct SecurityGate {
     blocked_patterns: Vec<String>,
 }
 
+impl Default for SecurityGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SecurityGate {
     pub fn new() -> Self {
         Self {
@@ -95,6 +101,12 @@ pub struct Antibody {
     pub threat_type: ThreatType,
     pub confidence: f32,
     pub detected_count: u32,
+}
+
+impl Default for ImmuneMemory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ImmuneMemory {

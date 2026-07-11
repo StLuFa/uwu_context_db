@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  quality:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
+
+  backend-matrix:
+    name: ${{ matrix.backend }} backend
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, postgres, nats]
+    services:
+      # Both lightweight services run for every leg; matrix-specific commands decide which
+      # backend contract is exercised. This avoids unsupported conditional service images.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: context_db_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      nats:
+        image: nats:2.11-alpine
+        ports:
+          - 4222:4222
+    env:
+      DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgres://postgres:postgres@localhost:5432/context_db_test' || '' }}
+      NATS_URL: ${{ matrix.backend == 'nats' && 'nats://localhost:4222' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: backend-${{ matrix.backend }}
+      - if: matrix.backend == 'sqlite'
+        run: cargo test --locked -p agent-context-db-storage --all-targets
+      - if: matrix.backend == 'postgres'
+        run: cargo test --locked -p agent-context-db-storage --all-targets -- --include-ignored
+      - if: matrix.backend == 'nats'
+        run: cargo test --locked -p agent-context-db-nats --all-targets
+
+  supply-chain:
+    name: audit and licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      # --locked makes Cargo.lock the reproducibility and advisory-review boundary.
+      - run: cargo audit --locked
+      - run: cargo deny --locked check advisories licenses bans sources

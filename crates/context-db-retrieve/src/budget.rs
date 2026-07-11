@@ -236,8 +236,10 @@ mod tests {
     use agent_context_db_core::{ContentType, ContextMeta, ContextUri};
 
     fn hit(uri: &str, relevance: f32, sparse: &str, dense: &str, full: &str) -> RetrievalHit {
-        let mut metadata = ContextMeta::default();
-        metadata.quality_score = Some(1.0);
+        let metadata = ContextMeta {
+            quality_score: Some(1.0),
+            ..Default::default()
+        };
         RetrievalHit {
             uri: ContextUri::parse(uri).unwrap(),
             level: ContentLevel::L0,

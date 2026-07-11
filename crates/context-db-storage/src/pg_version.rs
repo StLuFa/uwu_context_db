@@ -412,29 +412,24 @@ impl PgVersionStore {
         let mut chain = vec![id.clone()];
         let mut cur = id.clone();
         let mut seeded: Option<HashMap<String, String>> = None;
-        loop {
-            match self.first_parent(&cur).await? {
-                Some(p) => {
-                    if chain.contains(&p) {
-                        break; // 防环
-                    }
-                    // L1 命中？
-                    if let Some(snap) = self.cache_get_snapshot(&p).await {
-                        seeded = Some(snap);
-                        break;
-                    }
-                    // L2 命中？
-                    if let Some(snap) = self.checkpoint_get(&p).await {
-                        // 顺手回填 L1
-                        self.cache_put_snapshot(&p, &snap).await;
-                        seeded = Some(snap);
-                        break;
-                    }
-                    chain.push(p.clone());
-                    cur = p;
-                }
-                None => break,
+        while let Some(p) = self.first_parent(&cur).await? {
+            if chain.contains(&p) {
+                break; // 防环
             }
+            // L1 命中？
+            if let Some(snap) = self.cache_get_snapshot(&p).await {
+                seeded = Some(snap);
+                break;
+            }
+            // L2 命中？
+            if let Some(snap) = self.checkpoint_get(&p).await {
+                // 顺手回填 L1
+                self.cache_put_snapshot(&p, &snap).await;
+                seeded = Some(snap);
+                break;
+            }
+            chain.push(p.clone());
+            cur = p;
         }
         let chain_len = chain.len();
         // 从种子（或空）开始，沿链正向应用 delta
@@ -497,7 +492,7 @@ impl PgVersionStore {
                 entries.push((uri.clone(), payload));
             }
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by_key(|entry| entry.0.clone());
         entries
     }
 
@@ -732,6 +727,30 @@ impl PgVersionStore {
 
     // ---- 祖先关系 ------------------------------------------------------------
 
+    /// Finds the nearest common ancestor by walking all ancestors of `a` and then breadth-first
+    /// from `b`. Breadth-first traversal makes the first intersection the merge base nearest `b`.
+    async fn merge_base(&self, a: &CommitId, b: &CommitId) -> Result<Option<CommitId>> {
+        let mut ancestors = HashSet::new();
+        let mut stack = vec![a.clone()];
+        while let Some(id) = stack.pop() {
+            if ancestors.insert(id.clone()) {
+                stack.extend(self.load_parents(&id).await?);
+            }
+        }
+        let mut queue = std::collections::VecDeque::from([b.clone()]);
+        let mut seen = HashSet::new();
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if ancestors.contains(&id) {
+                return Ok(Some(id));
+            }
+            queue.extend(self.load_parents(&id).await?);
+        }
+        Ok(None)
+    }
+
     async fn is_ancestor(&self, ancestor: &CommitId, candidate: &CommitId) -> Result<bool> {
         if ancestor == candidate {
             return Ok(true);
@@ -866,6 +885,47 @@ impl PgVersionStore {
         Ok(())
     }
 
+    async fn advance_head_if_matches(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        scope: &str,
+        expected: &CommitId,
+        commit: &CommitId,
+    ) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE version_heads SET commit_id = $1 WHERE scope = $2 AND commit_id = $3",
+        )
+        .bind(commit.0)
+        .bind(scope)
+        .bind(expected.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(Self::storage_err)?;
+        Ok(affected.rows_affected() == 1)
+    }
+
+    async fn update_head_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        scope: &str,
+        expected: &CommitId,
+        commit: &CommitId,
+    ) -> Result<()> {
+        let affected = sqlx::query(
+            "UPDATE version_heads SET commit_id = $1 WHERE scope = $2 AND commit_id = $3",
+        )
+        .bind(commit.0)
+        .bind(scope)
+        .bind(expected.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(Self::storage_err)?;
+        if affected.rows_affected() != 1 {
+            return Err(VersionError::Storage(format!(
+                "HEAD for {scope} changed concurrently"
+            )));
+        }
+        Ok(())
+    }
+
     async fn get_branch(&self, scope: &str, name: &BranchName) -> Result<Option<Branch>> {
         let row = sqlx::query(
             r#"SELECT name, head, branch_type, lifecycle_json, created_from, created_at
@@ -887,15 +947,25 @@ impl PgVersionStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         scope: &str,
         name: &BranchName,
+        expected: &CommitId,
         head: &CommitId,
     ) -> Result<()> {
-        sqlx::query("UPDATE version_branches SET head = $1 WHERE scope = $2 AND name = $3")
-            .bind(head.0)
-            .bind(scope)
-            .bind(name.as_str())
-            .execute(&mut **tx)
-            .await
-            .map_err(Self::storage_err)?;
+        let affected = sqlx::query(
+            "UPDATE version_branches SET head = $1 WHERE scope = $2 AND name = $3 AND head = $4",
+        )
+        .bind(head.0)
+        .bind(scope)
+        .bind(name.as_str())
+        .bind(expected.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(Self::storage_err)?;
+        if affected.rows_affected() != 1 {
+            return Err(VersionError::Storage(format!(
+                "branch {} changed concurrently",
+                name.as_str()
+            )));
+        }
         Ok(())
     }
 }
@@ -925,10 +995,10 @@ fn apply_deltas(snapshot: &mut HashMap<String, String>, deltas: &[DeltaRow]) {
                 snapshot.remove(&d.uri);
             }
             "rename" => {
-                if let Some(from) = &d.rename_from {
-                    if let Some(v) = snapshot.remove(from) {
-                        snapshot.insert(d.uri.clone(), v);
-                    }
+                if let Some(from) = &d.rename_from
+                    && let Some(v) = snapshot.remove(from)
+                {
+                    snapshot.insert(d.uri.clone(), v);
                 }
             }
             _ => {} // 未知 op 忽略
@@ -1084,18 +1154,35 @@ impl VersionStore for PgVersionStore {
         };
 
         let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
+        // Scope 级事务锁覆盖首次提交（HEAD 行尚不存在）和后续 CAS，防止并发提交分叉后静默覆盖。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&scope_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::storage_err)?;
+        let locked_parent: Option<Uuid> =
+            sqlx::query_scalar("SELECT commit_id FROM version_heads WHERE scope = $1 FOR UPDATE")
+                .bind(&scope_key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(Self::storage_err)?;
+        if locked_parent.map(CommitId) != parent {
+            return Err(VersionError::Storage(format!(
+                "HEAD for {scope_key} changed concurrently"
+            )));
+        }
         self.insert_commit_row(&mut tx, &commit, &scope_key).await?;
         self.insert_deltas(&mut tx, &commit_id, &deltas).await?;
-        // 更新 scope HEAD
-        sqlx::query(
-            r#"INSERT INTO version_heads (scope, commit_id) VALUES ($1, $2)
-               ON CONFLICT (scope) DO UPDATE SET commit_id = EXCLUDED.commit_id"#,
-        )
-        .bind(&scope_key)
-        .bind(commit_id.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(Self::storage_err)?;
+        if let Some(expected) = &parent {
+            Self::update_head_in_tx(&mut tx, &scope_key, expected, &commit_id).await?;
+        } else {
+            sqlx::query("INSERT INTO version_heads (scope, commit_id) VALUES ($1, $2)")
+                .bind(&scope_key)
+                .bind(commit_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(Self::storage_err)?;
+        }
         tx.commit().await.map_err(Self::storage_err)?;
         Ok(commit_id)
     }
@@ -1125,13 +1212,13 @@ impl VersionStore for PgVersionStore {
                 }
                 out.push(commit);
             }
-            if let Some(max) = opts.max_count {
-                if out.len() >= max {
-                    break;
-                }
+            if let Some(max) = opts.max_count
+                && out.len() >= max
+            {
+                break;
             }
         }
-        out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        out.sort_by_key(|commit| std::cmp::Reverse(commit.timestamp));
         Ok(out)
     }
 
@@ -1376,42 +1463,67 @@ impl VersionStore for PgVersionStore {
         // Fast-forward 检测
         if self.is_ancestor(&into_head, &from_head).await? {
             let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
-            self.update_branch_head(&mut tx, &scope_key, into, &from_head)
+            self.update_branch_head(&mut tx, &scope_key, into, &into_head, &from_head)
                 .await?;
+            let _ =
+                Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &from_head).await?;
             tx.commit().await.map_err(Self::storage_err)?;
-            self.set_head(&scope_key, &from_head).await?;
             return Ok(MergeResult {
                 commit: from_head,
                 conflicts: vec![],
             });
         }
 
+        let base = self.merge_base(&from_head, &into_head).await?;
+        let base_snap = match base {
+            Some(id) => self.reconstruct_snapshot(&id).await?,
+            None => HashMap::new(),
+        };
         let from_snap = self.reconstruct_snapshot(&from_head).await?;
         let into_snap = self.reconstruct_snapshot(&into_head).await?;
 
-        // 冲突检测 + 合并策略
+        // True three-way merge over the union is required for delete propagation and all
+        // add/update/delete intersections. A conflict exists only when both sides changed the
+        // merge-base value differently.
         let mut merged = into_snap.clone();
         let mut conflicts = Vec::new();
-        for (uri, fv) in &from_snap {
-            match merged.get(uri) {
-                None => {
-                    merged.insert(uri.clone(), fv.clone());
-                }
-                Some(iv) if iv == fv => {}
-                Some(iv) => match strategy {
-                    MergeStrategy::Theirs | MergeStrategy::FastForward => {
-                        merged.insert(uri.clone(), fv.clone());
+        let keys: HashSet<String> = base_snap
+            .keys()
+            .chain(from_snap.keys())
+            .chain(into_snap.keys())
+            .cloned()
+            .collect();
+        for uri in keys {
+            let base_value = base_snap.get(&uri);
+            let ours = into_snap.get(&uri);
+            let theirs = from_snap.get(&uri);
+            if theirs == base_value {
+                continue;
+            }
+            if ours == base_value || ours == theirs {
+                match theirs {
+                    Some(value) => {
+                        merged.insert(uri, value.clone());
                     }
-                    MergeStrategy::Ours => {}
-                    MergeStrategy::ThreeWay => {
-                        // 无 base 时保守：标为冲突并采用 into 侧
-                        if let Ok(u) = ContextUri::parse(uri.as_str()) {
-                            conflicts.push(u);
-                        }
-                        // 保持 into 侧值
-                        let _ = iv;
+                    None => {
+                        merged.remove(&uri);
+                    }
+                }
+                continue;
+            }
+            match strategy {
+                MergeStrategy::Theirs | MergeStrategy::FastForward => match theirs {
+                    Some(value) => {
+                        merged.insert(uri, value.clone());
+                    }
+                    None => {
+                        merged.remove(&uri);
                     }
                 },
+                MergeStrategy::Ours => {}
+                MergeStrategy::ThreeWay => {
+                    conflicts.push(ContextUri::parse(&uri).map_err(Self::storage_err)?)
+                }
             }
         }
 
@@ -1442,10 +1554,10 @@ impl VersionStore for PgVersionStore {
         self.insert_commit_row(&mut tx, &merge_commit, &scope_key)
             .await?;
         self.insert_deltas(&mut tx, &commit_id, &deltas).await?;
-        self.update_branch_head(&mut tx, &scope_key, into, &commit_id)
+        self.update_branch_head(&mut tx, &scope_key, into, &into_head, &commit_id)
             .await?;
+        let _ = Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &commit_id).await?;
         tx.commit().await.map_err(Self::storage_err)?;
-        self.set_head(&scope_key, &commit_id).await?;
         Ok(MergeResult {
             commit: commit_id,
             conflicts,
@@ -1466,17 +1578,17 @@ impl VersionStore for PgVersionStore {
                 if let Ok(u) = ContextUri::parse(uri.as_str()) {
                     diff.adds.push(u);
                 }
-            } else if sa.get(uri) != sb.get(uri) {
-                if let Ok(u) = ContextUri::parse(uri.as_str()) {
-                    diff.updates.push(u);
-                }
+            } else if sa.get(uri) != sb.get(uri)
+                && let Ok(u) = ContextUri::parse(uri.as_str())
+            {
+                diff.updates.push(u);
             }
         }
         for uri in sa.keys() {
-            if !sb.contains_key(uri) {
-                if let Ok(u) = ContextUri::parse(uri.as_str()) {
-                    diff.deletes.push(u);
-                }
+            if !sb.contains_key(uri)
+                && let Ok(u) = ContextUri::parse(uri.as_str())
+            {
+                diff.deletes.push(u);
             }
         }
         Ok(diff)
@@ -1544,7 +1656,7 @@ impl VersionStore for PgVersionStore {
         }
         // 更新 branch HEAD
         let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
-        self.update_branch_head(&mut tx, &scope_key, branch, &target)
+        self.update_branch_head(&mut tx, &scope_key, branch, &branch_head, &target)
             .await?;
         tx.commit().await.map_err(Self::storage_err)?;
         Ok(applied)
@@ -1927,10 +2039,11 @@ impl VersionStore for PgVersionStore {
         // Fast-forward
         if self.is_ancestor(&into_head, &from_head).await? {
             let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
-            self.update_branch_head(&mut tx, &scope_key, into, &from_head)
+            self.update_branch_head(&mut tx, &scope_key, into, &into_head, &from_head)
                 .await?;
+            let _ =
+                Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &from_head).await?;
             tx.commit().await.map_err(Self::storage_err)?;
-            self.set_head(&scope_key, &from_head).await?;
             return Ok(MergeResult {
                 commit: from_head,
                 conflicts: vec![],
@@ -1968,10 +2081,10 @@ impl VersionStore for PgVersionStore {
                         if fv == iv {
                             continue;
                         }
-                        if jaccard(fv, iv) < threshold as f64 {
-                            if let Ok(u) = ContextUri::parse(uri_str.as_str()) {
-                                cs.push(u);
-                            }
+                        if jaccard(fv, iv) < threshold as f64
+                            && let Ok(u) = ContextUri::parse(uri_str.as_str())
+                        {
+                            cs.push(u);
                         }
                     }
                 }
@@ -2011,10 +2124,10 @@ impl VersionStore for PgVersionStore {
         self.insert_commit_row(&mut tx, &merge_commit, &scope_key)
             .await?;
         self.insert_deltas(&mut tx, &new_id, &deltas).await?;
-        self.update_branch_head(&mut tx, &scope_key, into, &new_id)
+        self.update_branch_head(&mut tx, &scope_key, into, &into_head, &new_id)
             .await?;
+        let _ = Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &new_id).await?;
         tx.commit().await.map_err(Self::storage_err)?;
-        self.set_head(&scope_key, &new_id).await?;
         Ok(MergeResult {
             commit: new_id,
             conflicts,
@@ -2038,6 +2151,20 @@ impl PgVersionStore {
         target: &CommitId,
         onto: &BranchName,
     ) -> Result<ConflictSession> {
+        let scope_key = Self::scope_key(scope);
+        for id in [commit, target] {
+            let found: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM version_commits WHERE id = $1 AND scope = $2)",
+            )
+            .bind(id.0)
+            .bind(&scope_key)
+            .fetch_one(self.pg())
+            .await
+            .map_err(Self::storage_err)?;
+            if !found {
+                return Err(VersionError::NotFound(format!("commit {}", id.0)));
+            }
+        }
         let parent = self.first_parent(commit).await?;
         let base_snap = if let Some(p) = &parent {
             self.reconstruct_snapshot(p).await?
@@ -2131,7 +2258,7 @@ impl PgVersionStore {
             .await?;
         self.insert_deltas(&mut tx, &new_id, &final_deltas).await?;
         if let Some(b) = onto_branch {
-            self.update_branch_head(&mut tx, &scope_key, b, &new_id)
+            self.update_branch_head(&mut tx, &scope_key, b, target, &new_id)
                 .await?;
         }
         tx.commit().await.map_err(Self::storage_err)?;
@@ -2313,7 +2440,7 @@ impl InteractiveVersionStore for PgVersionStore {
                 }
                 let scope_key = Self::scope_key(&session.scope);
                 let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
-                self.update_branch_head(&mut tx, &scope_key, branch, &target)
+                self.update_branch_head(&mut tx, &scope_key, branch, &session.target, &target)
                     .await?;
                 tx.commit().await.map_err(Self::storage_err)?;
                 Ok(applied)

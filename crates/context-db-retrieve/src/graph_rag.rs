@@ -134,7 +134,7 @@ impl GraphRagIndex {
                     content,
                     relevance: (score * 0.88 + self.node_score(&node) * 0.12).clamp(0.05, 1.0),
                     parent_chain: vec![
-                        ContextUri::parse(&format!("uwu://graph-rag/community/{}", community.id))
+                        ContextUri::parse(format!("uwu://graph-rag/community/{}", community.id))
                             .unwrap_or_else(|_| {
                                 ContextUri::parse("uwu://graph-rag/community/root").unwrap()
                             }),
@@ -374,10 +374,9 @@ impl GraphRagIndexer {
                     },
                 )
                 .await
+                && !summary.trim().is_empty()
             {
-                if !summary.trim().is_empty() {
-                    return summary;
-                }
+                return summary;
             }
         }
         if evidence.is_empty() {
@@ -515,7 +514,7 @@ fn build_hierarchy(mut communities: Vec<GraphRagCommunity>) -> Vec<GraphRagCommu
 
 fn community_summary_hit(community: &GraphRagCommunity, score: f32) -> RetrievalHit {
     RetrievalHit {
-        uri: ContextUri::parse(&format!("uwu://graph-rag/community/{}", community.id))
+        uri: ContextUri::parse(format!("uwu://graph-rag/community/{}", community.id))
             .unwrap_or_else(|_| ContextUri::parse("uwu://graph-rag/community/root").unwrap()),
         level: ContentLevel::L1,
         content: ContentPayload::Text {
@@ -621,7 +620,9 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_context_db_core::{DirEntry, FindPattern, GraphRelation, GrepHit, TreeNode};
+    use agent_context_db_core::{
+        DirEntry, FindPattern, GraphRelation, GrepHit, Page, PageRequest, TreeNode,
+    };
     use async_trait::async_trait;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -633,24 +634,36 @@ mod tests {
 
     #[async_trait]
     impl FsOps for MockFs {
-        async fn ls(&self, _dir: &ContextUri) -> Result<Vec<DirEntry>> {
-            Ok(vec![])
+        async fn ls(&self, _dir: &ContextUri, _page: PageRequest) -> Result<Page<DirEntry>> {
+            Ok(Page::new(vec![], None))
         }
 
-        async fn find(&self, _pattern: &FindPattern) -> Result<Vec<ContextUri>> {
-            Ok(self.docs.keys().cloned().collect())
+        async fn find(
+            &self,
+            _pattern: &FindPattern,
+            _page: PageRequest,
+        ) -> Result<Page<ContextUri>> {
+            Ok(Page::new(self.docs.keys().cloned().collect(), None))
         }
 
         async fn grep(&self, _regex: &str, _scope: &ContextUri) -> Result<Vec<GrepHit>> {
             Ok(vec![])
         }
 
-        async fn tree(&self, root: &ContextUri, _depth: usize) -> Result<TreeNode> {
-            Ok(TreeNode {
-                uri: root.clone(),
-                is_dir: true,
-                children: vec![],
-            })
+        async fn tree(
+            &self,
+            root: &ContextUri,
+            _depth: usize,
+            _page: PageRequest,
+        ) -> Result<Page<TreeNode>> {
+            Ok(Page::new(
+                vec![TreeNode {
+                    uri: root.clone(),
+                    is_dir: true,
+                    children: vec![],
+                }],
+                None,
+            ))
         }
 
         async fn read(&self, uri: &ContextUri, _level: ContentLevel) -> Result<ContentPayload> {

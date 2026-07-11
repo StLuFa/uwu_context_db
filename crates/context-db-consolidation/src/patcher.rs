@@ -12,6 +12,12 @@ pub struct PatchResult {
     pub affected_uris: Vec<ContextUri>,
 }
 
+impl Default for SkillPatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SkillPatcher {
     pub fn new() -> Self {
         Self

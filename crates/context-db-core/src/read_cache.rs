@@ -74,6 +74,12 @@ pub struct MemoryReadCache {
 }
 
 impl MemoryReadCache {
+    /// Builds the canonical cache key. Both dimensions are required: entries at
+    /// different content levels are different representations, not aliases.
+    fn cache_key(uri: &ContextUri, level: ContentLevel) -> String {
+        format!("{}:{}", uri.as_str(), level.as_str())
+    }
+
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
             l0: moka::future::Cache::builder()
@@ -114,9 +120,9 @@ impl MemoryReadCache {
 
 #[async_trait]
 impl ReadCache for MemoryReadCache {
-    async fn get(&self, uri: &ContextUri, _level: ContentLevel) -> Option<Option<ContentPayload>> {
+    async fn get(&self, uri: &ContextUri, level: ContentLevel) -> Option<Option<ContentPayload>> {
         self.l0
-            .get(&uri.to_string())
+            .get(&Self::cache_key(uri, level))
             .await
             .map(|entry| entry.payload)
     }
@@ -124,14 +130,14 @@ impl ReadCache for MemoryReadCache {
     async fn put(
         &self,
         uri: &ContextUri,
-        _level: ContentLevel,
+        level: ContentLevel,
         payload: ContentPayload,
         ttl: Duration,
     ) {
         let effective_ttl = if ttl.is_zero() { self.default_ttl } else { ttl };
         self.l0
             .insert(
-                uri.to_string(),
+                Self::cache_key(uri, level),
                 CacheEntry {
                     payload: Some(payload),
                     ttl: Self::jittered(effective_ttl),
@@ -140,10 +146,10 @@ impl ReadCache for MemoryReadCache {
             .await;
     }
 
-    async fn put_negative(&self, uri: &ContextUri, _level: ContentLevel) {
+    async fn put_negative(&self, uri: &ContextUri, level: ContentLevel) {
         self.l0
             .insert(
-                uri.to_string(),
+                Self::cache_key(uri, level),
                 CacheEntry {
                     payload: None,
                     ttl: Self::jittered(self.negative_ttl),
@@ -153,6 +159,97 @@ impl ReadCache for MemoryReadCache {
     }
 
     async fn invalidate(&self, uri: &ContextUri) {
-        self.l0.invalidate(&uri.to_string()).await;
+        // invalidate(uri) is deliberately level-agnostic: mutations make every
+        // cached representation stale and Moka invalidations are safe to race.
+        for level in [ContentLevel::L0, ContentLevel::L1, ContentLevel::L2] {
+            self.l0.invalidate(&Self::cache_key(uri, level)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn uri() -> ContextUri {
+        ContextUri::parse("uwu://tenant/agent/a/memory/fact/cache-test").unwrap()
+    }
+
+    fn payload(text: &str) -> ContentPayload {
+        ContentPayload::Text {
+            sparse: text.to_string(),
+            dense: text.to_string(),
+            full: text.to_string(),
+        }
+    }
+
+    fn cached_text(value: Option<Option<ContentPayload>>) -> Option<Option<String>> {
+        value.map(|payload| {
+            payload.map(|payload| match payload {
+                ContentPayload::Text { sparse, .. } => sparse,
+                _ => panic!("test cache contained non-text payload"),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn levels_do_not_pollute_each_other_in_either_direction() {
+        let cache = MemoryReadCache::new(16, Duration::from_secs(60));
+        let uri = uri();
+        cache
+            .put(&uri, ContentLevel::L0, payload("l0"), Duration::ZERO)
+            .await;
+        cache
+            .put(&uri, ContentLevel::L2, payload("l2"), Duration::ZERO)
+            .await;
+
+        assert_eq!(
+            cached_text(cache.get(&uri, ContentLevel::L0).await),
+            Some(Some("l0".into()))
+        );
+        assert!(cache.get(&uri, ContentLevel::L1).await.is_none());
+        assert_eq!(
+            cached_text(cache.get(&uri, ContentLevel::L2).await),
+            Some(Some("l2".into()))
+        );
+
+        cache.put_negative(&uri, ContentLevel::L1).await;
+        assert_eq!(
+            cached_text(cache.get(&uri, ContentLevel::L1).await),
+            Some(None)
+        );
+        assert_eq!(
+            cached_text(cache.get(&uri, ContentLevel::L0).await),
+            Some(Some("l0".into()))
+        );
+        assert_eq!(
+            cached_text(cache.get(&uri, ContentLevel::L2).await),
+            Some(Some("l2".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_invalidation_clears_all_levels() {
+        let cache = Arc::new(MemoryReadCache::new(32, Duration::from_secs(60)));
+        let uri = uri();
+        for level in [ContentLevel::L0, ContentLevel::L1, ContentLevel::L2] {
+            cache
+                .put(&uri, level, payload(level.as_str()), Duration::ZERO)
+                .await;
+        }
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let cache = Arc::clone(&cache);
+            let uri = uri.clone();
+            tasks.push(tokio::spawn(async move { cache.invalidate(&uri).await }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        for level in [ContentLevel::L0, ContentLevel::L1, ContentLevel::L2] {
+            assert!(cache.get(&uri, level).await.is_none());
+        }
     }
 }

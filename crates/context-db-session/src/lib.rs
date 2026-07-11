@@ -1,38 +1,15 @@
-//! # agent-context-db-session (L4 会话层)
-//!
-//! 两阶段 commit 的会话压缩：
-//! - Phase1 同步：归档消息 + 清空当前窗口 + 返回 task_id
-//! - Phase2 异步：生成 L0/L1 + 提取记忆 + 写 memory_diff.json
-//!
-//! ## 解耦约束
-//!
-//! - 仅依赖 core 的类型与 `ContentRepo` 端口（写归档）；不依赖 parse/compressor。
-//! - `SessionCompressor` 是端口（零实现），编排由 composition root 装配。
+//! 持久化、可恢复的会话压缩状态机。
 
 pub mod compressor;
 
-pub use compressor::{
-    MemoryExtractorShim, SemanticProcessorShim, SessionCompressorImpl, ShimAction,
-    ShimCandidateAction,
-};
+pub use compressor::SessionCompressorImpl;
 
-use agent_context_db_core::{ContentType, ContextUri, Result};
-use async_trait::async_trait;
+use agent_context_db_core::{ContentType, ContextUri};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// 两阶段 commit 会话压缩器。
-#[async_trait]
-pub trait SessionCompressor: Send + Sync {
-    /// Phase1 同步：归档消息 + 清空当前 + 返回 task_id。
-    async fn commit_phase1(&self, session: &SessionHandle) -> Result<CommitTaskId>;
-    /// Phase2 异步：生成 L0/L1 + 提取记忆 + 写 memory_diff.json。
-    async fn commit_phase2(&self, task_id: CommitTaskId) -> Result<DoneMarker>;
-    /// 查询异步任务状态。
-    async fn poll_task(&self, task_id: CommitTaskId) -> Result<TaskStatus>;
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHandle {
     pub session_id: Uuid,
     pub user_id: String,
@@ -46,7 +23,7 @@ pub struct SessionHandle {
 pub struct SessionMessage {
     pub role: Role,
     pub content: String,
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub timestamp: DateTime<Utc>,
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
@@ -74,24 +51,34 @@ impl Default for CommitTaskId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Pending,
-    Processing,
+    Processing {
+        attempt: u32,
+        started_at: DateTime<Utc>,
+    },
     Done(DoneMarker),
-    Failed(String),
+    Failed(FailureMetadata),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureMetadata {
+    pub message: String,
+    pub attempt: u32,
+    pub failed_at: DateTime<Utc>,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoneMarker {
     pub task_id: CommitTaskId,
-    pub finished_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: DateTime<Utc>,
     pub abstract_uri: ContextUri,
     pub overview_uri: ContextUri,
-    pub memory_diff_uri: Option<ContextUri>,
+    pub memory_diff_uri: ContextUri,
 }
 
-/// 记忆变更审计。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryDiff {
     pub adds: Vec<MemoryChange>,
@@ -106,20 +93,4 @@ pub struct MemoryChange {
     pub before: Option<serde_json::Value>,
     pub after: Option<serde_json::Value>,
     pub reason: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_diff_default_is_empty() {
-        let d = MemoryDiff::default();
-        assert!(d.adds.is_empty() && d.updates.is_empty() && d.deletes.is_empty());
-    }
-
-    #[test]
-    fn task_id_is_unique() {
-        assert_ne!(CommitTaskId::new(), CommitTaskId::new());
-    }
 }

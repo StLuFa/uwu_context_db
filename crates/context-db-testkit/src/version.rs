@@ -313,9 +313,9 @@ impl VersionStore for MemoryVersionStore {
                 .lock()
                 .get(&key)
                 .map(|b| b.head.clone())
-                .unwrap_or_else(|| CommitId::new())
+                .unwrap_or_default()
         } else {
-            self.head(&scope_key).unwrap_or_else(CommitId::new)
+            self.head(&scope_key).unwrap_or_default()
         };
 
         let commits = self.commits.lock();
@@ -382,33 +382,33 @@ impl VersionStore for MemoryVersionStore {
         };
 
         let snapshots = self.entry_snapshots.lock();
-        if let Some(snapshot) = snapshots.get(&commit_id) {
-            if let Some(entry_json) = snapshot.get(&uri.to_string()) {
-                let entry: ContextEntry = serde_json::from_str(entry_json)
-                    .map_err(|e| VersionError::Storage(format!("deserialize entry: {e}")))?;
-                return Ok(match level {
-                    ContentLevel::L0 => {
-                        let s = entry.l0_text().to_string();
-                        ContentPayload::Text {
-                            sparse: s.clone(),
-                            dense: s.clone(),
-                            full: s,
-                        }
+        if let Some(snapshot) = snapshots.get(&commit_id)
+            && let Some(entry_json) = snapshot.get(&uri.to_string())
+        {
+            let entry: ContextEntry = serde_json::from_str(entry_json)
+                .map_err(|e| VersionError::Storage(format!("deserialize entry: {e}")))?;
+            return Ok(match level {
+                ContentLevel::L0 => {
+                    let s = entry.l0_text().to_string();
+                    ContentPayload::Text {
+                        sparse: s.clone(),
+                        dense: s.clone(),
+                        full: s,
                     }
-                    ContentLevel::L1 => {
-                        let dense = match &entry.payload {
-                            ContentPayload::Text { dense, .. } => dense.clone(),
-                            _ => String::new(),
-                        };
-                        ContentPayload::Text {
-                            sparse: entry.l0_text().to_string(),
-                            dense: dense.clone(),
-                            full: dense,
-                        }
+                }
+                ContentLevel::L1 => {
+                    let dense = match &entry.payload {
+                        ContentPayload::Text { dense, .. } => dense.clone(),
+                        _ => String::new(),
+                    };
+                    ContentPayload::Text {
+                        sparse: entry.l0_text().to_string(),
+                        dense: dense.clone(),
+                        full: dense,
                     }
-                    ContentLevel::L2 => entry.payload.clone(),
-                });
-            }
+                }
+                ContentLevel::L2 => entry.payload.clone(),
+            });
         }
 
         Err(VersionError::NotFound(format!(
@@ -431,10 +431,10 @@ impl VersionStore for MemoryVersionStore {
                     let commits = self.commits.lock();
                     let mut best: Option<(DateTime<Utc>, CommitId)> = None;
                     for (id, c) in commits.iter() {
-                        if c.timestamp <= ts {
-                            if best.is_none() || c.timestamp > best.as_ref().unwrap().0 {
-                                best = Some((c.timestamp, id.clone()));
-                            }
+                        if c.timestamp <= ts
+                            && (best.is_none() || c.timestamp > best.as_ref().unwrap().0)
+                        {
+                            best = Some((c.timestamp, id.clone()));
                         }
                     }
                     best.map(|(_, id)| id)
@@ -548,7 +548,11 @@ impl VersionStore for MemoryVersionStore {
                     },
                 };
 
-                // 合并快照
+                // 基于最近共同祖先执行真正的三路合并，删除也必须作为变更传播。
+                let base_snapshot = self
+                    .merge_base(&from_head, &into_head)
+                    .and_then(|id| self.entry_snapshots.lock().get(&id).cloned())
+                    .unwrap_or_default();
                 let into_snapshot = self
                     .entry_snapshots
                     .lock()
@@ -561,10 +565,48 @@ impl VersionStore for MemoryVersionStore {
                     .get(&from_head)
                     .cloned()
                     .unwrap_or_default();
-
-                let mut merged = into_snapshot;
-                for (k, v) in from_snapshot {
-                    merged.insert(k, v);
+                let keys: std::collections::HashSet<String> = base_snapshot
+                    .keys()
+                    .chain(from_snapshot.keys())
+                    .chain(into_snapshot.keys())
+                    .cloned()
+                    .collect();
+                let mut merged = into_snapshot.clone();
+                let mut conflicts = Vec::new();
+                for uri in keys {
+                    let base = base_snapshot.get(&uri);
+                    let ours = into_snapshot.get(&uri);
+                    let theirs = from_snapshot.get(&uri);
+                    if theirs == base {
+                        continue;
+                    }
+                    if ours == base || ours == theirs {
+                        match theirs {
+                            Some(value) => {
+                                merged.insert(uri, value.clone());
+                            }
+                            None => {
+                                merged.remove(&uri);
+                            }
+                        }
+                        continue;
+                    }
+                    match strategy {
+                        MergeStrategy::Theirs => match theirs {
+                            Some(value) => {
+                                merged.insert(uri, value.clone());
+                            }
+                            None => {
+                                merged.remove(&uri);
+                            }
+                        },
+                        MergeStrategy::Ours => {}
+                        MergeStrategy::ThreeWay | MergeStrategy::FastForward => {
+                            conflicts.push(ContextUri::parse(&uri).map_err(|e| {
+                                VersionError::Storage(format!("invalid snapshot URI: {e}"))
+                            })?);
+                        }
+                    }
                 }
 
                 self.commits.lock().insert(merge_id.clone(), merge_commit);
@@ -587,7 +629,7 @@ impl VersionStore for MemoryVersionStore {
 
                 Ok(MergeResult {
                     commit: merge_id,
-                    conflicts: vec![],
+                    conflicts,
                 })
             }
         }
@@ -612,27 +654,26 @@ impl VersionStore for MemoryVersionStore {
         let map_a = snap_a.cloned().unwrap_or_default();
         let map_b = snap_b.cloned().unwrap_or_default();
 
-        for (uri_str, _) in &map_b {
-            if !map_a.contains_key(uri_str) {
-                if let Ok(u) = ContextUri::parse(uri_str.clone()) {
-                    adds.push(u);
-                }
+        for uri_str in map_b.keys() {
+            if !map_a.contains_key(uri_str)
+                && let Ok(u) = ContextUri::parse(uri_str.clone())
+            {
+                adds.push(u);
             }
         }
         for (uri_str, content_b) in &map_b {
-            if let Some(content_a) = map_a.get(uri_str) {
-                if content_a != content_b {
-                    if let Ok(u) = ContextUri::parse(uri_str.clone()) {
-                        updates.push(u);
-                    }
-                }
+            if let Some(content_a) = map_a.get(uri_str)
+                && content_a != content_b
+                && let Ok(u) = ContextUri::parse(uri_str.clone())
+            {
+                updates.push(u);
             }
         }
         for uri_str in map_a.keys() {
-            if !map_b.contains_key(uri_str) {
-                if let Ok(u) = ContextUri::parse(uri_str.clone()) {
-                    deletes.push(u);
-                }
+            if !map_b.contains_key(uri_str)
+                && let Ok(u) = ContextUri::parse(uri_str.clone())
+            {
+                deletes.push(u);
             }
         }
 
@@ -801,6 +842,24 @@ impl VersionStore for MemoryVersionStore {
             self.cherry_pick(scope, &branch_head, onto, strategy)
                 .await?,
         ];
+        let new_tip = new_ids.last().cloned().expect("rebase produced a commit");
+        let mut branches = self.branches.lock();
+        let rebased = branches
+            .get_mut(&(scope_key.clone(), branch.as_str().to_string()))
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", branch)))?;
+        if rebased.head != branch_head {
+            return Err(VersionError::Storage("rebase branch CAS failed".into()));
+        }
+        rebased.head = new_tip.clone();
+        drop(branches);
+        if self
+            .attached_branches
+            .lock()
+            .get(&scope_key)
+            .is_some_and(|attached| attached == branch)
+        {
+            self.set_head(&scope_key, new_tip);
+        }
         Ok(new_ids)
     }
 
@@ -810,24 +869,53 @@ impl VersionStore for MemoryVersionStore {
         commits: Vec<CommitId>,
         message: &str,
     ) -> Result<SquashResult> {
+        if commits.len() < 2 {
+            return Err(VersionError::Storage("squash needs >= 2 commits".into()));
+        }
         let count = commits.len();
-        let merged_snapshot = {
-            let snapshots = self.entry_snapshots.lock();
-            let mut merged = HashMap::new();
-            for cid in &commits {
-                if let Some(s) = snapshots.get(cid) {
-                    for (k, v) in s {
-                        merged.insert(k.clone(), v.clone());
-                    }
+        let (parent, merged_snapshot) = {
+            let stored_commits = self.commits.lock();
+            for id in &commits {
+                if !stored_commits.contains_key(id) {
+                    return Err(VersionError::NotFound(format!("commit {}", id.0)));
                 }
             }
-            merged
+            for pair in commits.windows(2) {
+                if stored_commits.get(&pair[1]).and_then(|c| c.parents.first()) != Some(&pair[0]) {
+                    return Err(VersionError::Storage(
+                        "squash commits must be a consecutive first-parent range ordered oldest to newest".into(),
+                    ));
+                }
+            }
+            let parent = stored_commits
+                .get(&commits[0])
+                .and_then(|commit| commit.parents.first().cloned());
+            let snapshot = self
+                .entry_snapshots
+                .lock()
+                .get(commits.last().expect("non-empty commits"))
+                .cloned()
+                .unwrap_or_default();
+            (parent, snapshot)
         };
+        let newest = commits.last().cloned().expect("non-empty commits");
+        let scope_key = Self::scope_key(scope);
+        let referenced = self.head(&scope_key).as_ref() == Some(&newest)
+            || self
+                .branches
+                .lock()
+                .values()
+                .any(|branch| branch.head == newest);
+        if !referenced {
+            return Err(VersionError::Storage(
+                "squash tip is not referenced by a branch or HEAD".into(),
+            ));
+        }
 
         let new_id = CommitId::new();
         let squash = Commit {
             id: new_id.clone(),
-            parents: commits,
+            parents: parent.into_iter().collect(),
             tree_hash: ContentHash(format!("squash-{}", new_id.0)),
             author: Author {
                 agent_id: None,
@@ -843,7 +931,14 @@ impl VersionStore for MemoryVersionStore {
         self.entry_snapshots
             .lock()
             .insert(new_id.clone(), merged_snapshot);
-        self.set_head(&Self::scope_key(scope), new_id.clone());
+        for branch in self.branches.lock().values_mut() {
+            if branch.head == newest {
+                branch.head = new_id.clone();
+            }
+        }
+        if self.head(&scope_key).as_ref() == Some(&newest) {
+            self.set_head(&scope_key, new_id.clone());
+        }
 
         Ok(SquashResult {
             new_commit: new_id,
@@ -913,10 +1008,10 @@ impl VersionStore for MemoryVersionStore {
         let mut downstream = Vec::new();
         let target = commit.clone();
         for (cid, c) in commits.iter() {
-            if c.parents.contains(&target) {
-                if let Ok(u) = ContextUri::parse(format!("commit-{}", cid.0)) {
-                    downstream.push(u);
-                }
+            if c.parents.contains(&target)
+                && let Ok(u) = ContextUri::parse(format!("commit-{}", cid.0))
+            {
+                downstream.push(u);
             }
         }
         let branches = self.branches.lock();
@@ -967,7 +1062,7 @@ impl VersionStore for MemoryVersionStore {
                 valid_until: None,
             })
             .collect();
-        versions.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        versions.sort_by_key(|a| a.timestamp);
         Ok(versions)
     }
 
@@ -1057,10 +1152,10 @@ impl VersionStore for MemoryVersionStore {
                             continue;
                         }
                         let sim = jaccard_similarity(from_val, into_val);
-                        if sim < threshold as f64 {
-                            if let Ok(u) = ContextUri::parse(uri_str.as_str()) {
-                                cs.push(u);
-                            }
+                        if sim < threshold as f64
+                            && let Ok(u) = ContextUri::parse(uri_str.as_str())
+                        {
+                            cs.push(u);
                         }
                     }
                 }
@@ -1152,6 +1247,34 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
 impl MemoryVersionStore {
     /// 检查 candidate 是否为 ancestor 的（祖先的）后代。
     /// 沿 candidate 的 parent 链回溯，看是否能到达 ancestor。
+    fn merge_base(&self, a: &CommitId, b: &CommitId) -> Option<CommitId> {
+        let commits = self.commits.lock();
+        let mut ancestors = std::collections::HashSet::new();
+        let mut stack = vec![a.clone()];
+        while let Some(id) = stack.pop() {
+            if !ancestors.insert(id.clone()) {
+                continue;
+            }
+            if let Some(commit) = commits.get(&id) {
+                stack.extend(commit.parents.iter().cloned());
+            }
+        }
+        let mut queue = std::collections::VecDeque::from([b.clone()]);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = queue.pop_front() {
+            if ancestors.contains(&id) {
+                return Some(id);
+            }
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if let Some(commit) = commits.get(&id) {
+                queue.extend(commit.parents.iter().cloned());
+            }
+        }
+        None
+    }
+
     fn is_ancestor(&self, ancestor: &CommitId, candidate: &CommitId) -> bool {
         if ancestor == candidate {
             return true;

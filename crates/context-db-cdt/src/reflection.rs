@@ -41,6 +41,15 @@ pub struct FailureTrace {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReflectionFailure {
+    pub task: String,
+    pub step: String,
+    pub error: String,
+    pub knowledge: Vec<String>,
+    pub trace: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReflectionWritebackConfig {
     pub agent_scope: String,
     pub tenant: TenantId,
@@ -105,12 +114,12 @@ impl SemanticGradient {
         )
         .to_hex();
         let short = &hash[..8];
-        let error_uri = ContextUri::parse(&format!(
+        let error_uri = ContextUri::parse(format!(
             "uwu://{}/memory/error/reflection/{:02}-{}",
             config.agent_scope, index, short
         ))
         .expect("reflection error URI must be valid");
-        let heuristic_uri = ContextUri::parse(&format!(
+        let heuristic_uri = ContextUri::parse(format!(
             "uwu://{}/memory/heuristic/reflection/{:02}-{}",
             config.agent_scope, index, short
         ))
@@ -164,7 +173,7 @@ impl SemanticGradient {
     }
 
     pub fn recall_hint(&self, agent_scope: &str) -> ReflectionRecallHint {
-        let scope = ContextUri::parse(&format!("uwu://{agent_scope}/memory/error/reflection"))
+        let scope = ContextUri::parse(format!("uwu://{agent_scope}/memory/error/reflection"))
             .expect("reflection recall scope must be valid");
         ReflectionRecallHint {
             pattern: FindPattern {
@@ -211,7 +220,7 @@ fn reflection_meta(
         }],
         evidence_uris: evidence_uri.into_iter().collect(),
         corroboration,
-        half_life_days: Some(120.0),
+        half_life: Some(agent_context_db_core::HalfLife::Finite { days: 120.0 }),
         entangled_with: gradient.source_uri.iter().cloned().collect(),
     }
 }
@@ -419,17 +428,17 @@ Output a JSON object with:
         };
 
         // 尝试 LLM 反思
-        if let Ok(response) = self.llm.complete(&prompt, &opts).await {
-            if let Ok(parsed) = serde_json::from_str::<LlmReflectionResponse>(&response) {
-                return SemanticGradient {
-                    error_type: ContentType::Error,
-                    reflection_text: parsed.why_failed,
-                    action_improvement: parsed.action_improvement,
-                    epistemic_tags: parsed.epistemic_tags,
-                    source_uri: None,
-                    priority: parsed.priority.clamp(0.0, 1.0),
-                };
-            }
+        if let Ok(response) = self.llm.complete(&prompt, &opts).await
+            && let Ok(parsed) = serde_json::from_str::<LlmReflectionResponse>(&response)
+        {
+            return SemanticGradient {
+                error_type: ContentType::Error,
+                reflection_text: parsed.why_failed,
+                action_improvement: parsed.action_improvement,
+                epistemic_tags: parsed.epistemic_tags,
+                source_uri: None,
+                priority: parsed.priority.clamp(0.0, 1.0),
+            };
         }
 
         Self::local_reflection(
@@ -477,18 +486,15 @@ Output a JSON object with:
     }
 
     /// 批量反思 — 对多个失败轨迹并行生成改进建议。
-    pub async fn reflect_batch(
-        &self,
-        failures: &[(String, String, String, Vec<String>, Vec<String>)],
-    ) -> Vec<SemanticGradient> {
+    pub async fn reflect_batch(&self, failures: &[ReflectionFailure]) -> Vec<SemanticGradient> {
         let traces: Vec<FailureTrace> = failures
             .iter()
-            .map(|(task, step, err, knowledge, trace)| FailureTrace {
-                task_description: task.clone(),
-                failed_step: step.clone(),
-                error_message: err.clone(),
-                relevant_knowledge: knowledge.clone(),
-                trace: trace.clone(),
+            .map(|failure| FailureTrace {
+                task_description: failure.task.clone(),
+                failed_step: failure.step.clone(),
+                error_message: failure.error.clone(),
+                relevant_knowledge: failure.knowledge.clone(),
+                trace: failure.trace.clone(),
             })
             .collect();
         self.reflect_failures(&traces).await

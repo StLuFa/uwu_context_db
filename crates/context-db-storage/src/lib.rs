@@ -11,12 +11,15 @@
 //!
 //! - 后端具体类型只在此层出现；上层（retrieve/session/parse）只依赖 core 窄端口。
 //! - PG 适配器通过 `uwu_database` 基础库注入连接池与向量后端，不自行管理连接。
+use agent_context_db_core::{Page, PageRequest};
 
 pub mod migrations;
+pub mod outbox;
 pub mod perf;
 pub mod pg;
 pub mod pg_version;
 pub mod sqlite;
+pub mod sqlite_version;
 pub mod uwu_cache_adapter;
 pub mod vector_index;
 
@@ -33,6 +36,7 @@ pub use perf::{
 pub use pg::PgContextStore;
 pub use pg_version::PgVersionStore;
 pub use sqlite::{SqliteContextStore, migrate_sqlite};
+pub use sqlite_version::SqliteVersionStore;
 pub use vector_index::UwuVectorIndex;
 
 use agent_context_db_core::{
@@ -51,16 +55,16 @@ pub enum SqlContextStore {
 
 #[async_trait]
 impl FsOps for SqlContextStore {
-    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
+    async fn ls(&self, dir: &ContextUri, page: PageRequest) -> Result<Page<DirEntry>> {
         match self {
-            Self::Sqlite(store) => store.ls(dir).await,
-            Self::Postgres(store) => store.ls(dir).await,
+            Self::Sqlite(store) => store.ls(dir, page).await,
+            Self::Postgres(store) => store.ls(dir, page).await,
         }
     }
-    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>> {
+    async fn find(&self, pattern: &FindPattern, page: PageRequest) -> Result<Page<ContextUri>> {
         match self {
-            Self::Sqlite(store) => store.find(pattern).await,
-            Self::Postgres(store) => store.find(pattern).await,
+            Self::Sqlite(store) => store.find(pattern, page).await,
+            Self::Postgres(store) => store.find(pattern, page).await,
         }
     }
     async fn grep(&self, pattern: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
@@ -69,10 +73,15 @@ impl FsOps for SqlContextStore {
             Self::Postgres(store) => store.grep(pattern, scope).await,
         }
     }
-    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
+    async fn tree(
+        &self,
+        root: &ContextUri,
+        depth: usize,
+        page: PageRequest,
+    ) -> Result<Page<TreeNode>> {
         match self {
-            Self::Sqlite(store) => store.tree(root, depth).await,
-            Self::Postgres(store) => store.tree(root, depth).await,
+            Self::Sqlite(store) => store.tree(root, depth, page).await,
+            Self::Postgres(store) => store.tree(root, depth, page).await,
         }
     }
     async fn read(
@@ -123,10 +132,25 @@ impl ContentStore for SqlContextStore {
             Self::Postgres(store) => ContentStore::batch_write(store, entries).await,
         }
     }
-    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
+    async fn scan_by_prefix(&self, prefix: &str, page: PageRequest) -> Result<Page<ContextEntry>> {
         match self {
-            Self::Sqlite(store) => ContentStore::scan_by_prefix(store, prefix, limit).await,
-            Self::Postgres(store) => ContentStore::scan_by_prefix(store, prefix, limit).await,
+            Self::Sqlite(store) => ContentStore::scan_by_prefix(store, prefix, page).await,
+            Self::Postgres(store) => ContentStore::scan_by_prefix(store, prefix, page).await,
+        }
+    }
+    async fn scan_by_type(
+        &self,
+        prefix: &str,
+        content_type: agent_context_db_core::ContentType,
+        page: PageRequest,
+    ) -> Result<Page<ContextEntry>> {
+        match self {
+            Self::Sqlite(store) => {
+                ContentStore::scan_by_type(store, prefix, content_type, page).await
+            }
+            Self::Postgres(store) => {
+                ContentStore::scan_by_type(store, prefix, content_type, page).await
+            }
         }
     }
 }
@@ -168,6 +192,9 @@ impl ContentRepo for SqlContextStore {
 pub struct ContextDbService<S> {
     content: Arc<S>,
     index: Arc<dyn VectorIndex>,
+    version: Arc<dyn agent_context_db_version::VersionStore>,
+    interactive_version: Arc<dyn agent_context_db_version::InteractiveVersionStore>,
+    _outbox_runtime: Option<Arc<outbox::OutboxRuntime>>,
 }
 
 impl<S> ContextDbService<S>
@@ -175,8 +202,24 @@ where
     S: agent_context_db_core::FsOps + agent_context_db_core::ContentRepo + 'static,
 {
     /// 通用构造器：注入任意实现了 ContextStore 的内容层 + VectorIndex。
-    pub fn new(content: Arc<S>, index: Arc<dyn VectorIndex>) -> Self {
-        Self { content, index }
+    pub fn new(
+        content: Arc<S>,
+        index: Arc<dyn VectorIndex>,
+        version: Arc<dyn agent_context_db_version::VersionStore>,
+        interactive_version: Arc<dyn agent_context_db_version::InteractiveVersionStore>,
+    ) -> Self {
+        Self {
+            content,
+            index,
+            version,
+            interactive_version,
+            _outbox_runtime: None,
+        }
+    }
+
+    fn with_outbox_runtime(mut self, runtime: outbox::OutboxRuntime) -> Self {
+        self._outbox_runtime = Some(Arc::new(runtime));
+        self
     }
 
     /// 交出内容层的只读寻址窄端口（供检索层使用）。
@@ -192,6 +235,16 @@ where
     /// 交出索引层端口。
     pub fn vector_index(&self) -> Arc<dyn VectorIndex> {
         self.index.clone()
+    }
+
+    pub fn version_store(&self) -> Arc<dyn agent_context_db_version::VersionStore> {
+        self.version.clone()
+    }
+
+    pub fn interactive_version_store(
+        &self,
+    ) -> Arc<dyn agent_context_db_version::InteractiveVersionStore> {
+        self.interactive_version.clone()
     }
 }
 
@@ -210,6 +263,9 @@ impl<S> Clone for ContextDbService<S> {
         Self {
             content: self.content.clone(),
             index: self.index.clone(),
+            version: self.version.clone(),
+            interactive_version: self.interactive_version.clone(),
+            _outbox_runtime: self._outbox_runtime.clone(),
         }
     }
 }
@@ -229,10 +285,20 @@ pub async fn service_from_uwu_db(
 ) -> Result<
     ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>>,
 > {
-    let store = match db.pool.backend() {
+    let pool = Arc::new(db.pool.clone());
+    let (store, version, interactive_version): (
+        SqlContextStore,
+        Arc<dyn agent_context_db_version::VersionStore>,
+        Arc<dyn agent_context_db_version::InteractiveVersionStore>,
+    ) = match db.pool.backend() {
         uwu_database::SqlBackend::Sqlite => {
             migrate_sqlite(&db.pool).await?;
-            SqlContextStore::Sqlite(SqliteContextStore::try_new(Arc::new(db.pool.clone()))?)
+            let versions = Arc::new(SqliteVersionStore::new(pool.clone()));
+            (
+                SqlContextStore::Sqlite(SqliteContextStore::try_new(pool.clone())?),
+                versions.clone(),
+                versions,
+            )
         }
         uwu_database::SqlBackend::Postgres => {
             let mut migrator = uwu_database::Migrator::new();
@@ -243,7 +309,12 @@ pub async fn service_from_uwu_db(
                 .up(&db.pool)
                 .await
                 .map_err(|e| ContextError::Storage(format!("postgres migration failed: {e}")))?;
-            SqlContextStore::Postgres(PgContextStore::new(Arc::new(db.pool.clone())))
+            let versions = Arc::new(PgVersionStore::new(pool.clone()));
+            (
+                SqlContextStore::Postgres(PgContextStore::new(pool.clone())),
+                versions.clone(),
+                versions,
+            )
         }
         backend => {
             return Err(ContextError::Storage(format!(
@@ -262,7 +333,11 @@ pub async fn service_from_uwu_db(
         )
     })?;
     let index: Arc<dyn VectorIndex> = Arc::new(UwuVectorIndex::new(vector));
-    Ok(ContextDbService::new(content, index))
+    let runtime = outbox::start_worker(pool, index.clone(), outbox::OutboxConfig::default());
+    Ok(
+        ContextDbService::new(content, index, version, interactive_version)
+            .with_outbox_runtime(runtime),
+    )
 }
 
 /// Convert context-db storage settings into an `uwu_database` runtime configuration.

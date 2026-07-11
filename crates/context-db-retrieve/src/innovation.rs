@@ -497,26 +497,36 @@ fn important_terms(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_context_db_core::{DirEntry, FindPattern, GrepHit, Result as CoreResult, TreeNode};
+    use agent_context_db_core::{
+        DirEntry, FindPattern, GrepHit, Page, PageRequest, Result as CoreResult, TreeNode,
+    };
 
     struct NoopFs;
     #[async_trait::async_trait]
     impl FsOps for NoopFs {
-        async fn ls(&self, _: &ContextUri) -> CoreResult<Vec<DirEntry>> {
-            Ok(vec![])
+        async fn ls(&self, _: &ContextUri, _: PageRequest) -> CoreResult<Page<DirEntry>> {
+            Ok(Page::new(vec![], None))
         }
-        async fn find(&self, _: &FindPattern) -> CoreResult<Vec<ContextUri>> {
-            Ok(vec![])
+        async fn find(&self, _: &FindPattern, _: PageRequest) -> CoreResult<Page<ContextUri>> {
+            Ok(Page::new(vec![], None))
         }
         async fn grep(&self, _: &str, _: &ContextUri) -> CoreResult<Vec<GrepHit>> {
             Ok(vec![])
         }
-        async fn tree(&self, r: &ContextUri, _: usize) -> CoreResult<TreeNode> {
-            Ok(TreeNode {
-                uri: r.clone(),
-                is_dir: true,
-                children: vec![],
-            })
+        async fn tree(
+            &self,
+            r: &ContextUri,
+            _: usize,
+            _: PageRequest,
+        ) -> CoreResult<Page<TreeNode>> {
+            Ok(Page::new(
+                vec![TreeNode {
+                    uri: r.clone(),
+                    is_dir: true,
+                    children: vec![],
+                }],
+                None,
+            ))
         }
         async fn read(&self, _: &ContextUri, _: ContentLevel) -> CoreResult<ContentPayload> {
             Ok(ContentPayload::Text {

@@ -68,6 +68,10 @@ impl LshIndex {
         self.buckets.values().map(|v| v.len()).sum()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buckets.values().all(Vec::is_empty)
+    }
+
     pub fn dimension(&self) -> Option<usize> {
         self.dimension
     }

@@ -105,6 +105,12 @@ pub struct WriteAheadLogger {
     seq: std::sync::atomic::AtomicU64,
 }
 
+impl Default for WriteAheadLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WriteAheadLogger {
     pub fn new() -> Self {
         Self {
@@ -177,6 +183,12 @@ pub struct DedupStats {
     pub dedup_hits: u64,
     pub raw_bytes: u64,
     pub compressed_bytes: u64,
+}
+
+impl Default for DedupStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DedupStore {
@@ -253,10 +265,10 @@ impl DedupStore {
         // 快路径：内存
         {
             let inner = self.inner.lock();
-            if let Some(hash) = inner.index.get(uri) {
-                if let Some(compressed) = inner.blobs.get(hash) {
-                    return decompress(compressed);
-                }
+            if let Some(hash) = inner.index.get(uri)
+                && let Some(compressed) = inner.blobs.get(hash)
+            {
+                return decompress(compressed);
             }
         }
         // 慢路径：持久化后端

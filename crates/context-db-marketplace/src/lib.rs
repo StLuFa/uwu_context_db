@@ -31,12 +31,15 @@ pub use conflict::{ConflictResolver, MarketConflictResolution};
 pub use consensus::ConsensusTracker;
 pub use crdt::{CrdtMergeStrategy, SemanticCrdtMerger};
 pub use discovery::{DiscoveryEngine, FederatedDiscoveryBackend};
-pub use feedback::{MarketFeedback, ReputationEngine};
+pub use feedback::{
+    FeedbackError, FeedbackPayload, FeedbackRegistry, FeedbackSignatureVerifier, MarketFeedback,
+    ReputationEngine,
+};
 pub use immune::ImmuneProtocol;
 pub use influence::InfluenceAnalyzer;
 pub use memetic::{
     EvolutionAction, EvolutionCandidate, EvolutionOffspring, EvolutionRunReport, FitnessScore,
-    FitnessSignals, MemeticEvolutionConfig, MemeticEvolutionEngine,
+    FitnessSignals, MemeticEvolutionConfig, MemeticEvolutionEngine, OffspringValidationStatus,
 };
 pub use phylogeny::CrossAgentPhylogeny;
 pub use publish::{KnowledgeSigner, PublishGate, PublishableProduct};
@@ -47,4 +50,7 @@ pub use secure_aggregation::{
     SecureAggregationError, SecureAggregationRejection, SharedContribution,
 };
 pub use types::*;
-pub use voting::SocialVoter;
+pub use voting::{
+    SignedVote, SocialVoter, VoteError, VoteOp, VotePayload, VoteReputationPolicy,
+    VoteSignatureVerifier, VoteTally,
+};

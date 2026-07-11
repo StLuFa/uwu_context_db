@@ -130,7 +130,7 @@ pub enum TraceStep {
     IntentAnalysis {
         raw: String,
         num_queries: usize,
-        decision: Option<IntentDecision>,
+        decision: Option<Box<IntentDecision>>,
     },
     PlanOptimized {
         logical: String,

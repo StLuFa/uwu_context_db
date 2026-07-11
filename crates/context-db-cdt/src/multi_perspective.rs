@@ -72,6 +72,8 @@ pub struct PerspectiveView {
     pub confidence: f32,
     pub evidence_uris: Vec<ContextUri>,
     pub gaps: Vec<String>, // 发现的待探索问题
+    /// Empty for schema-valid/local views; populated when model output fails validation.
+    pub validation_errors: Vec<String>,
 }
 
 /// 多视角合成产物。
@@ -106,14 +108,18 @@ pub struct MultiPerspectiveConsolidator {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPerspectiveView {
     summary: String,
-    #[serde(default)]
     key_insights: Vec<String>,
-    #[serde(default)]
     gaps: Vec<String>,
-    #[serde(default)]
-    confidence: Option<f32>,
+    confidence: f32,
+}
+
+impl Default for MultiPerspectiveConsolidator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MultiPerspectiveConsolidator {
@@ -245,33 +251,23 @@ impl MultiPerspectiveConsolidator {
                 key_insights: raw.key_insights.into_iter().take(8).collect(),
                 // Model confidence is optional and never allowed to exceed the evidence-derived
                 // ceiling. Missing confidence means no additional epistemic signal.
-                confidence: raw
-                    .confidence
-                    .filter(|value| value.is_finite())
-                    .map(|value| value.clamp(0.0, fallback.confidence))
-                    .unwrap_or(fallback.confidence),
+                confidence: if raw.confidence.is_finite() {
+                    raw.confidence.clamp(0.0, fallback.confidence)
+                } else {
+                    0.0
+                },
                 evidence_uris: evidence.iter().map(|entry| entry.uri.clone()).collect(),
                 gaps: raw.gaps.into_iter().take(8).collect(),
+                validation_errors: Vec::new(),
             };
         }
 
-        let key_insights = trimmed
-            .lines()
-            .skip(1)
-            .map(|line| {
-                line.trim()
-                    .trim_start_matches(['-', '*'])
-                    .trim()
-                    .to_string()
-            })
-            .filter(|line| !line.is_empty())
-            .take(5)
-            .collect::<Vec<_>>();
         PerspectiveView {
-            summary: trimmed.lines().next().unwrap_or(trimmed).trim().to_string(),
-            key_insights,
-            // Unstructured output is usable as text only; parse failure reduces confidence.
+            // Invalid model text is never promoted into summary or insights.
             confidence: (fallback.confidence * 0.5).clamp(0.0, 1.0),
+            validation_errors: vec![
+                "LLM perspective response failed strict JSON schema validation".into(),
+            ],
             ..fallback
         }
     }
@@ -324,6 +320,7 @@ impl MultiPerspectiveConsolidator {
             confidence,
             evidence_uris: evidence.iter().map(|e| e.uri.clone()).collect(),
             gaps,
+            validation_errors: Vec::new(),
         }
     }
 
@@ -457,8 +454,9 @@ fn evidence_prompt(evidence: &[ContextEntry]) -> String {
 fn perspective_prompt(perspective: Perspective, topic: &str, evidence_text: &str) -> String {
     format!(
         "{}\nTopic: {topic}\nEvidence:\n{evidence_text}\n\n\
-         Return strict JSON with fields: summary: string, key_insights: string[], gaps: string[], confidence: number. \
-         Use only the evidence above; gaps must be concrete exploration questions for missing evidence.",
+         Return exactly one JSON object matching this schema, with no markdown or extra fields: \
+         {{\"summary\":string,\"key_insights\":string[],\"gaps\":string[],\"confidence\":number}}. \
+         All fields are required. Use only the evidence above; gaps must be concrete exploration questions for missing evidence.",
         perspective.prompt_prefix()
     )
 }
@@ -527,6 +525,24 @@ mod tests {
             "provider error: upstream unavailable",
         );
         assert!(view.confidence < fallback.confidence);
+        assert_eq!(view.summary, fallback.summary);
+        assert_eq!(view.key_insights, fallback.key_insights);
+        assert_eq!(view.validation_errors.len(), 1);
+    }
+
+    #[test]
+    fn unknown_or_missing_json_fields_fail_strict_schema_without_reward() {
+        let consolidator = MultiPerspectiveConsolidator::new();
+        for response in [
+            r#"{\"summary\":\"x\",\"key_insights\":[],\"gaps\":[],\"confidence\":0.9,\"extra\":true}"#,
+            r#"{\"summary\":\"x\",\"confidence\":0.9}"#,
+        ] {
+            let fallback = consolidator.analyze_from(Perspective::Causal, "topic", &[]);
+            let view =
+                consolidator.view_from_llm_response(Perspective::Causal, "topic", &[], response);
+            assert!(view.confidence < fallback.confidence);
+            assert!(!view.validation_errors.is_empty());
+        }
     }
 
     #[tokio::test]

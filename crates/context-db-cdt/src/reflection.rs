@@ -198,18 +198,19 @@ fn reflection_meta(
     gradient: &SemanticGradient,
     evidence_uri: Option<ContextUri>,
 ) -> ConsolidationMeta {
+    let corroboration = usize::from(evidence_uri.is_some());
     ConsolidationMeta {
         source: "reflection-writeback".to_string(),
         generation: 1,
-        status: ConsolidationStatus::Converged,
-        patch_count: 1,
+        status: ConsolidationStatus::Pending,
+        patch_count: 0,
         lineage: vec![agent_context_db_core::LineageEntry {
             version: MvccVersion(0),
             timestamp: Utc::now(),
             change_summary: format!("semantic gradient priority {:.2}", gradient.priority),
         }],
         evidence_uris: evidence_uri.into_iter().collect(),
-        corroboration: 1,
+        corroboration,
         half_life_days: Some(120.0),
         entangled_with: gradient.source_uri.iter().cloned().collect(),
     }
@@ -247,20 +248,51 @@ impl FailureClass {
             .to_ascii_lowercase();
         if contains_any(&haystack, &["timeout", "timed out", "deadline", "elapsed"]) {
             Self::Timeout
-        } else if contains_any(&haystack, &["not found", "missing", "no such", "404", "absent"])
-        {
+        } else if contains_any(
+            &haystack,
+            &["not found", "missing", "no such", "404", "absent"],
+        ) {
             Self::MissingPrecondition
-        } else if contains_any(&haystack, &["permission", "forbidden", "unauthorized", "denied", "401", "403"])
-        {
+        } else if contains_any(
+            &haystack,
+            &[
+                "permission",
+                "forbidden",
+                "unauthorized",
+                "denied",
+                "401",
+                "403",
+            ],
+        ) {
             Self::Permission
-        } else if contains_any(&haystack, &["invalid", "schema", "parse", "validation", "deserialize"])
-        {
+        } else if contains_any(
+            &haystack,
+            &["invalid", "schema", "parse", "validation", "deserialize"],
+        ) {
             Self::Validation
-        } else if contains_any(&haystack, &["quota", "rate limit", "oom", "memory", "disk full", "capacity"])
-        {
+        } else if contains_any(
+            &haystack,
+            &[
+                "quota",
+                "rate limit",
+                "oom",
+                "memory",
+                "disk full",
+                "capacity",
+            ],
+        ) {
             Self::ResourceExhaustion
-        } else if contains_any(&haystack, &["connection", "unavailable", "dns", "refused", "upstream", "dependency"])
-        {
+        } else if contains_any(
+            &haystack,
+            &[
+                "connection",
+                "unavailable",
+                "dns",
+                "refused",
+                "upstream",
+                "dependency",
+            ],
+        ) {
             Self::Dependency
         } else {
             Self::Unknown
@@ -400,7 +432,13 @@ Output a JSON object with:
             }
         }
 
-        Self::local_reflection(task_description, failed_step, error_message, relevant_knowledge, trace)
+        Self::local_reflection(
+            task_description,
+            failed_step,
+            error_message,
+            relevant_knowledge,
+            trace,
+        )
     }
 
     fn local_reflection(

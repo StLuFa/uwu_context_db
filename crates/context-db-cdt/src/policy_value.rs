@@ -2,7 +2,7 @@
 
 use agent_context_db_core::ContextUri;
 
-/// 认知状态快照。
+/// 认知状态快照。该类型表示已观测状态，不允许搜索模拟直接改写。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CognitiveState {
     pub graph_density: f32,
@@ -152,27 +152,22 @@ impl PolicyModule {
         candidates
     }
 
-    /// Deterministic transition model used by MCTS rollouts.
-    pub fn apply(&self, state: &CognitiveState, action: &ActionCandidate) -> CognitiveState {
-        let mut next = state.clone();
-        next.avg_confidence = (next.avg_confidence + action.confidence * 0.08).clamp(0.0, 1.0);
-
-        for effect in &action.expected_effects {
-            if effect.contains("reduce errors") && !next.recent_errors.is_empty() {
-                next.recent_errors.pop();
-            }
-            if effect.contains("confirm or falsify") && !next.active_hypotheses.is_empty() {
-                next.active_hypotheses.pop();
-            }
-            if effect.contains("increase evidence") {
-                next.avg_confidence = (next.avg_confidence + 0.04).clamp(0.0, 1.0);
-            }
-            if effect.contains("improve graph density") || effect.contains("improve coherence") {
-                next.graph_density = (next.graph_density + 0.06).clamp(0.0, 1.0);
-            }
+    /// Conservative transition projection used only for MCTS ranking.
+    ///
+    /// Candidate effects are proposals, not observations. The projection therefore keeps errors,
+    /// hypotheses and epistemic confidence unchanged. It only applies a bounded topology estimate
+    /// so search can distinguish graph-oriented actions without manufacturing task success.
+    pub fn predict(&self, state: &CognitiveState, action: &ActionCandidate) -> CognitiveState {
+        let mut predicted = state.clone();
+        if action
+            .expected_effects
+            .iter()
+            .any(|effect| effect == "improve graph density" || effect == "improve coherence")
+        {
+            predicted.graph_density =
+                (predicted.graph_density + 0.02 * action.confidence).clamp(0.0, 1.0);
         }
-
-        next
+        predicted
     }
 }
 
@@ -221,7 +216,8 @@ mod tests {
         };
         let policy = PolicyModule::new();
         let action = policy.generate(&state).remove(0);
-        let next = policy.apply(&state, &action);
-        assert!(next.avg_confidence >= state.avg_confidence);
+        let next = policy.predict(&state, &action);
+        assert_eq!(next.avg_confidence, state.avg_confidence);
+        assert_eq!(next.recent_errors, state.recent_errors);
     }
 }

@@ -264,7 +264,13 @@ impl<V: VersionStore> TemporalReasoner<V> {
             }
 
             let entries = vec![
-                commit.metadata.changes.adds.clone(),
+                commit
+                    .metadata
+                    .changes
+                    .adds
+                    .iter()
+                    .map(|entry| entry.uri.clone())
+                    .collect::<Vec<_>>(),
                 commit
                     .metadata
                     .changes
@@ -308,7 +314,7 @@ impl<V: VersionStore> TemporalReasoner<V> {
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for commit in log {
             for add in &commit.metadata.changes.adds {
-                *counts.entry(add.to_string()).or_default() += 1;
+                *counts.entry(add.uri.to_string()).or_default() += 1;
             }
             for upd in &commit.metadata.changes.updates {
                 *counts.entry(upd.uri.to_string()).or_default() += 1;
@@ -388,7 +394,11 @@ mod tests {
             unsupported()
         }
 
-        async fn delete_branch(&self, _scope: &ContextUri, _name: &BranchName) -> crate::Result<()> {
+        async fn delete_branch(
+            &self,
+            _scope: &ContextUri,
+            _name: &BranchName,
+        ) -> crate::Result<()> {
             unsupported()
         }
 
@@ -411,7 +421,10 @@ mod tests {
             _level: ContentLevel,
         ) -> crate::Result<ContentPayload> {
             match ref_ {
-                VersionRef::Commit(id) => self.asof_read(uri, AsOfTime::Commit(id), ContentLevel::L0).await,
+                VersionRef::Commit(id) => {
+                    self.asof_read(uri, AsOfTime::Commit(id), ContentLevel::L0)
+                        .await
+                }
                 _ => unsupported(),
             }
         }
@@ -451,7 +464,11 @@ mod tests {
             unsupported()
         }
 
-        async fn switch_head(&self, _scope: &ContextUri, _branch: &BranchName) -> crate::Result<()> {
+        async fn switch_head(
+            &self,
+            _scope: &ContextUri,
+            _branch: &BranchName,
+        ) -> crate::Result<()> {
             unsupported()
         }
 
@@ -528,7 +545,9 @@ mod tests {
     }
 
     fn unsupported<T>() -> crate::Result<T> {
-        Err(VersionError::Storage("unsupported in TemporalTestStore".into()))
+        Err(VersionError::Storage(
+            "unsupported in TemporalTestStore".into(),
+        ))
     }
 
     fn text_payload(text: &str) -> ContentPayload {
@@ -539,7 +558,11 @@ mod tests {
         }
     }
 
-    fn test_commit(id: CommitId, changes: ChangeSet, timestamp: chrono::DateTime<chrono::Utc>) -> Commit {
+    fn test_commit(
+        id: CommitId,
+        changes: ChangeSet,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Commit {
         Commit {
             id,
             parents: Vec::new(),
@@ -569,7 +592,11 @@ mod tests {
             test_commit(
                 first.clone(),
                 ChangeSet {
-                    adds: vec![uri.clone()],
+                    adds: vec![agent_context_db_core::ContextEntry::new_text(
+                        uri.clone(),
+                        agent_context_db_core::TenantId(uuid::Uuid::nil()),
+                        "before",
+                    )],
                     ..Default::default()
                 },
                 t0,
@@ -582,6 +609,11 @@ mod tests {
                         old_hash: None,
                         new_hash: ContentHash("v2".into()),
                         diff_summary: "updated fact text".into(),
+                        entry: agent_context_db_core::ContextEntry::new_text(
+                            uri.clone(),
+                            agent_context_db_core::TenantId(uuid::Uuid::nil()),
+                            "after",
+                        ),
                     }],
                     ..Default::default()
                 },
@@ -589,8 +621,14 @@ mod tests {
             ),
         ];
         let snapshots = HashMap::from([
-            (first.clone(), HashMap::from([(uri.to_string(), text_payload("before"))])),
-            (second.clone(), HashMap::from([(uri.to_string(), text_payload("after"))])),
+            (
+                first.clone(),
+                HashMap::from([(uri.to_string(), text_payload("before"))]),
+            ),
+            (
+                second.clone(),
+                HashMap::from([(uri.to_string(), text_payload("after"))]),
+            ),
         ]);
         let reasoner = TemporalReasoner::new(Arc::new(TemporalTestStore { commits, snapshots }));
 
@@ -606,7 +644,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(timeline.len(), 2);
-        assert!(timeline.iter().any(|event| event.entries_changed.contains(&uri)));
+        assert!(
+            timeline
+                .iter()
+                .any(|event| event.entries_changed.contains(&uri))
+        );
 
         let (before, after) = reasoner
             .temporal_diff(&uri, AsOfTime::Commit(first), AsOfTime::Commit(second))

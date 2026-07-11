@@ -23,10 +23,36 @@ impl UwuVectorIndex {
 #[async_trait]
 impl VectorIndex for UwuVectorIndex {
     async fn upsert(&self, collection: &str, point: IndexPoint) -> Result<()> {
+        if point.vector.is_empty() || point.vector.iter().any(|value| !value.is_finite()) {
+            return Err(ContextError::Storage(
+                "vector upsert requires a non-empty finite embedding".into(),
+            ));
+        }
+        if point
+            .embedding_dim
+            .is_some_and(|dim| dim != point.vector.len())
+        {
+            return Err(ContextError::Storage(format!(
+                "embedding dimension metadata does not match vector length {}",
+                point.vector.len()
+            )));
+        }
+        let mut metadata: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_value(point.payload).map_err(|e| {
+                ContextError::Storage(format!("vector payload must be a JSON object: {e}"))
+            })?;
+        metadata.insert("_uwu_uri".into(), point.uri.to_string().into());
+        if let Some(model) = point.embedding_model_id {
+            metadata.insert("embedding_model_id".into(), model.into());
+        }
+        metadata.insert("embedding_dim".into(), point.vector.len().into());
+        if let Some(version) = point.embedding_version {
+            metadata.insert("embedding_version".into(), version.into());
+        }
         let record = uwu_database::Record {
             id: point.uri.to_string(),
             vector: point.vector,
-            metadata: serde_json::from_value(point.payload).unwrap_or_default(),
+            metadata,
         };
         self.inner
             .upsert(collection, &[record])
@@ -41,8 +67,17 @@ impl VectorIndex for UwuVectorIndex {
         top_k: usize,
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<IndexHit>> {
-        let filter_map: Option<std::collections::HashMap<String, serde_json::Value>> =
-            filter.and_then(|v| serde_json::from_value(v).ok());
+        if query.is_empty() || query.iter().any(|value| !value.is_finite()) {
+            return Err(ContextError::Storage(
+                "vector search requires a non-empty finite embedding".into(),
+            ));
+        }
+        let filter_map: Option<std::collections::HashMap<String, serde_json::Value>> = filter
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| {
+                ContextError::Storage(format!("vector filter must be a JSON object: {e}"))
+            })?;
 
         let q = uwu_database::Query {
             vector: &query,
@@ -55,18 +90,28 @@ impl VectorIndex for UwuVectorIndex {
             .await
             .map_err(|e| ContextError::Storage(format!("vector search: {e}")))?;
 
-        Ok(matches
+        matches
             .into_iter()
-            .filter_map(|m| {
-                // 底层存的是有效的 uwu:// URI；解析失败则跳过（记 debug）
-                let uri = ContextUri::parse(&m.id).ok()?;
-                Some(IndexHit {
+            .map(|m| {
+                let uri_text = m
+                    .metadata
+                    .get("_uwu_uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&m.id);
+                let uri = ContextUri::parse(uri_text).map_err(|e| {
+                    ContextError::Storage(format!(
+                        "vector backend returned invalid URI {uri_text:?}: {e}"
+                    ))
+                })?;
+                let payload = serde_json::to_value(m.metadata)
+                    .map_err(|e| ContextError::Storage(format!("serialize vector payload: {e}")))?;
+                Ok(IndexHit {
                     uri,
                     score: m.score,
-                    payload: serde_json::to_value(m.metadata).unwrap_or_default(),
+                    payload,
                 })
             })
-            .collect())
+            .collect()
     }
 
     async fn delete(&self, collection: &str, uri: &ContextUri) -> Result<()> {

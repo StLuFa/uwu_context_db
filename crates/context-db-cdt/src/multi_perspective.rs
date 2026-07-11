@@ -102,7 +102,6 @@ pub struct KnowledgeGap {
 /// 多视角巩固器 — 对同一主题从多个认知视角分别分析，再合成。
 pub struct MultiPerspectiveConsolidator {
     perspectives: Vec<Perspective>,
-    min_confidence: f32,
     llm: Option<Arc<dyn LlmClient>>,
 }
 
@@ -121,7 +120,6 @@ impl MultiPerspectiveConsolidator {
     pub fn new() -> Self {
         Self {
             perspectives: Perspective::all(),
-            min_confidence: 0.3,
             llm: None,
         }
     }
@@ -245,10 +243,13 @@ impl MultiPerspectiveConsolidator {
                 perspective,
                 summary: raw.summary,
                 key_insights: raw.key_insights.into_iter().take(8).collect(),
+                // Model confidence is optional and never allowed to exceed the evidence-derived
+                // ceiling. Missing confidence means no additional epistemic signal.
                 confidence: raw
                     .confidence
-                    .unwrap_or(fallback.confidence + 0.2)
-                    .clamp(self.min_confidence, 1.0),
+                    .filter(|value| value.is_finite())
+                    .map(|value| value.clamp(0.0, fallback.confidence))
+                    .unwrap_or(fallback.confidence),
                 evidence_uris: evidence.iter().map(|entry| entry.uri.clone()).collect(),
                 gaps: raw.gaps.into_iter().take(8).collect(),
             };
@@ -269,7 +270,8 @@ impl MultiPerspectiveConsolidator {
         PerspectiveView {
             summary: trimmed.lines().next().unwrap_or(trimmed).trim().to_string(),
             key_insights,
-            confidence: (fallback.confidence + 0.2).clamp(self.min_confidence, 1.0),
+            // Unstructured output is usable as text only; parse failure reduces confidence.
+            confidence: (fallback.confidence * 0.5).clamp(0.0, 1.0),
             ..fallback
         }
     }
@@ -511,7 +513,20 @@ mod tests {
         assert_eq!(view.summary, "causal summary");
         assert_eq!(view.key_insights, vec!["a causes b".to_string()]);
         assert_eq!(view.gaps, vec!["need counterexample".to_string()]);
-        assert!(view.confidence > 0.8);
+        assert_eq!(view.confidence, 0.1);
+    }
+
+    #[test]
+    fn malformed_response_reduces_fallback_confidence() {
+        let consolidator = MultiPerspectiveConsolidator::new();
+        let fallback = consolidator.analyze_from(Perspective::Causal, "topic", &[]);
+        let view = consolidator.view_from_llm_response(
+            Perspective::Causal,
+            "topic",
+            &[],
+            "provider error: upstream unavailable",
+        );
+        assert!(view.confidence < fallback.confidence);
     }
 
     #[tokio::test]

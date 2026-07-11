@@ -103,6 +103,8 @@ impl LatsLoop {
                 None
             };
 
+            // Search and reflection produce proposals only. Observed state changes require an
+            // execution receipt and self-verification, so LATS cannot mutate epistemic state.
             state = apply_lats_feedback(&state, preference.as_ref(), reflection.as_ref());
 
             iterations.push(LatsIteration {
@@ -171,33 +173,10 @@ fn failure_traces_from_tree(
 
 fn apply_lats_feedback(
     state: &CognitiveState,
-    preference: Option<&CognitivePreferencePair>,
-    reflection: Option<&ReflexionEvolutionResult>,
+    _preference: Option<&CognitivePreferencePair>,
+    _reflection: Option<&ReflexionEvolutionResult>,
 ) -> CognitiveState {
-    let mut next = state.clone();
-
-    if let Some(pref) = preference {
-        next.avg_confidence = (next.avg_confidence + pref.confidence * 0.08).clamp(0.0, 1.0);
-        if pref.cognitive_delta.contradiction_diff > 0 && !next.recent_errors.is_empty() {
-            next.recent_errors.pop();
-        }
-        if pref.cognitive_delta.evidence_diff > 0 && !next.active_hypotheses.is_empty() {
-            next.active_hypotheses.pop();
-        }
-        if pref.cognitive_delta.knowledge_graph_growth > 0 {
-            next.graph_density = (next.graph_density + 0.04).clamp(0.0, 1.0);
-        }
-    }
-
-    if let Some(result) = reflection {
-        let guidance_strength = result.training_guidance.len() as f32 * 0.03;
-        next.avg_confidence = (next.avg_confidence + guidance_strength).clamp(0.0, 1.0);
-        if !result.gradients.is_empty() && !next.recent_errors.is_empty() {
-            next.recent_errors.pop();
-        }
-    }
-
-    next
+    state.clone()
 }
 
 #[cfg(test)]
@@ -263,7 +242,7 @@ mod tests {
 
         let report = loop_runner.run(state.clone()).await;
         assert_eq!(report.iterations.len(), 2);
-        assert!(report.final_state.avg_confidence >= state.avg_confidence);
+        assert_eq!(report.final_state, state);
         assert!(report.iterations.iter().any(|i| i.reflection.is_some()));
         assert!(!report.insights.is_empty());
     }

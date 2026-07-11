@@ -197,6 +197,7 @@ impl GenAgentMemory {
             contradiction_uris: vec![],
             source: CdtSignalSource::GenAgent,
             tags: vec!["gen-agent".into(), "profile".into()],
+            hypothesis_outcome: None,
         });
 
         signals.push(CdtConsolidationSignal {
@@ -218,6 +219,7 @@ impl GenAgentMemory {
             contradiction_uris: vec![],
             source: CdtSignalSource::GenAgent,
             tags: vec!["gen-agent".into(), "behavior-forecast".into()],
+            hypothesis_outcome: None,
         });
 
         signals.extend(self.episodes.iter().map(|episode| CdtConsolidationSignal {
@@ -243,6 +245,7 @@ impl GenAgentMemory {
             contradiction_uris: vec![],
             source: CdtSignalSource::GenAgent,
             tags: vec!["gen-agent".into(), "episode".into()],
+            hypothesis_outcome: None,
         }));
 
         signals

@@ -177,7 +177,7 @@ impl CognitiveTreeSearch {
             .into_iter()
             .take(self.branching_factor)
             .map(|action| {
-                let state = self.policy.apply(&node.state, &action);
+                let state = self.policy.predict(&node.state, &action);
                 let value = self.value.evaluate(&state);
                 SearchNode {
                     state,
@@ -219,7 +219,7 @@ impl CognitiveTreeSearch {
             }) else {
                 break;
             };
-            current = self.policy.apply(&current, &best);
+            current = self.policy.predict(&current, &best);
             weight *= 0.72;
             total += self.value.evaluate(&current).composite * weight;
             norm += weight;
@@ -274,7 +274,7 @@ impl CognitiveTreeSearch {
             chosen: crate::TrajectorySummary {
                 task_id: "lats".into(),
                 task_description: best_desc,
-                success: true,
+                success: false,
                 steps: tree.best_path.len().saturating_sub(1).max(best.depth),
                 contradictions: best.state.recent_errors.len(),
                 avg_confidence: path_value(&tree.best_path),
@@ -287,7 +287,7 @@ impl CognitiveTreeSearch {
                 contradictions: worst.state.recent_errors.len().max(1),
                 avg_confidence: path_value(&tree.worst_path),
             },
-            preference_source: PreferenceSource::KnowledgeConsistency,
+            preference_source: PreferenceSource::Simulation,
             confidence: confidence.abs().clamp(0.0, 1.0),
             cognitive_delta: CognitiveDelta {
                 contradiction_diff: worst.state.recent_errors.len() as i32
@@ -552,6 +552,9 @@ mod tests {
                 .contains("retrieved evidence")
         }));
         assert!(tree.root.visits > 0);
-        assert!(tree.best_path.last().unwrap().state != state);
+        let projected = &tree.best_path.last().unwrap().state;
+        assert_eq!(projected.avg_confidence, state.avg_confidence);
+        assert_eq!(projected.recent_errors, state.recent_errors);
+        assert_eq!(projected.active_hypotheses, state.active_hypotheses);
     }
 }

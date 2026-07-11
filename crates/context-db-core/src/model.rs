@@ -529,6 +529,22 @@ pub struct ContextEntry {
 }
 
 impl ContextEntry {
+    /// 校验 URI 中明确使用 UUID 的租户段与结构化租户 ID 一致。
+    ///
+    /// 历史 URI 允许使用租户 slug；只有 tenant 段本身是 UUID 时才具有可直接比较的身份语义。
+    pub fn validate_tenant_binding(&self) -> crate::Result<()> {
+        if let Ok(uri_tenant) = uuid::Uuid::parse_str(self.uri.tenant())
+            && uri_tenant != self.tenant.0
+        {
+            return Err(crate::ContextError::InvalidUri(format!(
+                "URI tenant {} does not match entry tenant {}",
+                self.uri.tenant(),
+                self.tenant.0
+            )));
+        }
+        Ok(())
+    }
+
     /// 构造一个最小 L0 文本条目（便于测试 / 快速写入）。
     pub fn new_text(
         uri: crate::uri::ContextUri,

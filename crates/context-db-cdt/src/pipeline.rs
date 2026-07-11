@@ -20,7 +20,7 @@ use crate::{
 use agent_context_db_consolidation::{ConsolidationEngine, ConsolidationProduct};
 use agent_context_db_core::{
     AccessEvent, ConsolidationStatus, ContentType, ContextMeta, ContextUri, LifecycleAction,
-    LifecycleEngine, LlmClient, Result, TenantId, VectorIndex,
+    LifecycleEngine, LlmClient, Result, TenantId,
 };
 use std::sync::Arc;
 
@@ -217,7 +217,6 @@ impl CognitiveTrainingPipeline {
         encoder: &TrajectoryEncoder,
         skill_library: &SkillLibrary,
         curriculum: &CurriculumGenerator,
-        _vector_index: &Arc<dyn VectorIndex>,
     ) -> Result<TrainingReport> {
         let mut report = TrainingReport {
             epochs: vec![],
@@ -287,16 +286,16 @@ impl CognitiveTrainingPipeline {
 
             // ── 阶段 4: 主动课程生成（Voyager） ──
             let mut epoch_skills: Vec<SkillEntry> = Vec::new();
-            if let Ok(_goal) = curriculum.next_goal(&[]).await {
-                // 用课程目标生成真实 embedding
-                let task_embedding = self
-                    .llm
-                    .embed(&_goal.expected_new_knowledge)
-                    .await
-                    .map(|embedding| embedding.vector)
-                    .unwrap_or_else(|_| vec![0.0_f32; 1536]);
-                let retrieved = skill_library.retrieve(&task_embedding, 5).await;
-                epoch_skills.extend(retrieved);
+            let known_uris = trainable_products
+                .iter()
+                .map(|product| product.uri.clone())
+                .collect::<Vec<_>>();
+            if let Ok(goal) = curriculum.next_goal(&known_uris).await {
+                // Embedding failure means the curriculum retrieval step is unavailable; a zero
+                // vector would create arbitrary nearest-neighbor results and is not a substitute.
+                if let Ok(embedding) = self.llm.embed(&goal.expected_new_knowledge).await {
+                    epoch_skills.extend(skill_library.retrieve(&embedding.vector, 5).await?);
+                }
             }
 
             // ── 阶段 5: 策略优化（偏好loss） ──
@@ -329,9 +328,8 @@ impl CognitiveTrainingPipeline {
                             let skill_embedding = self
                                 .llm
                                 .embed(&gradient.source_uri.to_string())
-                                .await
-                                .map(|embedding| embedding.vector)
-                                .unwrap_or_else(|_| vec![0.0_f32; 1536]);
+                                .await?
+                                .vector;
                             let skill = SkillEntry {
                                 uri: gradient.source_uri.clone(),
                                 name: format!("skill-epoch-{}", epoch),
@@ -340,7 +338,7 @@ impl CognitiveTrainingPipeline {
                                 success_rate: gradient.confidence,
                                 embedding: skill_embedding,
                             };
-                            skill_library.deposit(&skill).await;
+                            skill_library.deposit(&skill).await?;
                         }
                     } else {
                         gradients_rejected += 1;

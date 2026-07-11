@@ -47,19 +47,43 @@ impl Default for UwuConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlStorageBackend {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorStorageBackend {
+    QdrantEdge,
+    Memory,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    pub backend: String, // "postgres" | "sled" | "memory"
+    /// SQL 内容后端。默认使用嵌入式 SQLite。
+    pub backend: SqlStorageBackend,
+    /// SQL 连接 URL。SQLite 默认持久化到当前目录下的 `uwu_context.db`。
+    pub database_url: String,
     pub max_connections: usize,
     pub batch_size: usize,
+    /// 向量后端。默认使用进程内 Qdrant Edge。
+    pub vector_backend: VectorStorageBackend,
+    /// Qdrant Edge 数据目录。
+    pub vector_url: Option<String>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            backend: "memory".into(),
-            max_connections: 10,
+            backend: SqlStorageBackend::Sqlite,
+            database_url: "sqlite://uwu_context.db?mode=rwc".into(),
+            max_connections: 4,
             batch_size: 100,
+            vector_backend: VectorStorageBackend::QdrantEdge,
+            vector_url: Some("./uwu_context_vectors".into()),
         }
     }
 }

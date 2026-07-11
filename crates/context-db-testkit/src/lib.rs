@@ -457,19 +457,21 @@ mod tests {
     #[tokio::test]
     async fn write_read_ls_roundtrip() {
         let store = MemoryContextStore::new();
-        store
-            .write(entry("uwu://t/agent/a/memories/cases/c1", "solved bug X"))
-            .await
-            .unwrap();
+        ContentRepo::write(
+            &store,
+            entry("uwu://t/agent/a/memories/cases/c1", "solved bug X"),
+        )
+        .await
+        .unwrap();
 
         // read L0
-        let p = store
-            .read(
-                &ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap(),
-                ContentLevel::L0,
-            )
-            .await
-            .unwrap();
+        let p = FsOps::read(
+            &store,
+            &ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap(),
+            ContentLevel::L0,
+        )
+        .await
+        .unwrap();
         assert!(matches!(p, ContentPayload::Text { sparse, .. } if sparse == "solved bug X"));
 
         // ls parent dir
@@ -488,15 +490,17 @@ mod tests {
     async fn write_sanitizes_sensitive_payload_before_storage() {
         let store = MemoryContextStore::new();
         let uri = ContextUri::parse("uwu://t/agent/a/memories/evidence/pii").unwrap();
-        store
-            .write(entry(
+        ContentRepo::write(
+            &store,
+            entry(
                 &uri.to_string(),
                 "contact user@example.com with sk-secret12345678901234567890",
-            ))
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
 
-        let payload = store.read(&uri, ContentLevel::L2).await.unwrap();
+        let payload = FsOps::read(&store, &uri, ContentLevel::L2).await.unwrap();
         let ContentPayload::Text { sparse, full, .. } = payload else {
             panic!("expected text payload");
         };
@@ -519,8 +523,12 @@ mod tests {
     async fn version_history_and_rollback() {
         let store = MemoryContextStore::new();
         let uri = ContextUri::parse("uwu://t/agent/a/state/mid/s1").unwrap();
-        let v1 = store.write(entry(&uri.to_string(), "v1")).await.unwrap();
-        store.write(entry(&uri.to_string(), "v2")).await.unwrap();
+        let v1 = ContentRepo::write(&store, entry(&uri.to_string(), "v1"))
+            .await
+            .unwrap();
+        ContentRepo::write(&store, entry(&uri.to_string(), "v2"))
+            .await
+            .unwrap();
         assert_eq!(store.version_history(&uri).await.unwrap().len(), 2);
 
         store.rollback(&uri, v1).await.unwrap();

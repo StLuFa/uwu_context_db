@@ -1,9 +1,10 @@
 //! # agent-context-db-storage (L7 存储层)
 //!
 //! 双层存储的**适配器 + 装配根**：
-//! - [`PgContextStore`]：基于 `uwu_database::DbPool` 的内容层适配器，实现全部四个窄端口。
-//! - [`UwuVectorIndex`]：将 `uwu_database::VectorStore` 适配为 core 的 `VectorIndex`。
-//! - [`ContextDbService`]：composition root —— 唯一同时持有内容层与索引层的地方。
+//! - [`SqliteContextStore`]：默认嵌入式内容后端。
+//! - [`PgContextStore`]：可选 PostgreSQL 内容后端。
+//! - [`UwuVectorIndex`]：将 `uwu_database::VectorStore` 适配为 core 的 `VectorIndex`；默认由 Qdrant Edge 提供。
+//! - [`ContextDbService`]：composition root，唯一同时持有内容层与索引层的地方。
 //! - `IndexPoint` / `IndexHit` / `VectorIndex` 从 `agent_context_db_core` re-export。
 //!
 //! ## 解耦约束
@@ -15,6 +16,7 @@ pub mod migrations;
 pub mod perf;
 pub mod pg;
 pub mod pg_version;
+pub mod sqlite;
 pub mod uwu_cache_adapter;
 pub mod vector_index;
 
@@ -30,11 +32,132 @@ pub use perf::{
 };
 pub use pg::PgContextStore;
 pub use pg_version::PgVersionStore;
+pub use sqlite::{SqliteContextStore, migrate_sqlite};
 pub use vector_index::UwuVectorIndex;
 
-use agent_context_db_core::Result;
+use agent_context_db_core::{
+    ContentRepo, ContentStore, ContextEntry, ContextError, ContextUri, DirEntry, FindPattern,
+    FsOps, GrepHit, MvccVersion, Result, TreeNode,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// Runtime-selected SQL content backend.
+#[derive(Clone)]
+pub enum SqlContextStore {
+    Sqlite(SqliteContextStore),
+    Postgres(PgContextStore),
+}
+
+#[async_trait]
+impl FsOps for SqlContextStore {
+    async fn ls(&self, dir: &ContextUri) -> Result<Vec<DirEntry>> {
+        match self {
+            Self::Sqlite(store) => store.ls(dir).await,
+            Self::Postgres(store) => store.ls(dir).await,
+        }
+    }
+    async fn find(&self, pattern: &FindPattern) -> Result<Vec<ContextUri>> {
+        match self {
+            Self::Sqlite(store) => store.find(pattern).await,
+            Self::Postgres(store) => store.find(pattern).await,
+        }
+    }
+    async fn grep(&self, pattern: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
+        match self {
+            Self::Sqlite(store) => store.grep(pattern, scope).await,
+            Self::Postgres(store) => store.grep(pattern, scope).await,
+        }
+    }
+    async fn tree(&self, root: &ContextUri, depth: usize) -> Result<TreeNode> {
+        match self {
+            Self::Sqlite(store) => store.tree(root, depth).await,
+            Self::Postgres(store) => store.tree(root, depth).await,
+        }
+    }
+    async fn read(
+        &self,
+        uri: &ContextUri,
+        level: agent_context_db_core::ContentLevel,
+    ) -> Result<agent_context_db_core::ContentPayload> {
+        match self {
+            Self::Sqlite(store) => FsOps::read(store, uri, level).await,
+            Self::Postgres(store) => FsOps::read(store, uri, level).await,
+        }
+    }
+}
+
+#[async_trait]
+impl ContentStore for SqlContextStore {
+    async fn read(
+        &self,
+        uri: &ContextUri,
+        level: agent_context_db_core::ContentLevel,
+    ) -> Result<agent_context_db_core::ContentPayload> {
+        match self {
+            Self::Sqlite(store) => ContentStore::read(store, uri, level).await,
+            Self::Postgres(store) => ContentStore::read(store, uri, level).await,
+        }
+    }
+    async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
+        match self {
+            Self::Sqlite(store) => ContentStore::write(store, entry).await,
+            Self::Postgres(store) => ContentStore::write(store, entry).await,
+        }
+    }
+    async fn delete(&self, uri: &ContextUri) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => ContentStore::delete(store, uri).await,
+            Self::Postgres(store) => ContentStore::delete(store, uri).await,
+        }
+    }
+    async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => ContentStore::rename(store, from, to).await,
+            Self::Postgres(store) => ContentStore::rename(store, from, to).await,
+        }
+    }
+    async fn batch_write(&self, entries: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
+        match self {
+            Self::Sqlite(store) => ContentStore::batch_write(store, entries).await,
+            Self::Postgres(store) => ContentStore::batch_write(store, entries).await,
+        }
+    }
+    async fn scan_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<ContextEntry>> {
+        match self {
+            Self::Sqlite(store) => ContentStore::scan_by_prefix(store, prefix, limit).await,
+            Self::Postgres(store) => ContentStore::scan_by_prefix(store, prefix, limit).await,
+        }
+    }
+}
+
+#[async_trait]
+impl ContentRepo for SqlContextStore {
+    async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
+        match self {
+            Self::Sqlite(store) => ContentRepo::write(store, entry).await,
+            Self::Postgres(store) => ContentRepo::write(store, entry).await,
+        }
+    }
+    async fn delete(&self, uri: &ContextUri) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => ContentRepo::delete(store, uri).await,
+            Self::Postgres(store) => ContentRepo::delete(store, uri).await,
+        }
+    }
+    async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => ContentRepo::rename(store, from, to).await,
+            Self::Postgres(store) => ContentRepo::rename(store, from, to).await,
+        }
+    }
+    async fn batch_write(&self, entries: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
+        match self {
+            Self::Sqlite(store) => ContentRepo::batch_write(store, entries).await,
+            Self::Postgres(store) => ContentRepo::batch_write(store, entries).await,
+        }
+    }
+}
 
 // ===========================================================================
 // 装配根：唯一持有内容层 + 索引层的地方
@@ -95,90 +218,116 @@ impl<S> Clone for ContextDbService<S> {
 // uwu_database 便捷构造器
 // ===========================================================================
 
-/// 使用 `uwu_database::Database` 快速构造带 ACL 的 `ContextDbService`。
+/// 使用 `uwu_database::Database` 构造带 ACL 的服务。
 ///
-/// 内容层自动从 `DbPool` 构建 `PgContextStore` 并包上 `AclProtectedStore`；
-/// 向量层优先使用 `Database.vector`，无配置时回退到空实现。
-///
-/// 首次调用会自动应用 context-db 的 SQL 迁移。
+/// SQLite 与 PostgreSQL 都在这里选择并迁移；向量后端必须由调用方通过
+/// `Database::connect_with_vector` 初始化，避免配置错误时静默降级为无索引。
 pub async fn service_from_uwu_db(
     db: uwu_database::Database,
     acl: Arc<PathAcl>,
     principal: Principal,
 ) -> Result<
-    ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<PgContextStore>>>>,
+    ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>>,
 > {
-    // 1. 应用迁移
-    let mut migrator = uwu_database::Migrator::new();
-    for m in context_db_migrations() {
-        migrator = migrator.add(m);
-    }
-    migrator.up(&db.pool).await.map_err(|e| {
-        agent_context_db_core::ContextError::Storage(format!("migration failed: {e}"))
-    })?;
-
-    // 2. 构造内容层适配器：ACL 后先做写入前语义去重，再发布 watch 事件。
-    let content = Arc::new(WatchableStore::new(
-        SemanticWriteDedupStore::new(AclProtectedStore::new(
-            PgContextStore::new(Arc::new(db.pool)),
-            acl,
-            principal,
-        )),
-        Arc::new(WatchHub::default()),
-    ));
-
-    // 3. 构造向量层适配器（无配置时回退空实现）
-    let index: Arc<dyn VectorIndex> = match db.vector {
-        Some(vs) => Arc::new(UwuVectorIndex::new(vs)),
-        None => Arc::new(NoopVectorIndex::new()),
+    let store = match db.pool.backend() {
+        uwu_database::SqlBackend::Sqlite => {
+            migrate_sqlite(&db.pool).await?;
+            SqlContextStore::Sqlite(SqliteContextStore::try_new(Arc::new(db.pool.clone()))?)
+        }
+        uwu_database::SqlBackend::Postgres => {
+            let mut migrator = uwu_database::Migrator::new();
+            for migration in context_db_migrations() {
+                migrator = migrator.add(migration);
+            }
+            migrator
+                .up(&db.pool)
+                .await
+                .map_err(|e| ContextError::Storage(format!("postgres migration failed: {e}")))?;
+            SqlContextStore::Postgres(PgContextStore::new(Arc::new(db.pool.clone())))
+        }
+        backend => {
+            return Err(ContextError::Storage(format!(
+                "unsupported context-db SQL backend: {backend:?}"
+            )));
+        }
     };
 
+    let content = Arc::new(WatchableStore::new(
+        SemanticWriteDedupStore::new(AclProtectedStore::new(store, acl, principal)),
+        Arc::new(WatchHub::default()),
+    ));
+    let vector = db.vector.ok_or_else(|| {
+        ContextError::Storage(
+            "vector backend is not initialized; use Database::connect_with_vector".into(),
+        )
+    })?;
+    let index: Arc<dyn VectorIndex> = Arc::new(UwuVectorIndex::new(vector));
     Ok(ContextDbService::new(content, index))
 }
 
-/// 空实现：无向量后端时的降级方案。
-///
-/// 所有操作仅首次 warn（E.4: OnceLock 去重），静默返回空结果。
-struct NoopVectorIndex {
-    warned: std::sync::OnceLock<()>,
-}
-
-impl NoopVectorIndex {
-    fn new() -> Self {
-        Self {
-            warned: std::sync::OnceLock::new(),
+/// Convert context-db storage settings into an `uwu_database` runtime configuration.
+pub fn runtime_config(
+    config: &agent_context_db_core::config::StorageConfig,
+) -> uwu_database::RuntimeConfig {
+    let sql_backend = match config.backend {
+        agent_context_db_core::config::SqlStorageBackend::Sqlite => {
+            uwu_database::SqlBackend::Sqlite
         }
-    }
-    fn warn_once(&self, msg: &str) {
-        self.warned.get_or_init(|| {
-            tracing::warn!("{msg}");
-        });
+        agent_context_db_core::config::SqlStorageBackend::Postgres => {
+            uwu_database::SqlBackend::Postgres
+        }
+    };
+    let vector_backend = match config.vector_backend {
+        agent_context_db_core::config::VectorStorageBackend::QdrantEdge => {
+            uwu_database::VectorBackend::QdrantEdge
+        }
+        agent_context_db_core::config::VectorStorageBackend::Memory => {
+            uwu_database::VectorBackend::Memory
+        }
+    };
+    uwu_database::RuntimeConfig {
+        deploy: uwu_database::config::DeployConfig::default(),
+        database: uwu_database::DbConfig {
+            backend: sql_backend,
+            url: config.database_url.clone(),
+            max_connections: config.max_connections.try_into().unwrap_or(u32::MAX),
+            min_connections: 0,
+            acquire_timeout_secs: 5,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1800,
+            test_before_acquire: false,
+            statement_cache_capacity: 100,
+            application_name: Some("uwu-context-db".into()),
+        },
+        cache: uwu_database::CacheConfig {
+            backend: uwu_database::CacheBackend::Memory,
+            url: None,
+            capacity: 10_000,
+        },
+        vector: uwu_database::VectorConfig {
+            backend: vector_backend,
+            url: config.vector_url.clone(),
+            api_key: None,
+        },
     }
 }
 
-#[async_trait]
-impl VectorIndex for NoopVectorIndex {
-    async fn upsert(&self, _collection: &str, _point: IndexPoint) -> Result<()> {
-        self.warn_once("NoopVectorIndex: no vector backend configured — operations are no-ops");
-        Ok(())
-    }
-    async fn search(
-        &self,
-        _collection: &str,
-        _query: Vec<f32>,
-        _top_k: usize,
-        _filter: Option<serde_json::Value>,
-    ) -> Result<Vec<IndexHit>> {
-        self.warn_once("NoopVectorIndex: no vector backend configured — operations are no-ops");
-        Ok(vec![])
-    }
-    async fn delete(
-        &self,
-        _collection: &str,
-        _uri: &agent_context_db_core::ContextUri,
-    ) -> Result<()> {
-        Ok(())
-    }
+/// Default embedded runtime: SQLite for content and Qdrant Edge for vectors.
+pub fn default_runtime_config() -> uwu_database::RuntimeConfig {
+    runtime_config(&agent_context_db_core::config::StorageConfig::default())
+}
+
+/// Connect and assemble the default embedded database in one call.
+pub async fn default_embedded_service(
+    acl: Arc<PathAcl>,
+    principal: Principal,
+) -> Result<
+    ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>>,
+> {
+    let db = uwu_database::Database::connect_with_vector(&default_runtime_config())
+        .await
+        .map_err(|e| ContextError::Storage(format!("connect embedded database failed: {e}")))?;
+    service_from_uwu_db(db, acl, principal).await
 }
 
 // ===========================================================================
@@ -250,7 +399,7 @@ mod pg_tests {
     async fn test_service_from_uwu_db_assembles() {
         let _url = require_pg();
         let cfg = test_cfg();
-        let db = Database::connect(&cfg).await.unwrap();
+        let db = Database::connect_with_vector(&cfg).await.unwrap();
 
         let service = service_from_uwu_db(db, full_acl(), test_principal())
             .await
@@ -271,23 +420,19 @@ mod pg_tests {
         let cfg = test_cfg();
 
         // 第一次：创建表
-        let db1 = Database::connect(&cfg).await.unwrap();
+        let db1 = Database::connect_with_vector(&cfg).await.unwrap();
         let svc1 = service_from_uwu_db(db1, full_acl(), test_principal())
             .await
             .unwrap();
         drop(svc1);
 
         // 第二次：不应报错（表已存在）
-        let db2 = Database::connect(&cfg).await.unwrap();
+        let db2 = Database::connect_with_vector(&cfg).await.unwrap();
         let svc2 = service_from_uwu_db(db2, full_acl(), test_principal())
             .await
             .unwrap();
 
-        // 验证 NoopVectorIndex 也可正常使用
-        let idx = svc2.vector_index();
-        let uri = agent_context_db_core::ContextUri::parse("uwu://memory/test/noop").unwrap();
-        idx.delete("nonexistent", &uri).await.unwrap();
-        let results = idx.search("nonexistent", vec![1.0], 5, None).await.unwrap();
-        assert!(results.is_empty());
+        // 向量后端已实际装配，而不是静默 no-op。
+        let _idx = svc2.vector_index();
     }
 }

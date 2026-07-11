@@ -923,7 +923,10 @@ impl GraphStore for PgContextStore {
         if node_list.len() <= 1 {
             return Ok(0.0);
         }
-        let node_set = node_list.iter().cloned().collect::<std::collections::HashSet<_>>();
+        let node_set = node_list
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         let rows = sqlx::query(
             "SELECT from_uri, to_uri FROM context_relations
              WHERE from_uri = ANY($1) OR to_uri = ANY($1)",
@@ -933,7 +936,8 @@ impl GraphStore for PgContextStore {
         .await
         .map_err(|e| Self::storage_err("centrality.edges", e))?;
 
-        let mut outgoing: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut outgoing: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for row in rows {
             let from = row.try_get::<String, _>("from_uri").unwrap_or_default();
             let to = row.try_get::<String, _>("to_uri").unwrap_or_default();
@@ -965,8 +969,8 @@ impl GraphStore for PgContextStore {
                 if targets.is_empty() {
                     continue;
                 }
-                let contribution = DAMPING * ranks.get(from).copied().unwrap_or(0.0)
-                    / targets.len() as f32;
+                let contribution =
+                    DAMPING * ranks.get(from).copied().unwrap_or(0.0) / targets.len() as f32;
                 for target in targets {
                     if let Some(value) = next.get_mut(target) {
                         *value += contribution;

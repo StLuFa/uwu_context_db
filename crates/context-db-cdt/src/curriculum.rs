@@ -102,27 +102,13 @@ impl CurriculumGenerator {
         ))
     }
 
-    /// 找前沿节点：已巩固知识的相邻未学节点。
-    ///
-    /// 旧调用方只提供 uri/confidence map 时仍可用；它不会访问 GraphStore，只根据
-    /// confidence 估算下一层难度并按 ZPD 排序。
-    pub fn find_frontier(&self, known: &HashMap<String, f32>) -> Vec<FrontierNode> {
-        let mut frontier = Vec::new();
-        for (uri_str, confidence) in known {
-            if *confidence > 0.7 {
-                let difficulty =
-                    (1.0 - confidence + self.exploration_ratio * 0.25).clamp(0.05, 0.95);
-                frontier.push(FrontierNode {
-                    uri: ContextUri::parse(uri_str).unwrap(),
-                    difficulty,
-                    prerequisite_count: 1,
-                    expected_knowledge: format!("next level of {uri_str}"),
-                    content_type: None,
-                    zpd_score: self.zpd_score(difficulty),
-                });
-            }
+    /// Validate legacy known-node input without pretending known nodes are unknown frontier nodes.
+    /// A real frontier requires graph neighbors or explicit bootstrap targets.
+    pub fn find_frontier(&self, known: &HashMap<String, f32>) -> Result<Vec<FrontierNode>> {
+        for uri in known.keys() {
+            ContextUri::parse(uri)?;
         }
-        self.sort_frontier(frontier)
+        Ok(Vec::new())
     }
 
     /// 用 GraphStore 做真实 frontier 扩展：从已掌握节点出发，找未学邻居。
@@ -135,7 +121,7 @@ impl CurriculumGenerator {
                 .iter()
                 .map(|(uri, confidence)| (uri.as_str().to_string(), *confidence))
                 .collect();
-            return Ok(self.find_frontier(&fallback));
+            return self.find_frontier(&fallback);
         };
 
         let known_set: HashSet<&str> = known.keys().map(|uri| uri.as_str()).collect();
@@ -161,7 +147,7 @@ impl CurriculumGenerator {
 
         let mut frontier = Vec::new();
         for (uri, prerequisite_count) in candidate_prereqs {
-            let centrality = graph.centrality(&uri).await.unwrap_or(0.5).clamp(0.0, 1.0);
+            let centrality = graph.centrality(&uri).await?.clamp(0.0, 1.0);
             let base_confidence = best_confidence.get(&uri).copied().unwrap_or(0.75);
             let difficulty = estimate_difficulty(base_confidence, prerequisite_count, centrality);
             frontier.push(FrontierNode {
@@ -351,6 +337,15 @@ mod tests {
         let goal = curriculum.next_goal(&[base]).await.unwrap();
         assert_eq!(goal.target_node, next);
         assert!(!goal.expected_new_knowledge.is_empty());
+    }
+
+    #[test]
+    fn no_graph_does_not_relabel_known_nodes_as_frontier() {
+        let curriculum = CurriculumGenerator::new(0.2);
+        let known = HashMap::from([("uwu://t/agent/a/memories/skill/base".to_string(), 0.9)]);
+        assert!(curriculum.find_frontier(&known).unwrap().is_empty());
+        let invalid = HashMap::from([("not a uri".to_string(), 0.9)]);
+        assert!(curriculum.find_frontier(&invalid).is_err());
     }
 
     #[tokio::test]

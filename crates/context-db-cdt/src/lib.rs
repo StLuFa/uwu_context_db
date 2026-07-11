@@ -39,8 +39,10 @@ pub mod trajectory_encoder;
 pub mod tree_search;
 pub mod voting;
 
-use agent_context_db_consolidation::ConsolidationProduct;
-use agent_context_db_core::{ContentType, ContextEntry, ContextUri};
+use agent_context_db_consolidation::{
+    ConsolidationProduct, HypothesisOutcome as ProductHypothesisOutcome,
+};
+use agent_context_db_core::{ConsolidationStatus, ContentType, ContextEntry, ContextUri};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -145,8 +147,8 @@ pub struct TrajectorySummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreferenceSource {
     TaskOutcome,
-    KnowledgeConsistency,
-    EpistemicConfidence,
+    /// Counterfactual ranking from tree search; never an observed success label.
+    Simulation,
 }
 
 /// 认知差异。
@@ -230,9 +232,40 @@ pub fn extract_gradients_from_products(
 ) -> Vec<CognitiveGradient> {
     let mut gradients = Vec::new();
 
+    let now = Utc::now();
     for product in products {
-        let weight = CognitiveGradient::compute_weight(product.content_type, product.quality_score);
+        // Training consumes only completed, currently valid products with a traceable source.
+        // Facts and hypotheses additionally require evidence because they can alter the agent's
+        // epistemic state; locally generated procedural signals may use source_session lineage.
+        let valid = product.metadata.validity.as_ref().is_none_or(|validity| {
+            validity.valid_from <= now
+                && validity.valid_until.is_none_or(|until| until > now)
+                && validity.invalidated_by.is_none()
+                && validity.invalidation_reason.is_none()
+        });
+        let traceable = product.provenance.is_some()
+            || (product.metadata.source_session.is_some() && !product.metadata.lineage.is_empty());
+        let evidence_required = matches!(
+            product.content_type,
+            ContentType::Fact | ContentType::Hypothesis
+        );
+        if product.metadata.status != ConsolidationStatus::Converged
+            || !valid
+            || !traceable
+            || product.content.trim().is_empty()
+            || !product.quality_score.is_finite()
+            || !product.confidence.is_finite()
+            || product.confidence < min_confidence
+            || (evidence_required && product.evidence_uris.is_empty())
+        {
+            continue;
+        }
 
+        let effective_confidence = product
+            .quality_score
+            .min(product.confidence)
+            .clamp(0.0, 1.0);
+        let weight = CognitiveGradient::compute_weight(product.content_type, effective_confidence);
         if weight < min_confidence {
             continue;
         }
@@ -245,7 +278,7 @@ pub fn extract_gradients_from_products(
                     old_claim: product.superseded_claim.clone().unwrap_or_default(),
                     new_claim: product.content.clone(),
                 },
-                confidence: product.quality_score,
+                confidence: effective_confidence,
                 evidence_uris: product.evidence_uris.clone(),
                 contradiction_uris: product.contradiction_uris.clone(),
                 weight,
@@ -257,15 +290,16 @@ pub fn extract_gradients_from_products(
                     pattern: product.error_pattern.clone().unwrap_or_default(),
                     reason: product.content.clone(),
                 },
-                confidence: product.quality_score,
+                confidence: effective_confidence,
                 evidence_uris: vec![],
                 contradiction_uris: vec![],
                 weight,
             },
             ContentType::Hypothesis => {
                 let outcome = match product.hypothesis_outcome {
-                    Some(_o) => crate::HypothesisOutcome::Confirmed,
-                    _ => crate::HypothesisOutcome::Falsified,
+                    Some(ProductHypothesisOutcome::Confirmed) => HypothesisOutcome::Confirmed,
+                    Some(ProductHypothesisOutcome::Falsified) => HypothesisOutcome::Falsified,
+                    Some(ProductHypothesisOutcome::Inconclusive) | None => continue,
                 };
                 CognitiveGradient {
                     source_uri: product.uri.clone(),
@@ -274,7 +308,7 @@ pub fn extract_gradients_from_products(
                         hypothesis: product.content.clone(),
                         outcome,
                     },
-                    confidence: product.quality_score,
+                    confidence: effective_confidence,
                     evidence_uris: product.evidence_uris.clone(),
                     contradiction_uris: vec![],
                     weight,
@@ -288,7 +322,7 @@ pub fn extract_gradients_from_products(
                     precondition: product.preconditions.clone().unwrap_or_default(),
                     expected_outcome: product.expected_outcome.clone().unwrap_or_default(),
                 },
-                confidence: product.quality_score,
+                confidence: effective_confidence,
                 evidence_uris: product.evidence_uris.clone(),
                 contradiction_uris: vec![],
                 weight,
@@ -301,7 +335,7 @@ pub fn extract_gradients_from_products(
                     old_value: product.superseded_claim.clone(),
                     new_value: product.content.clone(),
                 },
-                confidence: product.quality_score,
+                confidence: effective_confidence,
                 evidence_uris: vec![],
                 contradiction_uris: vec![],
                 weight,
@@ -313,7 +347,7 @@ pub fn extract_gradients_from_products(
                     insight: product.content.clone(),
                     applies_to: product.related_policy_uris.clone(),
                 },
-                confidence: product.quality_score,
+                confidence: effective_confidence,
                 evidence_uris: vec![],
                 contradiction_uris: vec![],
                 weight,
@@ -331,6 +365,119 @@ pub fn extract_gradients_from_products(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     gradients
+}
+
+#[cfg(test)]
+mod gradient_gate_tests {
+    use super::*;
+    use agent_context_db_consolidation::{
+        ConsolidationProductMeta, HypothesisOutcome as ProductOutcome,
+    };
+    use agent_context_db_core::{
+        ConsolidationStatus, EpistemicType, LineageEntry, MvccVersion, ValidityRecord,
+    };
+
+    fn product(content_type: ContentType) -> ConsolidationProduct {
+        let now = Utc::now();
+        ConsolidationProduct {
+            uri: ContextUri::parse(format!(
+                "uwu://tenant/agent/a/memory/{}/gate/test",
+                content_type.as_path_segment()
+            ))
+            .unwrap(),
+            content_type,
+            epistemic_type: EpistemicType::Fact,
+            content: "tested claim".into(),
+            quality_score: 0.9,
+            confidence: 0.8,
+            superseded_claim: None,
+            evidence_uris: vec![
+                ContextUri::parse("uwu://tenant/agent/a/memory/evidence/e1").unwrap(),
+            ],
+            contradiction_uris: vec![],
+            error_pattern: Some("failure".into()),
+            hypothesis_outcome: None,
+            preconditions: Some("precondition".into()),
+            expected_outcome: Some("outcome".into()),
+            related_policy_uris: vec![],
+            provenance: None,
+            metadata: ConsolidationProductMeta {
+                source_session: Some("verified-session".into()),
+                generation: 1,
+                status: ConsolidationStatus::Converged,
+                patch_count: 1,
+                lineage: vec![LineageEntry {
+                    version: MvccVersion(1),
+                    timestamp: now,
+                    change_summary: "verified".into(),
+                }],
+                validity: Some(ValidityRecord {
+                    valid_from: now - chrono::Duration::minutes(1),
+                    valid_until: None,
+                    invalidated_by: None,
+                    invalidation_reason: None,
+                }),
+                half_life_days: Some(30.0),
+            },
+        }
+    }
+
+    #[test]
+    fn hypothesis_outcomes_preserve_confirmed_and_falsified() {
+        let mut confirmed = product(ContentType::Hypothesis);
+        confirmed.hypothesis_outcome = Some(ProductOutcome::Confirmed);
+        let mut falsified = confirmed.clone();
+        falsified.uri =
+            ContextUri::parse("uwu://tenant/agent/a/memory/hypothesis/gate/falsified").unwrap();
+        falsified.hypothesis_outcome = Some(ProductOutcome::Falsified);
+        let gradients = extract_gradients_from_products(&[confirmed, falsified], 0.1);
+        assert!(gradients.iter().any(|gradient| matches!(
+            gradient.gradient_type,
+            GradientType::ValidationRule {
+                outcome: HypothesisOutcome::Confirmed,
+                ..
+            }
+        )));
+        assert!(gradients.iter().any(|gradient| matches!(
+            gradient.gradient_type,
+            GradientType::ValidationRule {
+                outcome: HypothesisOutcome::Falsified,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn inconclusive_unknown_and_unsafe_products_are_rejected() {
+        let mut inconclusive = product(ContentType::Hypothesis);
+        inconclusive.hypothesis_outcome = Some(ProductOutcome::Inconclusive);
+        let mut unknown = product(ContentType::Hypothesis);
+        unknown.hypothesis_outcome = None;
+        let mut pending = product(ContentType::Fact);
+        pending.metadata.status = ConsolidationStatus::Pending;
+        let mut unsupported = product(ContentType::Fact);
+        unsupported.evidence_uris.clear();
+        let mut untraceable = product(ContentType::Skill);
+        untraceable.metadata.source_session = None;
+        untraceable.metadata.lineage.clear();
+        assert!(
+            extract_gradients_from_products(
+                &[inconclusive, unknown, pending, unsupported, untraceable],
+                0.1
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn confidence_uses_lower_of_quality_and_declared_confidence() {
+        let product = product(ContentType::Fact);
+        let gradient = extract_gradients_from_products(&[product], 0.1)
+            .pop()
+            .unwrap();
+        assert_eq!(gradient.confidence, 0.8);
+        assert_eq!(gradient.weight, 0.8);
+    }
 }
 
 // ===========================================================================
@@ -509,7 +656,11 @@ pub struct FailureCase {
 ///
 /// - 成功 case → Skill 记忆（可指导下轮训练）
 /// - 失败 case → Error 记忆（避免重复踩坑）
-pub fn feedback_evaluation_to_memories(eval: &EvalResult, agent_scope: &str) -> Vec<ContextEntry> {
+pub fn feedback_evaluation_to_memories(
+    eval: &EvalResult,
+    agent_scope: &str,
+    tenant: agent_context_db_core::TenantId,
+) -> Vec<ContextEntry> {
     let mut entries = Vec::new();
 
     // 成功 case → Skill 记忆
@@ -524,11 +675,7 @@ pub fn feedback_evaluation_to_memories(eval: &EvalResult, agent_scope: &str) -> 
             ContextUri::parse(&format!("uwu://{}/memory/skill/fallback", agent_scope)).unwrap()
         });
 
-        let entry = ContextEntry::new_text(
-            uri,
-            agent_context_db_core::TenantId(uuid::Uuid::new_v4()),
-            &success.skill_extracted,
-        );
+        let entry = ContextEntry::new_text(uri, tenant, &success.skill_extracted);
         entries.push(entry);
     }
 
@@ -544,15 +691,41 @@ pub fn feedback_evaluation_to_memories(eval: &EvalResult, agent_scope: &str) -> 
             ContextUri::parse(&format!("uwu://{}/memory/error/fallback", agent_scope)).unwrap()
         });
 
-        let entry = ContextEntry::new_text(
-            uri,
-            agent_context_db_core::TenantId(uuid::Uuid::new_v4()),
-            &failure.analysis,
-        );
+        let entry = ContextEntry::new_text(uri, tenant, &failure.analysis);
         entries.push(entry);
     }
 
     entries
+}
+
+#[cfg(test)]
+mod feedback_memory_tests {
+    use super::*;
+    use agent_context_db_core::TenantId;
+
+    #[test]
+    fn feedback_memories_preserve_caller_tenant() {
+        let tenant = TenantId(uuid::Uuid::new_v4());
+        let eval = EvalResult {
+            epoch: 2,
+            accuracy: 0.8,
+            successes: vec![SuccessCase {
+                skill_extracted: "safe deploy".into(),
+                procedure: "deploy".into(),
+                precondition: "tests pass".into(),
+                expected_outcome: "healthy service".into(),
+            }],
+            failures: vec![FailureCase {
+                description: "failed rollout".into(),
+                analysis: "rollback required".into(),
+                trace: "deploy -> fail".into(),
+                root_cause_contradiction: None,
+            }],
+        };
+        let entries = feedback_evaluation_to_memories(&eval, "tenant/agent/a", tenant);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.tenant == tenant));
+    }
 }
 
 /// 认知 Metric — 多维评估。

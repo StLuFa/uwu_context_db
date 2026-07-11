@@ -40,6 +40,8 @@ pub struct MemoryVersionStore {
     tags: Mutex<HashMap<(String, String), Tag>>,
     /// scope_uri → HEAD CommitId
     heads: Mutex<HashMap<String, CommitId>>,
+    /// scope_uri → 当前检出的分支。缺失时 HEAD 处于 detached 状态。
+    attached_branches: Mutex<HashMap<String, BranchName>>,
 }
 
 impl MemoryVersionStore {
@@ -50,6 +52,7 @@ impl MemoryVersionStore {
             branches: Mutex::new(HashMap::new()),
             tags: Mutex::new(HashMap::new()),
             heads: Mutex::new(HashMap::new()),
+            attached_branches: Mutex::new(HashMap::new()),
         }
     }
 
@@ -153,14 +156,27 @@ impl VersionStore for MemoryVersionStore {
             HashMap::new()
         };
 
-        // 应用变更（标记 add/update，实际内容通过 put_entry_version 注入）
-        for add_uri in &changes.adds {
-            snapshot
-                .entry(add_uri.to_string())
-                .or_insert_with(|| "{}".to_string());
+        // Apply complete post-change entries so the in-memory contract matches PostgreSQL and
+        // every commit is independently replayable.
+        for entry in &changes.adds {
+            snapshot.insert(
+                entry.uri.to_string(),
+                serde_json::to_string(entry)
+                    .map_err(|e| VersionError::Storage(format!("serialize added entry: {e}")))?,
+            );
         }
         for upd in &changes.updates {
-            snapshot.insert(upd.uri.to_string(), "{}".to_string());
+            if upd.uri != upd.entry.uri {
+                return Err(VersionError::Storage(format!(
+                    "update URI {} does not match entry URI {}",
+                    upd.uri, upd.entry.uri
+                )));
+            }
+            snapshot.insert(
+                upd.uri.to_string(),
+                serde_json::to_string(&upd.entry)
+                    .map_err(|e| VersionError::Storage(format!("serialize updated entry: {e}")))?,
+            );
         }
         for del in &changes.deletes {
             snapshot.remove(&del.to_string());
@@ -173,19 +189,20 @@ impl VersionStore for MemoryVersionStore {
 
         let tree_hash = ContentHash(format!("tree-{}", commit_id.0));
 
-        // 推进当前 HEAD 所在分支（如果有）
-        let first_parent = parents.first().cloned();
-        {
+        // 只有显式检出的分支会随 commit 推进；共享同一 parent 的其他分支必须保持隔离。
+        if let Some(attached) = self.attached_branches.lock().get(&scope_key).cloned() {
+            let key = (scope_key.clone(), attached.as_str().to_string());
             let mut branches = self.branches.lock();
-            for ((s, _name), branch) in branches.iter_mut() {
-                if s == &scope_key {
-                    if let Some(ref p) = first_parent {
-                        if branch.head == *p {
-                            branch.head = commit_id.clone();
-                        }
-                    }
-                }
+            let branch = branches.get_mut(&key).ok_or_else(|| {
+                VersionError::NotFound(format!("attached branch {}", attached.as_str()))
+            })?;
+            if parents.first() != Some(&branch.head) {
+                return Err(VersionError::Storage(format!(
+                    "HEAD and attached branch {} diverged",
+                    attached.as_str()
+                )));
             }
+            branch.head = commit_id.clone();
         }
 
         let commit = Commit {
@@ -222,9 +239,12 @@ impl VersionStore for MemoryVersionStore {
     ) -> Result<Branch> {
         let scope_key = Self::scope_key(scope);
         let key = (scope_key.clone(), name.as_str().to_string());
-        let branches = self.branches.lock();
+        let mut branches = self.branches.lock();
         if branches.contains_key(&key) {
             return Err(VersionError::BranchExists(name.as_str().to_string()));
+        }
+        if !self.commits.lock().contains_key(&from) {
+            return Err(VersionError::NotFound(format!("commit {}", from.0)));
         }
 
         let branch = Branch {
@@ -236,7 +256,7 @@ impl VersionStore for MemoryVersionStore {
             lifecycle: BranchLifecycle::Active,
         };
 
-        self.branches.lock().insert(key, branch.clone());
+        branches.insert(key, branch.clone());
         Ok(branch)
     }
 
@@ -463,10 +483,20 @@ impl VersionStore for MemoryVersionStore {
                         "cannot fast-forward: branches have diverged".into(),
                     ));
                 }
-                let mut branches = self.branches.lock();
-                if let Some(b) = branches.get_mut(&into_key) {
-                    b.head = from_head.clone();
-                    b.lifecycle = BranchLifecycle::Active;
+                let target_is_attached = self
+                    .attached_branches
+                    .lock()
+                    .get(&scope_key)
+                    .is_some_and(|name| name == into);
+                {
+                    let mut branches = self.branches.lock();
+                    if let Some(b) = branches.get_mut(&into_key) {
+                        b.head = from_head.clone();
+                        b.lifecycle = BranchLifecycle::Active;
+                    }
+                }
+                if target_is_attached {
+                    self.set_head(&scope_key, from_head.clone());
                 }
                 Ok(MergeResult {
                     commit: from_head,
@@ -475,9 +505,19 @@ impl VersionStore for MemoryVersionStore {
             }
             MergeStrategy::ThreeWay | MergeStrategy::Ours | MergeStrategy::Theirs => {
                 if is_ancestor {
-                    let mut branches = self.branches.lock();
-                    if let Some(b) = branches.get_mut(&into_key) {
-                        b.head = from_head.clone();
+                    let target_is_attached = self
+                        .attached_branches
+                        .lock()
+                        .get(&scope_key)
+                        .is_some_and(|name| name == into);
+                    {
+                        let mut branches = self.branches.lock();
+                        if let Some(b) = branches.get_mut(&into_key) {
+                            b.head = from_head.clone();
+                        }
+                    }
+                    if target_is_attached {
+                        self.set_head(&scope_key, from_head.clone());
                     }
                     return Ok(MergeResult {
                         commit: from_head,
@@ -530,11 +570,20 @@ impl VersionStore for MemoryVersionStore {
                 self.commits.lock().insert(merge_id.clone(), merge_commit);
                 self.entry_snapshots.lock().insert(merge_id.clone(), merged);
 
-                let mut branches = self.branches.lock();
-                if let Some(b) = branches.get_mut(&into_key) {
-                    b.head = merge_id.clone();
+                let target_is_attached = self
+                    .attached_branches
+                    .lock()
+                    .get(&scope_key)
+                    .is_some_and(|name| name == into);
+                {
+                    let mut branches = self.branches.lock();
+                    if let Some(b) = branches.get_mut(&into_key) {
+                        b.head = merge_id.clone();
+                    }
                 }
-                self.set_head(&scope_key, merge_id.clone());
+                if target_is_attached {
+                    self.set_head(&scope_key, merge_id.clone());
+                }
 
                 Ok(MergeResult {
                     commit: merge_id,
@@ -597,13 +646,17 @@ impl VersionStore for MemoryVersionStore {
     async fn switch_head(&self, scope: &ContextUri, branch: &BranchName) -> Result<()> {
         let scope_key = Self::scope_key(scope);
         let key = (scope_key.clone(), branch.as_str().to_string());
-        let branches = self.branches.lock();
-        if let Some(b) = branches.get(&key) {
-            self.set_head(&scope_key, b.head.clone());
-            Ok(())
-        } else {
-            Err(VersionError::NotFound(format!("branch {}", branch)))
-        }
+        let branch_head = self
+            .branches
+            .lock()
+            .get(&key)
+            .map(|value| value.head.clone())
+            .ok_or_else(|| VersionError::NotFound(format!("branch {}", branch)))?;
+        self.set_head(&scope_key, branch_head);
+        self.attached_branches
+            .lock()
+            .insert(scope_key, branch.clone());
+        Ok(())
     }
 
     async fn cherry_pick(
@@ -1156,7 +1209,11 @@ mod tests {
             .commit(
                 &s,
                 ChangeSet {
-                    adds: vec![entry_uri("uwu://t1/agent/a1/state/mid/s1")],
+                    adds: vec![ContextEntry::new_text(
+                        entry_uri("uwu://t1/agent/a1/state/mid/s1"),
+                        TenantId(uuid::Uuid::nil()),
+                        "state one",
+                    )],
                     ..Default::default()
                 },
                 CommitMeta {
@@ -1179,6 +1236,15 @@ mod tests {
             .unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].id, id);
+        let payload = store
+            .read_at(
+                &entry_uri("uwu://t1/agent/a1/state/mid/s1"),
+                VersionRef::Commit(id),
+                ContentLevel::L2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(payload.sparse_text(), "state one");
     }
 
     #[tokio::test]
@@ -1206,6 +1272,7 @@ mod tests {
             .unwrap();
 
         // commit on feat
+        store.switch_head(&s, &feat).await.unwrap();
         let c2 = store
             .commit(&s, ChangeSet::default(), CommitMeta::default())
             .await

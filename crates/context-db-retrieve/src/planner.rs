@@ -95,6 +95,7 @@ pub enum PhysicalPlan {
     PgPrefixScan { uri_prefix: String, limit: usize },
     /// 向量搜索（带 payload 过滤）。
     VectorSearch {
+        collection: String,
         embedding: Vec<f32>,
         filter: VectorFilter,
         limit: usize,
@@ -349,7 +350,7 @@ impl CboOptimizer {
             },
 
             LogicalPlan::VectorSearch {
-                collection: _,
+                collection,
                 query,
                 top_k,
             } => {
@@ -364,6 +365,7 @@ impl CboOptimizer {
                     .map(|hint| hint.top_k_multiplier.clamp(1.0, 3.0))
                     .unwrap_or(1.0);
                 PhysicalPlan::VectorSearch {
+                    collection: collection.clone(),
                     embedding: query.clone(),
                     filter: VectorFilter::default(),
                     limit: ((*top_k as f32) * multiplier).ceil() as usize,
@@ -378,9 +380,15 @@ impl CboOptimizer {
                         limit: extract_limit(input).unwrap_or_else(|| self.type_limit(&ct)),
                     };
                 }
-                if let LogicalPlan::VectorSearch { query, top_k, .. } = input.as_ref() {
+                if let LogicalPlan::VectorSearch {
+                    collection,
+                    query,
+                    top_k,
+                } = input.as_ref()
+                {
                     let (filter, residual) = vector_filter_from_predicate(predicate);
                     let search = PhysicalPlan::VectorSearch {
+                        collection: collection.clone(),
                         embedding: query.clone(),
                         filter,
                         limit: *top_k,

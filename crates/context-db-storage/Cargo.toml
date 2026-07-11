@@ -2,12 +2,24 @@
 name = "agent-context-db-storage"
 version = "0.0.0"
 edition = "2024"
-description = "agent-context-db L7 存储层：VectorIndex 端口 + PG 适配器（基于 uwu_database）+ 服务装配（composition root）"
+description = "agent-context-db L7 存储层：SQLite/PostgreSQL 内容适配器、向量索引适配器与服务装配根"
 
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
 agent-context-db-version = { path = "../context-db-version" }
-uwu_database = { git = "https://github.com/StLuFa/uwu_database.git" }
+uwu_database = {
+    git = "https://github.com/StLuFa/uwu_database.git",
+    rev = "ce2fad2",
+    default-features = false,
+    features = [
+        "postgres",
+        "sqlite",
+        "cache-memory",
+        "community",
+        "vector-memory",
+        "vector-qdrant-edge",
+    ],
+}
 uwu-crdt = { workspace = true }
 cel-interpreter = { workspace = true }
 serde = { version = "1", features = ["derive"] }
@@ -21,7 +33,7 @@ blake3 = "1"
 zstd = "0.13"
 tracing = "0.1"
 tokio = { version = "1", features = ["sync", "time"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "macros", "chrono", "uuid"] }
 
 [features]
 default = []

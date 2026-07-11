@@ -30,6 +30,8 @@ pub struct CdtConsolidationSignal {
     pub contradiction_uris: Vec<ContextUri>,
     pub source: CdtSignalSource,
     pub tags: Vec<String>,
+    /// Structured hypothesis result retained across CDT -> consolidation round trips.
+    pub hypothesis_outcome: Option<HypothesisOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +104,7 @@ impl CdtConsolidationBridge {
             contradiction_uris: vec![],
             source: CdtSignalSource::Reflexion,
             tags: gradient.epistemic_tags.clone(),
+            hypothesis_outcome: None,
         }
     }
 
@@ -137,6 +140,7 @@ impl CdtConsolidationBridge {
             contradiction_uris: vec![],
             source: CdtSignalSource::ExpeLInsight,
             tags: insight.evidence.clone(),
+            hypothesis_outcome: None,
         }
     }
 
@@ -157,11 +161,18 @@ impl CdtConsolidationBridge {
         let (
             superseded_claim,
             error_pattern,
-            hypothesis_outcome,
+            default_hypothesis_outcome,
             preconditions,
             expected_outcome,
             related_policy_uris,
         ) = product_details(signal);
+        let hypothesis_outcome = signal
+            .hypothesis_outcome
+            .map(|outcome| match outcome {
+                HypothesisOutcome::Confirmed => ProductHypothesisOutcome::Confirmed,
+                HypothesisOutcome::Falsified => ProductHypothesisOutcome::Falsified,
+            })
+            .or(default_hypothesis_outcome);
 
         ConsolidationProduct {
             uri: signal.uri.clone(),
@@ -182,7 +193,7 @@ impl CdtConsolidationBridge {
             metadata: ProductConsolidationMeta {
                 source_session: Some(format!("cdt::{:?}", signal.source)),
                 generation: 0,
-                status: ConsolidationStatus::Converged,
+                status: ConsolidationStatus::Pending,
                 patch_count: 0,
                 lineage: vec![LineageEntry {
                     version: MvccVersion(0),
@@ -217,7 +228,7 @@ impl CdtConsolidationBridge {
         entry.metadata.consolidation = Some(EntryConsolidationMeta {
             source: format!("cdt::{:?}", signal.source),
             generation: 0,
-            status: ConsolidationStatus::Converged,
+            status: ConsolidationStatus::Pending,
             patch_count: 0,
             lineage: vec![LineageEntry {
                 version: MvccVersion(0),
@@ -300,6 +311,10 @@ impl CdtConsolidationBridge {
             ),
         };
 
+        let hypothesis_outcome = match &gradient.gradient_type {
+            GradientType::ValidationRule { outcome, .. } => Some(*outcome),
+            _ => None,
+        };
         CdtConsolidationSignal {
             uri: gradient.source_uri.clone(),
             content_type,
@@ -311,6 +326,7 @@ impl CdtConsolidationBridge {
             contradiction_uris: gradient.contradiction_uris.clone(),
             source: CdtSignalSource::Gradient,
             tags,
+            hypothesis_outcome,
         }
     }
 
@@ -413,9 +429,43 @@ mod tests {
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(batch.products[0].content_type, ContentType::Skill);
         assert_eq!(
+            batch.products[0].metadata.status,
+            ConsolidationStatus::Pending
+        );
+        assert_eq!(
             batch.entries[0].metadata.content_type,
             Some(ContentType::Skill)
         );
-        assert!(batch.entries[0].metadata.consolidation.is_some());
+        assert_eq!(
+            batch.entries[0]
+                .metadata
+                .consolidation
+                .as_ref()
+                .unwrap()
+                .status,
+            ConsolidationStatus::Pending
+        );
+    }
+
+    #[test]
+    fn hypothesis_outcome_survives_round_trip() {
+        let bridge = CdtConsolidationBridge::for_agent("t/agent/cdt");
+        let gradient = CognitiveGradient {
+            source_uri: uri("uwu://t/agent/cdt/hypothesis/test"),
+            epistemic_type: ContentType::Hypothesis,
+            gradient_type: GradientType::ValidationRule {
+                hypothesis: "candidate".into(),
+                outcome: HypothesisOutcome::Falsified,
+            },
+            confidence: 0.8,
+            evidence_uris: vec![uri("uwu://t/agent/cdt/evidence/test")],
+            contradiction_uris: vec![],
+            weight: 0.7,
+        };
+        let product = bridge.product_from_gradient(&gradient);
+        assert_eq!(
+            product.hypothesis_outcome,
+            Some(ProductHypothesisOutcome::Falsified)
+        );
     }
 }

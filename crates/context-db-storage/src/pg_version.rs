@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri};
+use agent_context_db_core::{ContentLevel, ContentPayload, ContextEntry, ContextUri};
 use agent_context_db_version::{
     AsOfTime, Author, Branch, BranchLifecycle, BranchName, BranchType, ChangeSet, Commit, CommitId,
     CommitMeta, ConflictItem, ConflictResolution, ConflictResolutionSet, ConflictSession,
@@ -603,7 +603,13 @@ impl PgVersionStore {
                 let common = old_items.len().min(new_items.len());
                 for idx in 0..common {
                     let child_path = format!("{}[{}]", path_or_root(path), idx);
-                    Self::diff_json_value(uri, &child_path, &old_items[idx], &new_items[idx], changes);
+                    Self::diff_json_value(
+                        uri,
+                        &child_path,
+                        &old_items[idx],
+                        &new_items[idx],
+                        changes,
+                    );
                 }
                 for item in &new_items[common..] {
                     changes.push(EntityChange {
@@ -1016,22 +1022,33 @@ impl VersionStore for PgVersionStore {
 
         // 把 ChangeSet 转成 DeltaRow
         let mut deltas = Vec::new();
-        for uri in &changes.adds {
+        for entry in &changes.adds {
             deltas.push(DeltaRow {
-                uri: uri.to_string(),
+                uri: entry.uri.to_string(),
                 op: "add".into(),
-                entry_json: Some(serde_json::json!({})),
+                entry_json: Some(
+                    serde_json::to_value(entry).map_err(|e| {
+                        VersionError::Storage(format!("serialize added entry: {e}"))
+                    })?,
+                ),
                 rename_from: None,
             });
         }
         for upd in &changes.updates {
+            if upd.entry.uri != upd.uri {
+                return Err(VersionError::Storage(format!(
+                    "update URI {} does not match entry URI {}",
+                    upd.uri, upd.entry.uri
+                )));
+            }
             deltas.push(DeltaRow {
                 uri: upd.uri.to_string(),
                 op: "update".into(),
-                entry_json: Some(serde_json::json!({
-                    "diff_summary": upd.diff_summary,
-                    "new_hash": upd.new_hash.0,
-                })),
+                entry_json: Some(
+                    serde_json::to_value(&upd.entry).map_err(|e| {
+                        VersionError::Storage(format!("serialize updated entry: {e}"))
+                    })?,
+                ),
                 rename_from: None,
             });
         }
@@ -1854,7 +1871,6 @@ impl VersionStore for PgVersionStore {
         })
     }
 
-
     // ---- 时态演化 ------------------------------------------------------------
 
     async fn evolution(&self, uri: &ContextUri) -> Result<Vec<TemporalVersion>> {
@@ -2339,8 +2355,11 @@ fn path_or_root(path: &str) -> &str {
     if path.is_empty() { "*" } else { path }
 }
 
-/// 从 JSON 字符串重建 ContentPayload；失败时退化为纯文本。
+/// Rebuild payloads from current full-entry snapshots and legacy payload-only snapshots.
 fn payload_from_json(json: &str) -> ContentPayload {
+    if let Ok(entry) = serde_json::from_str::<ContextEntry>(json) {
+        return entry.payload;
+    }
     serde_json::from_str::<ContentPayload>(json).unwrap_or(ContentPayload::Text {
         sparse: json.to_string(),
         dense: String::new(),

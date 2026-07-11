@@ -68,10 +68,11 @@ impl PhysicalPlan {
                 PgPrefixScanOp::execute_scan(uri_prefix, *limit, ctx).await
             }
             PhysicalPlan::VectorSearch {
+                collection,
                 embedding,
                 filter,
                 limit,
-            } => VectorSearchOp::execute_search(embedding, filter, *limit, ctx).await,
+            } => VectorSearchOp::execute_search(collection, embedding, filter, *limit, ctx).await,
             PhysicalPlan::Filter { input, predicate } => {
                 let inner = input.execute(ctx).await?;
                 FilterOp::apply(inner, predicate).await
@@ -154,6 +155,7 @@ pub struct VectorSearchOp;
 
 impl VectorSearchOp {
     async fn execute_search(
+        collection: &str,
         embedding: &[f32],
         filter: &VectorFilter,
         limit: usize,
@@ -183,7 +185,6 @@ impl VectorSearchOp {
             None
         };
 
-        let collection = filter.uri_prefix.as_deref().unwrap_or("default");
         let index_hits = index
             .search(collection, embedding.to_vec(), limit, filter_json)
             .await?;

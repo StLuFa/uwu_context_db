@@ -568,7 +568,7 @@ impl<V: VersionStore> DreamConsolidator<V> {
         let mut changed_uris = Vec::new();
         for commit in &log {
             for add in &commit.metadata.changes.adds {
-                changed_uris.push(add.clone());
+                changed_uris.push(add.uri.clone());
             }
         }
 
@@ -718,9 +718,9 @@ fn replay_uris_from_log(log: &[crate::model::Commit]) -> Vec<ContextUri> {
     let mut seen = HashSet::new();
     let mut uris = Vec::new();
     for commit in log {
-        for uri in &commit.metadata.changes.adds {
-            if seen.insert(uri.clone()) {
-                uris.push(uri.clone());
+        for entry in &commit.metadata.changes.adds {
+            if seen.insert(entry.uri.clone()) {
+                uris.push(entry.uri.clone());
             }
         }
         for update in &commit.metadata.changes.updates {
@@ -1084,7 +1084,14 @@ fn build_causal_samples(
 
 fn touched_uris(commit: &crate::Commit) -> HashSet<ContextUri> {
     let mut touched = HashSet::new();
-    touched.extend(commit.metadata.changes.adds.iter().cloned());
+    touched.extend(
+        commit
+            .metadata
+            .changes
+            .adds
+            .iter()
+            .map(|entry| entry.uri.clone()),
+    );
     touched.extend(commit.metadata.changes.deletes.iter().cloned());
     for update in &commit.metadata.changes.updates {
         touched.insert(update.uri.clone());

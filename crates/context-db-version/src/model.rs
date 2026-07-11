@@ -1,6 +1,6 @@
 //! 版本 DAG 模型（M2）：Commit / Branch / Tag。见 ARCHITECTURE.md §1.2-1.4。
 
-use agent_context_db_core::{ContentHash, ContextUri};
+use agent_context_db_core::{ContentHash, ContextEntry, ContextUri};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -181,7 +181,8 @@ pub enum CommitTrigger {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeSet {
-    pub adds: Vec<ContextUri>,
+    /// Complete entries added by this commit. A reversible version log must own the value it adds.
+    pub adds: Vec<ContextEntry>,
     pub updates: Vec<UriChange>,
     pub deletes: Vec<ContextUri>,
     pub renames: Vec<RenameOp>,
@@ -193,6 +194,8 @@ pub struct UriChange {
     pub old_hash: Option<ContentHash>,
     pub new_hash: ContentHash,
     pub diff_summary: String,
+    /// Complete post-update value used for snapshot reconstruction and time travel.
+    pub entry: ContextEntry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

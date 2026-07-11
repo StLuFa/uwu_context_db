@@ -34,18 +34,13 @@ async fn m2_acceptance_fork_rewrite_rollback() {
         .commit(
             &s,
             ChangeSet {
-                adds: vec![state_uri.clone()],
+                adds: vec![entry(&state_uri, "{\"mood\": \"neutral\"}")],
                 ..Default::default()
             },
             CommitMeta::default(),
         )
         .await
         .unwrap();
-    store.put_entry_version(
-        &baseline,
-        &state_uri,
-        &entry(&state_uri, "{\"mood\": \"neutral\"}"),
-    );
 
     // 创建 main 分支
     let main = BranchName::new("main");
@@ -60,8 +55,9 @@ async fn m2_acceptance_fork_rewrite_rollback() {
         .create_branch(&s, fork.clone(), baseline.clone(), BranchType::StateFork)
         .await
         .unwrap();
+    store.switch_head(&s, &fork).await.unwrap();
 
-    // 3. 在 fork 分支上改写 State（模拟推演）— 用 scope commit（推进 HEAD）
+    // 3. 在显式检出的 fork 分支上改写 State（模拟推演）
     let fork_commit = store
         .commit(
             &s,
@@ -71,6 +67,7 @@ async fn m2_acceptance_fork_rewrite_rollback() {
                     old_hash: None,
                     new_hash: agent_context_db_version::ContentHash("v2".into()),
                     diff_summary: "mood changed to happy".into(),
+                    entry: entry(&state_uri, "{\"mood\": \"happy\"}"),
                 }],
                 ..Default::default()
             },
@@ -83,11 +80,6 @@ async fn m2_acceptance_fork_rewrite_rollback() {
         )
         .await
         .unwrap();
-    store.put_entry_version(
-        &fork_commit,
-        &state_uri,
-        &entry(&state_uri, "{\"mood\": \"happy\"}"),
-    );
 
     // 4. 验证时间旅行：baseline 时能读到 v1
     let v1 = store

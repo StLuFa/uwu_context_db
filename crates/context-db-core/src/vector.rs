@@ -42,6 +42,17 @@ impl IndexPoint {
     }
 }
 
+/// 从索引按 URI 读取的完整向量记录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexVector {
+    pub uri: ContextUri,
+    pub vector: Vec<f32>,
+    pub embedding_model_id: Option<String>,
+    pub embedding_dim: Option<usize>,
+    pub embedding_version: Option<u64>,
+    pub payload: serde_json::Value,
+}
+
 /// 索引命中结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexHit {
@@ -64,6 +75,13 @@ pub trait VectorIndex: Send + Sync {
         top_k: usize,
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<IndexHit>>;
+
+    /// 在一次后端调用中按 URI 批量读取完整向量。结果顺序不作保证；缺失 URI 不返回。
+    async fn get_many(&self, _collection: &str, _uris: &[ContextUri]) -> Result<Vec<IndexVector>> {
+        Err(crate::error::ContextError::Storage(
+            "vector backend does not support batch retrieval".into(),
+        ))
+    }
 
     /// 按 URI 删除索引点。
     async fn delete(&self, collection: &str, uri: &ContextUri) -> Result<()>;

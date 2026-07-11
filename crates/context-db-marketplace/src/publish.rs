@@ -24,26 +24,39 @@ pub trait KnowledgeSigner: Send + Sync {
     ) -> std::result::Result<KnowledgeProvenance, String>;
 }
 
-/// 发布门控 — 检查 knowledge 是否可以进入市场。
-pub struct PublishGate {
-    /// 最低质量分。
-    min_quality: f32,
-    /// 最低确认等级。
-    min_corroboration: CorroborationLevel,
+#[derive(Debug, Clone)]
+pub struct PublishConfig {
+    pub min_quality: f32,
+    pub min_corroboration: CorroborationLevel,
 }
 
-impl Default for PublishGate {
+impl Default for PublishConfig {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PublishGate {
-    pub fn new() -> Self {
         Self {
             min_quality: 0.80,
             min_corroboration: CorroborationLevel::CrossSession,
         }
+    }
+}
+
+impl PublishConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.min_quality.is_finite() || !(0.0..=1.0).contains(&self.min_quality) {
+            return Err("min_quality must be finite and in [0, 1]".into());
+        }
+        Ok(())
+    }
+}
+
+/// 发布门控 — 检查 knowledge 是否可以进入市场。
+pub struct PublishGate {
+    config: PublishConfig,
+}
+
+impl PublishGate {
+    pub fn new(config: PublishConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     /// 尝试发布一个 ConsolidationProduct。
@@ -62,12 +75,12 @@ impl PublishGate {
         domain: &str,
     ) -> Result<MarketEntry, PublishError> {
         // 1. 质量
-        if product.quality_score() < self.min_quality {
+        if product.quality_score() < self.config.min_quality {
             return Err(PublishError::QualityTooLow(product.quality_score()));
         }
 
         // 2. 确认
-        if corroboration.level < self.min_corroboration {
+        if corroboration.level < self.config.min_corroboration {
             return Err(PublishError::InsufficientCorroboration(corroboration.level));
         }
 
@@ -251,7 +264,7 @@ mod tests {
 
     #[test]
     fn signed_publish_entry_attaches_signer_provenance() {
-        let gate = PublishGate::new();
+        let gate = PublishGate::new(PublishConfig::default()).unwrap();
         let entry = gate
             .try_publish_signed(
                 &publishable_product(),

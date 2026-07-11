@@ -25,6 +25,29 @@ pub struct SelfConsistencyConfig {
     pub max_tokens: u32,
 }
 
+impl SelfConsistencyConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.samples == 0 || self.min_valid_samples == 0 || self.max_tokens == 0 {
+            return Err(crate::ConfigError(
+                "samples, min_valid_samples, and max_tokens must be nonzero".into(),
+            ));
+        }
+        if self.min_valid_samples > self.samples {
+            return Err(crate::ConfigError(
+                "min_valid_samples must not exceed samples".into(),
+            ));
+        }
+        crate::validate_unit_f32("min_majority_ratio", self.min_majority_ratio)?;
+        crate::validate_unit_f32("similarity_threshold", self.similarity_threshold)?;
+        if !self.base_temperature.is_finite() || self.base_temperature < 0.0 {
+            return Err(crate::ConfigError(
+                "base_temperature must be finite and nonnegative".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for SelfConsistencyConfig {
     fn default() -> Self {
         Self {
@@ -68,15 +91,12 @@ pub struct SelfConsistencyConsolidator {
 }
 
 impl SelfConsistencyConsolidator {
-    pub fn new(llm: Arc<dyn LlmClient>) -> Self {
-        Self {
-            llm,
-            config: SelfConsistencyConfig::default(),
-        }
-    }
-
-    pub fn with_config(llm: Arc<dyn LlmClient>, config: SelfConsistencyConfig) -> Self {
-        Self { llm, config }
+    pub fn new(
+        llm: Arc<dyn LlmClient>,
+        config: SelfConsistencyConfig,
+    ) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self { llm, config })
     }
 
     pub async fn consolidate(
@@ -146,6 +166,7 @@ impl SelfConsistencyConsolidator {
             content: winner,
             quality_score,
             confidence: calibrated_confidence,
+            evidence_required: false,
             superseded_claim: None,
             evidence_uris: vec![],
             contradiction_uris: if report.accepted {
@@ -396,10 +417,11 @@ mod tests {
 
     #[tokio::test]
     async fn partial_single_response_cannot_masquerade_as_consensus() {
-        let consolidator = SelfConsistencyConsolidator::with_config(
+        let consolidator = SelfConsistencyConsolidator::new(
             Arc::new(PartialLlm),
             SelfConsistencyConfig::default(),
-        );
+        )
+        .unwrap();
         let (product, report) = consolidator.consolidate(&entry()).await;
 
         assert_eq!(report.requested_samples, 5);
@@ -413,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_consistency_accepts_majority_cluster_and_calibrates_confidence() {
-        let consolidator = SelfConsistencyConsolidator::with_config(
+        let consolidator = SelfConsistencyConsolidator::new(
             Arc::new(VotingLlm),
             SelfConsistencyConfig {
                 samples: 5,
@@ -421,7 +443,8 @@ mod tests {
                 similarity_threshold: 0.5,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         let (product, report) = consolidator.consolidate(&entry()).await;
 
         assert!(report.accepted);

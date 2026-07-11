@@ -137,7 +137,126 @@ pub enum ContentPart {
     Reference(crate::uri::ContextUri),
 }
 
+/// Searchable text projected from a payload's three storage levels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentIndexProjection {
+    pub l0: String,
+    pub l1: Option<String>,
+    pub l2: String,
+}
+
 impl ContentPayload {
+    /// Produces the canonical searchable L0/L1/L2 representation used by every backend.
+    pub fn index_projection(&self) -> ContentIndexProjection {
+        let mut projection = ContentIndexProjection {
+            l0: String::new(),
+            l1: None,
+            l2: String::new(),
+        };
+        self.append_index_projection(&mut projection);
+        projection
+    }
+
+    fn append_index_projection(&self, output: &mut ContentIndexProjection) {
+        fn append(target: &mut String, value: &str) {
+            if !value.is_empty() {
+                if !target.is_empty() {
+                    target.push('\n');
+                }
+                target.push_str(value);
+            }
+        }
+        fn append_optional(target: &mut Option<String>, value: &str) {
+            if value.is_empty() {
+                return;
+            }
+            append(target.get_or_insert_with(String::new), value);
+        }
+
+        match self {
+            Self::Text {
+                sparse,
+                dense,
+                full,
+            } => {
+                append(&mut output.l0, sparse);
+                append_optional(&mut output.l1, dense);
+                append(&mut output.l2, full);
+            }
+            Self::Image {
+                thumbnail,
+                features,
+                raw,
+            } => {
+                append(
+                    &mut output.l0,
+                    &format!("[image thumbnail_bytes={}]", thumbnail.len()),
+                );
+                append_optional(
+                    &mut output.l1,
+                    &format!("[image feature_dimensions={}]", features.len()),
+                );
+                append(
+                    &mut output.l2,
+                    &format!(
+                        "[image blob={} size={} mime={}]",
+                        raw.hash.0, raw.size, raw.mime_type
+                    ),
+                );
+            }
+            Self::Audio {
+                transcript,
+                embedding,
+                raw,
+            } => {
+                append(&mut output.l0, transcript);
+                append_optional(
+                    &mut output.l1,
+                    &format!("[audio embedding_dimensions={}]", embedding.len()),
+                );
+                append(
+                    &mut output.l2,
+                    &format!(
+                        "{}\n[audio blob={} size={} mime={}]",
+                        transcript, raw.hash.0, raw.size, raw.mime_type
+                    ),
+                );
+            }
+            Self::Structured {
+                summary,
+                schema,
+                data,
+            } => {
+                append(&mut output.l0, summary);
+                if let Some(schema) = schema {
+                    append_optional(
+                        &mut output.l1,
+                        &format!("[schema format={}]", schema.format),
+                    );
+                }
+                let json = serde_json::to_string(data).unwrap_or_else(|_| data.to_string());
+                append_optional(&mut output.l1, &json);
+                append(&mut output.l2, &json);
+            }
+            Self::Composite { summary, parts } => {
+                append(&mut output.l0, summary);
+                append(&mut output.l2, summary);
+                for part in parts {
+                    match part {
+                        ContentPart::Text(payload)
+                        | ContentPart::Image(payload)
+                        | ContentPart::Audio(payload) => payload.append_index_projection(output),
+                        ContentPart::Reference(uri) => {
+                            let reference = format!("[reference {uri}]");
+                            append_optional(&mut output.l1, &reference);
+                            append(&mut output.l2, &reference);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 获取 L0 级文本摘要（所有变体通用）。
     pub fn sparse_text(&self) -> &str {
         match self {
@@ -158,16 +277,14 @@ impl ContentPayload {
                 full,
             } => {
                 let l0 = sparse.clone();
-                let l1 = if budget >= crate::tokenizer::count_tokens(dense) {
-                    Some(dense.clone())
-                } else {
-                    None
-                };
-                let l2 = if budget >= crate::tokenizer::count_tokens(full) {
-                    Some(full.clone())
-                } else {
-                    None
-                };
+                let l1 = crate::tokenizer::count_tokens(dense)
+                    .ok()
+                    .filter(|tokens| budget >= *tokens)
+                    .map(|_| dense.clone());
+                let l2 = crate::tokenizer::count_tokens(full)
+                    .ok()
+                    .filter(|tokens| budget >= *tokens)
+                    .map(|_| full.clone());
                 DecodedContent::Text { l0, l1, l2 }
             }
             ContentPayload::Image { thumbnail, .. } => DecodedContent::Binary(thumbnail.clone()),

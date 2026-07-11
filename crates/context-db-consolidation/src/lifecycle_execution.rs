@@ -265,18 +265,19 @@ impl LifecycleActionExecutor {
         };
         self.journal.upsert(job).await
     }
-    pub async fn run_pending(&self) -> Vec<LifecycleJob> {
+    pub async fn run_pending(&self) -> Result<Vec<LifecycleJob>> {
         let mut out = Vec::new();
         for j in self.journal.recoverable(Utc::now()).await {
-            out.push(self.execute(j).await);
+            out.push(self.execute(j).await?);
         }
-        out
+        Ok(out)
     }
-    async fn execute(&self, mut job: LifecycleJob) -> LifecycleJob {
+    async fn execute(&self, mut job: LifecycleJob) -> Result<LifecycleJob> {
         job.state = LifecycleJobState::Running;
         job.attempts += 1;
         audit(&mut job, "attempt started");
-        let _ = self.journal.update(job.clone()).await;
+        // The running checkpoint must be durable before any destructive backend operation.
+        self.journal.update(job.clone()).await?;
         let result = self.execute_phases(&mut job).await;
         match result {
             Ok(()) => {
@@ -296,8 +297,9 @@ impl LifecycleActionExecutor {
                 audit(&mut job, &format!("execution failed: {e}"));
             }
         }
-        let _ = self.journal.update(job.clone()).await;
-        job
+        // Never report a state transition that failed to reach durable storage.
+        self.journal.update(job.clone()).await?;
+        Ok(job)
     }
     async fn execute_phases(&self, job: &mut LifecycleJob) -> Result<()> {
         let key = &job.idempotency_key;
@@ -552,7 +554,7 @@ mod tests {
                 .retain(|(f, t, _)| f != from || t != to);
             Ok(())
         }
-        async fn neighbors(
+        async fn outgoing_neighbors(
             &self,
             uri: &ContextUri,
             kind: Option<GraphRelation>,
@@ -821,7 +823,7 @@ mod tests {
             .submit(f.uri.clone(), LifecycleAction::Archive)
             .await
             .unwrap();
-        let result = f.executor.run_pending().await.pop().unwrap();
+        let result = f.executor.run_pending().await.unwrap().pop().unwrap();
         assert_eq!(result.state, LifecycleJobState::Retryable);
         assert!(result.checkpoint.manifest);
         assert!(!result.checkpoint.vector);
@@ -851,11 +853,11 @@ mod tests {
             .submit(f.uri.clone(), LifecycleAction::Archive)
             .await
             .unwrap();
-        let failed = f.executor.run_pending().await.pop().unwrap();
+        let failed = f.executor.run_pending().await.unwrap().pop().unwrap();
         let mut due = failed;
         due.next_attempt_at = Utc::now() - chrono::Duration::seconds(1);
         f.journal.update(due).await.unwrap();
-        let retried = f.executor.run_pending().await.pop().unwrap();
+        let retried = f.executor.run_pending().await.unwrap().pop().unwrap();
         assert_eq!(retried.state, LifecycleJobState::Succeeded);
         assert_eq!(retried.attempts, 2);
         assert!(retried.checkpoint.blobs);
@@ -881,7 +883,7 @@ mod tests {
             cold,
             "memory",
         );
-        let recovered = executor.run_pending().await;
+        let recovered = executor.run_pending().await.unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].id, submitted.id);
         assert_eq!(recovered[0].state, LifecycleJobState::Succeeded);
@@ -903,7 +905,7 @@ mod tests {
             .submit(f.uri.clone(), LifecycleAction::Delete)
             .await
             .unwrap();
-        let completed = f.executor.run_pending().await.pop().unwrap();
+        let completed = f.executor.run_pending().await.unwrap().pop().unwrap();
         assert_eq!(completed.state, LifecycleJobState::Succeeded);
         assert!(!f.ports.contains_entry(&f.uri).await);
         assert!(!f.ports.contains_blob(&f.blob).await);

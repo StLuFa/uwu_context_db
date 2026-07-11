@@ -3,6 +3,7 @@
 //! 这里负责把 CDT 训练中的成功轨迹、偏好对和认知 metric 转成可复用 demo，
 //! 再通过优化器流水线调整训练配置，形成“评估 → bootstrap → optimize”的闭环。
 
+use crate::config::BootstrapConfig;
 use crate::{CognitiveMetric, CognitivePreferencePair, TrainingConfig, TrajectorySummary};
 use agent_context_db_core::Result;
 
@@ -38,16 +39,12 @@ pub struct OptimizerRunReport {
 }
 
 impl CognitiveBootstrap {
-    pub fn new(threshold: f32) -> Self {
-        Self {
-            metric_threshold: threshold.clamp(0.0, 1.0),
-            max_demos: 5,
-        }
-    }
-
-    pub fn with_max_demos(mut self, max_demos: usize) -> Self {
-        self.max_demos = max_demos.max(1);
-        self
+    pub fn new(config: BootstrapConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            metric_threshold: config.metric_threshold,
+            max_demos: config.max_demos,
+        })
     }
 
     pub fn extract_demos(&self, metrics: &[(String, CognitiveMetric)]) -> Vec<Demo> {
@@ -273,7 +270,9 @@ mod tests {
             },
         }];
 
-        let report = CognitiveBootstrap::new(0.5).extract_from_preferences(&pairs);
+        let report = CognitiveBootstrap::new(BootstrapConfig::default())
+            .unwrap()
+            .extract_from_preferences(&pairs);
         assert_eq!(report.candidates_seen, 1);
         assert_eq!(report.demos.len(), 1);
         assert_eq!(report.demos[0].source_task_id.as_deref(), Some("good"));
@@ -288,7 +287,8 @@ mod tests {
             gradient_batch_size: 10,
             ..Default::default()
         };
-        let demos = CognitiveBootstrap::new(0.5)
+        let demos = CognitiveBootstrap::new(BootstrapConfig::default())
+            .unwrap()
             .extract_from_trajectories(&[trajectory("demo", true, 0.95)])
             .demos;
         let pipeline = OptimizerPipeline::new()

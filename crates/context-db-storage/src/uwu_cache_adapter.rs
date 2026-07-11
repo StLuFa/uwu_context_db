@@ -52,11 +52,24 @@ impl UwuCacheAdapter {
 impl ReadCache for UwuCacheAdapter {
     async fn get(&self, uri: &ContextUri, level: ContentLevel) -> Option<Option<ContentPayload>> {
         let key = self.key(uri, level);
-        let data = self.inner.get(&key).await.ok()??;
+        let data = match self.inner.get(&key).await {
+            Ok(Some(data)) => data,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, %key, "read cache get failed");
+                return None;
+            }
+        };
         if data.as_slice() == NEG_MARKER {
             return Some(None); // 负缓存命中
         }
-        Some(serde_json::from_slice(&data).ok())
+        match serde_json::from_slice(&data) {
+            Ok(payload) => Some(Some(payload)),
+            Err(error) => {
+                tracing::warn!(%error, %key, "read cache payload is corrupt; treating as miss");
+                None
+            }
+        }
     }
 
     async fn put(
@@ -68,23 +81,33 @@ impl ReadCache for UwuCacheAdapter {
     ) {
         let effective = if ttl.is_zero() { self.default_ttl } else { ttl };
         let key = self.key(uri, level);
-        if let Ok(data) = serde_json::to_vec(&payload) {
-            self.inner.set(&key, &data, Some(effective)).await.ok();
+        match serde_json::to_vec(&payload) {
+            Ok(data) => {
+                if let Err(error) = self.inner.set(&key, &data, Some(effective)).await {
+                    tracing::warn!(%error, %key, "read cache put failed");
+                }
+            }
+            Err(error) => tracing::warn!(%error, %key, "read cache serialization failed"),
         }
     }
 
     async fn put_negative(&self, uri: &ContextUri, level: ContentLevel) {
         let key = self.key(uri, level);
-        self.inner
+        if let Err(error) = self
+            .inner
             .set(&key, NEG_MARKER, Some(self.negative_ttl))
             .await
-            .ok();
+        {
+            tracing::warn!(%error, %key, "negative cache put failed");
+        }
     }
 
     async fn invalidate(&self, uri: &ContextUri) {
         for level in [ContentLevel::L0, ContentLevel::L1, ContentLevel::L2] {
             let key = self.key(uri, level);
-            self.inner.del(&key).await.ok();
+            if let Err(error) = self.inner.del(&key).await {
+                tracing::warn!(%error, %key, "read cache invalidation failed");
+            }
         }
     }
 }

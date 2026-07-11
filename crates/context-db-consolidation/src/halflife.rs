@@ -5,8 +5,8 @@
 
 use crate::quality::QualityRoute;
 use agent_context_db_core::{
-    ConsolidationMeta, ConsolidationStatus, ContentType, ContextEntry, ContextUri, HalfLife,
-    LineageEntry, LlmClient, LlmOpts, MvccVersion, StateScope,
+    ConsolidationMeta, ConsolidationStatus, ContentType, ContextEntry, ContextError, ContextUri,
+    HalfLife, LineageEntry, LlmClient, LlmOpts, MvccVersion, StateScope,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -282,6 +282,40 @@ pub struct SpacedRepetitionConfig {
     pub default_stability_days: f64,
 }
 
+impl SpacedRepetitionConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        for (name, value) in [
+            ("due_threshold", self.due_threshold),
+            ("revalidate_threshold", self.revalidate_threshold),
+            ("forget_threshold", self.forget_threshold),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(crate::ConfigError(format!(
+                    "{name} must be finite and nonnegative"
+                )));
+            }
+        }
+        if !(self.due_threshold <= self.revalidate_threshold
+            && self.revalidate_threshold <= self.forget_threshold)
+        {
+            return Err(crate::ConfigError(
+                "review thresholds must be ordered due <= revalidate <= forget".into(),
+            ));
+        }
+        if self.max_tasks == 0
+            || !self.default_half_life_days.is_finite()
+            || self.default_half_life_days <= 0.0
+            || !self.default_stability_days.is_finite()
+            || self.default_stability_days <= 0.0
+        {
+            return Err(crate::ConfigError(
+                "review limits and default durations must be finite and positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for SpacedRepetitionConfig {
     fn default() -> Self {
         Self {
@@ -299,15 +333,10 @@ pub struct SpacedRepetitionScheduler {
     config: SpacedRepetitionConfig,
 }
 
-impl Default for SpacedRepetitionScheduler {
-    fn default() -> Self {
-        Self::new(SpacedRepetitionConfig::default())
-    }
-}
-
 impl SpacedRepetitionScheduler {
-    pub fn new(config: SpacedRepetitionConfig) -> Self {
-        Self { config }
+    pub fn new(config: SpacedRepetitionConfig) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     pub fn plan(&self, entries: &[ContextEntry], now: DateTime<Utc>) -> Vec<ReviewTask> {
@@ -330,7 +359,7 @@ impl SpacedRepetitionScheduler {
         entry: &mut ContextEntry,
         task: &ReviewTask,
         now: DateTime<Utc>,
-    ) -> ReviewOutcome {
+    ) -> Result<ReviewOutcome, ContextError> {
         let (next_stability_days, reinforcements) =
             reinforce_on_adoption(task.stability_days, task.reinforcements);
         upsert_review_state(
@@ -341,21 +370,21 @@ impl SpacedRepetitionScheduler {
                 reinforcements,
                 last_reviewed_at: now,
             },
-        );
+        )?;
         entry.updated_at = now;
         entry
             .metadata
             .tags
             .retain(|tag| !tag.starts_with("quality:review:"));
         entry.metadata.tags.push("quality:review:adopted".into());
-        ReviewOutcome {
+        Ok(ReviewOutcome {
             uri: entry.uri.clone(),
             action: ReviewAction::Rehearse,
             route: QualityRoute::Rehearse,
             next_stability_days,
             reinforcements,
             tags: entry.metadata.tags.clone(),
-        }
+        })
     }
 
     fn task_for_entry(&self, entry: &ContextEntry, now: DateTime<Utc>) -> Option<ReviewTask> {
@@ -449,8 +478,14 @@ pub fn review_state(entry: &ContextEntry) -> Option<ReviewMemoryState> {
     entry.metadata.custom_field("spaced_repetition")
 }
 
-pub fn upsert_review_state(entry: &mut ContextEntry, state: ReviewMemoryState) {
-    let _ = entry.metadata.set_custom_field("spaced_repetition", &state);
+pub fn upsert_review_state(
+    entry: &mut ContextEntry,
+    state: ReviewMemoryState,
+) -> Result<(), ContextError> {
+    entry
+        .metadata
+        .set_custom_field("spaced_repetition", &state)
+        .map_err(ContextError::Serialization)?;
     let meta = entry
         .metadata
         .consolidation
@@ -474,6 +509,7 @@ pub fn upsert_review_state(entry: &mut ContextEntry, state: ReviewMemoryState) {
             state.stability_days, state.reinforcements
         ),
     });
+    Ok(())
 }
 
 // ===========================================================================
@@ -507,14 +543,17 @@ mod tests {
         entry.metadata.state_scope = Some(StateScope::Long);
         entry.metadata.quality_score = Some(quality);
         entry.updated_at = now - Duration::days(age_days);
-        upsert_review_state(
-            &mut entry,
-            ReviewMemoryState {
-                half_life_days,
-                stability_days: half_life_days,
-                reinforcements: 1,
-                last_reviewed_at: now - Duration::days(age_days),
-            },
+        assert!(
+            upsert_review_state(
+                &mut entry,
+                ReviewMemoryState {
+                    half_life_days,
+                    stability_days: half_life_days,
+                    reinforcements: 1,
+                    last_reviewed_at: now - Duration::days(age_days),
+                },
+            )
+            .is_ok()
         );
         entry
     }
@@ -544,7 +583,8 @@ mod tests {
         let mut entry = long_entry(10_000, 1.0, 0.1);
         entry.metadata.consolidation.as_mut().unwrap().half_life = Some(HalfLife::Infinite);
         assert!(
-            SpacedRepetitionScheduler::default()
+            SpacedRepetitionScheduler::new(SpacedRepetitionConfig::default())
+                .unwrap()
                 .plan(&[entry], now)
                 .is_empty()
         );
@@ -553,7 +593,7 @@ mod tests {
     #[test]
     fn scheduler_orders_due_reviews_and_routes_revalidate() {
         let now = Utc::now();
-        let scheduler = SpacedRepetitionScheduler::default();
+        let scheduler = SpacedRepetitionScheduler::new(SpacedRepetitionConfig::default()).unwrap();
         let entries = vec![long_entry(45, 30.0, 0.7), long_entry(5, 30.0, 0.8)];
 
         let tasks = scheduler.plan(&entries, now);
@@ -565,13 +605,13 @@ mod tests {
     }
 
     #[test]
-    fn adoption_extends_stability_and_records_state() {
+    fn adoption_extends_stability_and_records_state() -> Result<(), ContextError> {
         let now = Utc::now();
-        let scheduler = SpacedRepetitionScheduler::default();
+        let scheduler = SpacedRepetitionScheduler::new(SpacedRepetitionConfig::default()).unwrap();
         let mut entry = long_entry(29, 30.0, 0.8);
         let task = scheduler.plan(&[entry.clone()], now).remove(0);
 
-        let outcome = scheduler.apply_adoption(&mut entry, &task, now);
+        let outcome = scheduler.apply_adoption(&mut entry, &task, now)?;
         let state = review_state(&entry).unwrap();
 
         assert_eq!(outcome.route, QualityRoute::Rehearse);
@@ -583,12 +623,13 @@ mod tests {
                 .tags
                 .contains(&"quality:review:adopted".to_string())
         );
+        Ok(())
     }
 
     #[test]
     fn low_quality_overdue_memory_becomes_forget_candidate() {
         let now = Utc::now();
-        let scheduler = SpacedRepetitionScheduler::default();
+        let scheduler = SpacedRepetitionScheduler::new(SpacedRepetitionConfig::default()).unwrap();
         let entries = vec![long_entry(90, 30.0, 0.2)];
 
         let tasks = scheduler.plan(&entries, now);

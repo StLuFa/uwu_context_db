@@ -1,6 +1,6 @@
 //! Write-path security helpers shared by storage adapters.
 
-use crate::{ContentPart, ContentPayload, ContextEntry};
+use crate::{ContentPart, ContentPayload, ContextEntry, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SensitiveFinding {
@@ -22,20 +22,20 @@ pub fn scan_sensitive_entry(entry: &ContextEntry) -> Vec<SensitiveFinding> {
     findings
 }
 
-pub fn sanitize_entry_for_write(entry: &ContextEntry) -> ContextEntry {
-    redact_sensitive_entry(entry).0
+pub fn sanitize_entry_for_write(entry: &ContextEntry) -> Result<ContextEntry> {
+    Ok(redact_sensitive_entry(entry)?.0)
 }
 
-pub fn redact_sensitive_entry(entry: &ContextEntry) -> (ContextEntry, Vec<SensitiveFinding>) {
+pub fn redact_sensitive_entry(
+    entry: &ContextEntry,
+) -> Result<(ContextEntry, Vec<SensitiveFinding>)> {
     let mut redacted = entry.clone();
     let mut findings = Vec::new();
     redact_payload(&mut redacted.payload, &mut findings);
     if !findings.is_empty() {
-        let _ = redacted
-            .metadata
-            .set_custom_field("security_redactions", &findings_to_json(&findings));
+        set_security_redactions(&mut redacted, &findings_to_json(&findings))?;
     }
-    (redacted, findings)
+    Ok((redacted, findings))
 }
 
 fn scan_payload(payload: &ContentPayload, findings: &mut Vec<SensitiveFinding>) {
@@ -45,19 +45,19 @@ fn scan_payload(payload: &ContentPayload, findings: &mut Vec<SensitiveFinding>) 
             dense,
             full,
         } => {
-            let _ = redact_text(sparse, findings);
-            let _ = redact_text(dense, findings);
-            let _ = redact_text(full, findings);
+            drop(redact_text(sparse, findings));
+            drop(redact_text(dense, findings));
+            drop(redact_text(full, findings));
         }
         ContentPayload::Audio { transcript, .. } => {
-            let _ = redact_text(transcript, findings);
+            drop(redact_text(transcript, findings));
         }
         ContentPayload::Structured { summary, data, .. } => {
-            let _ = redact_text(summary, findings);
+            drop(redact_text(summary, findings));
             scan_json(data, findings);
         }
         ContentPayload::Composite { summary, parts } => {
-            let _ = redact_text(summary, findings);
+            drop(redact_text(summary, findings));
             for part in parts {
                 match part {
                     ContentPart::Text(payload)
@@ -74,7 +74,7 @@ fn scan_payload(payload: &ContentPayload, findings: &mut Vec<SensitiveFinding>) 
 fn scan_json(value: &serde_json::Value, findings: &mut Vec<SensitiveFinding>) {
     match value {
         serde_json::Value::String(s) => {
-            let _ = redact_text(s, findings);
+            drop(redact_text(s, findings));
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -226,6 +226,13 @@ fn push_finding(findings: &mut Vec<SensitiveFinding>, kind: SensitiveKind) {
     }
 }
 
+fn set_security_redactions<T: serde::Serialize>(entry: &mut ContextEntry, value: &T) -> Result<()> {
+    entry
+        .metadata
+        .set_custom_field("security_redactions", value)
+        .map_err(Into::into)
+}
+
 fn findings_to_json(findings: &[SensitiveFinding]) -> Vec<serde_json::Value> {
     findings
         .iter()
@@ -244,7 +251,7 @@ mod tests {
     use crate::{ContentPayload, ContextUri, TenantId};
 
     #[test]
-    fn sanitize_entry_redacts_all_text_levels() {
+    fn sanitize_entry_redacts_all_text_levels() -> Result<()> {
         let mut entry = ContextEntry::new_text(
             ContextUri::parse("uwu://t/agent/a/memories/evidence/e1").unwrap(),
             TenantId(uuid::Uuid::nil()),
@@ -256,7 +263,7 @@ mod tests {
             full: "token sk-secret12345678901234567890".into(),
         };
 
-        let sanitized = sanitize_entry_for_write(&entry);
+        let sanitized = sanitize_entry_for_write(&entry)?;
         let ContentPayload::Text {
             sparse,
             dense,
@@ -275,5 +282,6 @@ mod tests {
                 .get("security_redactions")
                 .is_some()
         );
+        Ok(())
     }
 }

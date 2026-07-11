@@ -20,6 +20,7 @@ use uuid::Uuid;
 use std::sync::Arc;
 use uwu_database::DbPool;
 
+use crate::graph::{GraphCentralityConfig, pagerank_score};
 use crate::outbox::{
     IndexMutation, collection_from_entry, enqueue_pg, point_from_entry, upsert_mutation,
 };
@@ -31,21 +32,26 @@ use crate::outbox::{
 /// PG 适配器：持有 `DbPool` + 可选内容缓存。
 #[derive(Clone)]
 pub struct PgContextStore {
-    pool: Arc<DbPool>,
+    pool: sqlx::PgPool,
     /// 可选的 L0/L1 读取缓存（通过 UwuCacheAdapter 桥接 uwu_database::Cache）。
     read_cache: Option<Arc<dyn agent_context_db_core::ReadCache>>,
+    centrality_config: GraphCentralityConfig,
 }
 
 impl PgContextStore {
     /// C.3: 构造时验证后端类型，避免运行时 expect panic。
-    pub fn new(pool: Arc<DbPool>) -> Self {
-        let _ = pool
+    pub fn new(pool: Arc<DbPool>, centrality_config: GraphCentralityConfig) -> Result<Self> {
+        let pool = pool
             .as_postgres()
-            .expect("PgContextStore requires postgres backend");
-        Self {
+            .map_err(|error| {
+                ContextError::Storage(format!("PgContextStore requires postgres backend: {error}"))
+            })?
+            .clone();
+        Ok(Self {
             pool,
             read_cache: None,
-        }
+            centrality_config,
+        })
     }
 
     /// 注入读取缓存（使用 uwu_database::Cache 或任意 ReadCache 实现）。
@@ -55,9 +61,7 @@ impl PgContextStore {
     }
 
     fn pg_pool(&self) -> &sqlx::PgPool {
-        self.pool
-            .as_postgres()
-            .expect("PgContextStore: backend validated at construction")
+        &self.pool
     }
 
     /// I.3: 统一 map_err 辅助 —— 记录 tracing::error! 并返回 `ContextError::Storage`。
@@ -93,7 +97,7 @@ impl PgContextStore {
         if has_more {
             items.truncate(limit);
         }
-        let next_cursor = has_more.then(|| cursor(items.last().expect("non-empty limited page")));
+        let next_cursor = has_more.then(|| items.last().map(&cursor)).flatten();
         Page::new(items, next_cursor)
     }
 
@@ -102,7 +106,7 @@ impl PgContextStore {
         input: &ContextEntry,
     ) -> Result<MvccVersion> {
         input.validate_tenant_binding()?;
-        let mut entry = sanitize_entry_for_write(input);
+        let mut entry = sanitize_entry_for_write(input)?;
         let uri = entry.uri.to_string();
         let (l0, l1, _) = extract_payload_levels(&entry.payload);
         let content_type = entry
@@ -196,19 +200,8 @@ impl PgContextStore {
 
 /// 从 ContentPayload 提取各层文本（L0/L1/L2）。
 fn extract_payload_levels(payload: &ContentPayload) -> (String, Option<String>, String) {
-    match payload {
-        ContentPayload::Text {
-            sparse,
-            dense,
-            full,
-        } => (sparse.clone(), Some(dense.clone()), full.clone()),
-        ContentPayload::Image { .. } => ("[image]".to_string(), None, String::new()),
-        ContentPayload::Audio { transcript, .. } => (transcript.clone(), None, transcript.clone()),
-        ContentPayload::Structured { summary, data, .. } => {
-            (summary.clone(), Some(data.to_string()), String::new())
-        }
-        ContentPayload::Composite { summary, .. } => (summary.clone(), None, String::new()),
-    }
+    let projection = payload.index_projection();
+    (projection.l0, projection.l1, projection.l2)
 }
 
 fn validate_blob_ref(
@@ -506,11 +499,11 @@ impl Default for PgStoreConfig {
 }
 
 impl PgStoreConfig {
-    pub fn from_uwu_config(cfg: &agent_context_db_core::config::StorageConfig) -> Self {
-        Self {
-            max_connections: cfg.max_connections as u32,
+    pub fn from_uwu_config(cfg: &agent_context_db_core::config::StorageConfig) -> Result<Self> {
+        Ok(Self {
+            max_connections: crate::max_connections(cfg)?,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -674,8 +667,7 @@ impl FsOps for PgContextStore {
         .map_err(|e| Self::storage_err("tree", e))?;
         let has_more = rows.len() > page.effective_limit();
         let selected = &rows[..rows.len().min(page.effective_limit())];
-        let next_cursor =
-            has_more.then(|| selected.last().expect("non-empty limited page").clone());
+        let next_cursor = has_more.then(|| selected.last().cloned()).flatten();
         Ok(Page::new(
             vec![TreeNode {
                 uri: root.clone(),
@@ -1075,7 +1067,7 @@ impl GraphStore for PgContextStore {
         Ok(())
     }
 
-    async fn neighbors(
+    async fn outgoing_neighbors(
         &self,
         uri: &ContextUri,
         kind: Option<GraphRelation>,
@@ -1083,33 +1075,33 @@ impl GraphStore for PgContextStore {
         let pg = self.pg_pool();
         let uri_str = uri.to_string();
         let rows: Vec<String> = if let Some(k) = kind {
-            sqlx::query_scalar(
-                "SELECT DISTINCT to_uri FROM context_relations
-                 WHERE from_uri = $1 AND relation_kind = $2
-                 UNION
-                 SELECT DISTINCT from_uri FROM context_relations
-                 WHERE to_uri = $1 AND relation_kind = $2",
-            )
-            .bind(&uri_str)
-            .bind(format!("{:?}", k))
-            .fetch_all(pg)
-            .await
-            .map_err(|e| Self::storage_err("neighbors", e))?
+            sqlx::query_scalar("SELECT DISTINCT to_uri FROM context_relations WHERE from_uri = $1 AND relation_kind = $2 ORDER BY to_uri")
+                .bind(&uri_str).bind(format!("{:?}", k)).fetch_all(pg).await
         } else {
-            sqlx::query_scalar(
-                "SELECT DISTINCT to_uri FROM context_relations WHERE from_uri = $1
-                 UNION
-                 SELECT DISTINCT from_uri FROM context_relations WHERE to_uri = $1",
-            )
-            .bind(&uri_str)
-            .fetch_all(pg)
-            .await
-            .map_err(|e| Self::storage_err("neighbors", e))?
-        };
-        Ok(rows
-            .into_iter()
+            sqlx::query_scalar("SELECT DISTINCT to_uri FROM context_relations WHERE from_uri = $1 ORDER BY to_uri")
+                .bind(&uri_str).fetch_all(pg).await
+        }.map_err(|e| Self::storage_err("outgoing neighbors", e))?;
+        rows.into_iter()
             .map(ContextUri::parse)
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .collect::<std::result::Result<_, _>>()
+    }
+
+    async fn incoming_neighbors(
+        &self,
+        uri: &ContextUri,
+        kind: Option<GraphRelation>,
+    ) -> Result<Vec<ContextUri>> {
+        let pg = self.pg_pool();
+        let rows: Vec<String> = if let Some(k) = kind {
+            sqlx::query_scalar("SELECT DISTINCT from_uri FROM context_relations WHERE to_uri = $1 AND relation_kind = $2 ORDER BY from_uri")
+                .bind(uri.to_string()).bind(format!("{:?}", k)).fetch_all(pg).await
+        } else {
+            sqlx::query_scalar("SELECT DISTINCT from_uri FROM context_relations WHERE to_uri = $1 ORDER BY from_uri")
+                .bind(uri.to_string()).fetch_all(pg).await
+        }.map_err(|e| Self::storage_err("incoming neighbors", e))?;
+        rows.into_iter()
+            .map(ContextUri::parse)
+            .collect::<std::result::Result<_, _>>()
     }
 
     async fn batch_traverse(
@@ -1129,7 +1121,7 @@ impl GraphStore for PgContextStore {
                     continue;
                 }
                 for kind in kinds {
-                    let edges = self.neighbors(uri, Some(*kind)).await?;
+                    let edges = self.outgoing_neighbors(uri, Some(*kind)).await?;
                     for edge in &edges {
                         results.push((uri.clone(), edge.clone(), *kind));
                         next_frontier.push(edge.clone());
@@ -1145,19 +1137,14 @@ impl GraphStore for PgContextStore {
     }
 
     async fn centrality(&self, uri: &ContextUri) -> Result<f32> {
-        const MAX_NODES: usize = 256;
-        const MAX_HOPS: usize = 3;
-        const MAX_ITERS: usize = 32;
-        const EPSILON: f32 = 1e-5;
-        const DAMPING: f32 = 0.85;
-
+        let config = self.centrality_config;
         let pg = self.pg_pool();
         let mut nodes = std::collections::BTreeSet::new();
         let mut frontier = vec![uri.to_string()];
         nodes.insert(uri.to_string());
 
-        for _ in 0..MAX_HOPS {
-            if frontier.is_empty() || nodes.len() >= MAX_NODES {
+        for _ in 0..config.max_hops() {
+            if frontier.is_empty() || nodes.len() >= config.max_nodes() {
                 break;
             }
             let rows: Vec<String> = sqlx::query_scalar(
@@ -1172,7 +1159,7 @@ impl GraphStore for PgContextStore {
 
             frontier.clear();
             for node in rows {
-                if nodes.len() >= MAX_NODES {
+                if nodes.len() >= config.max_nodes() {
                     break;
                 }
                 if nodes.insert(node.clone()) {
@@ -1198,64 +1185,22 @@ impl GraphStore for PgContextStore {
         .await
         .map_err(|e| Self::storage_err("centrality.edges", e))?;
 
-        let mut outgoing: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for row in rows {
-            let from = row.try_get::<String, _>("from_uri").unwrap_or_default();
-            let to = row.try_get::<String, _>("to_uri").unwrap_or_default();
-            if node_set.contains(&from) && node_set.contains(&to) {
-                outgoing.entry(from).or_default().push(to);
-            }
-        }
-
-        let n = node_list.len() as f32;
-        let base = (1.0 - DAMPING) / n;
-        let mut ranks = node_list
-            .iter()
-            .map(|node| (node.clone(), 1.0 / n))
-            .collect::<std::collections::HashMap<_, _>>();
-
-        for _ in 0..MAX_ITERS {
-            let dangling_mass = node_list
-                .iter()
-                .filter(|node| outgoing.get(*node).is_none_or(Vec::is_empty))
-                .map(|node| ranks.get(node).copied().unwrap_or(0.0))
-                .sum::<f32>()
-                / n;
-            let mut next = node_list
-                .iter()
-                .map(|node| (node.clone(), base + DAMPING * dangling_mass))
-                .collect::<std::collections::HashMap<_, _>>();
-
-            for (from, targets) in &outgoing {
-                if targets.is_empty() {
-                    continue;
-                }
-                let contribution =
-                    DAMPING * ranks.get(from).copied().unwrap_or(0.0) / targets.len() as f32;
-                for target in targets {
-                    if let Some(value) = next.get_mut(target) {
-                        *value += contribution;
-                    }
-                }
-            }
-
-            let delta = node_list
-                .iter()
-                .map(|node| {
-                    (next.get(node).copied().unwrap_or(0.0)
-                        - ranks.get(node).copied().unwrap_or(0.0))
-                    .abs()
-                })
-                .sum::<f32>();
-            ranks = next;
-            if delta < EPSILON {
-                break;
-            }
-        }
-
-        let raw = ranks.get(uri.as_str()).copied().unwrap_or(0.0);
-        Ok((raw * n).clamp(0.0, 1.0))
+        let edges = rows
+            .into_iter()
+            .map(|row| {
+                let from = row
+                    .try_get::<String, _>("from_uri")
+                    .map_err(|e| Self::storage_err("centrality.edges.from_uri", e))?;
+                let to = row
+                    .try_get::<String, _>("to_uri")
+                    .map_err(|e| Self::storage_err("centrality.edges.to_uri", e))?;
+                Ok((from, to))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(from, to)| node_set.contains(from) && node_set.contains(to))
+            .collect::<Vec<_>>();
+        Ok(pagerank_score(uri.as_str(), &node_list, &edges, config))
     }
 }
 
@@ -1324,14 +1269,14 @@ pub struct AclPgEngine {
 }
 
 impl AclPgEngine {
-    pub fn from_pool(pool: Arc<DbPool>, acl: Arc<PathAcl>, principal: Principal) -> Self {
-        let raw_store = Arc::new(PgContextStore::new(pool));
+    pub fn from_pool(pool: Arc<DbPool>, acl: Arc<PathAcl>, principal: Principal) -> Result<Self> {
+        let raw_store = Arc::new(PgContextStore::new(pool, GraphCentralityConfig::default())?);
         let store = Arc::new(AclProtectedStore::new(
             raw_store.as_ref().clone(),
             acl,
             principal,
         ));
-        Self { store, raw_store }
+        Ok(Self { store, raw_store })
     }
 }
 
@@ -1397,11 +1342,9 @@ fn build_tree_level(
         if rest.is_empty() {
             continue;
         }
-        let slash_pos = rest.find('/');
-        let (name, is_dir) = if let Some(pos) = slash_pos {
-            (&rest[..pos], true)
-        } else {
-            (rest, false)
+        let (name, is_dir) = match rest.split_once('/') {
+            Some((name, _)) => (name, true),
+            None => (rest, false),
         };
         if name.is_empty() {
             continue;
@@ -1463,16 +1406,12 @@ mod pg_tests {
         std::env::var("DATABASE_URL").ok()
     }
 
-    fn require_pg() -> String {
-        pg_url().expect("SKIP: DATABASE_URL not set")
-    }
-
-    fn test_cfg() -> RuntimeConfig {
+    fn test_cfg(url: String) -> RuntimeConfig {
         RuntimeConfig {
             deploy: DeployConfig::default(),
             database: DbConfig {
                 backend: SqlBackend::Postgres,
-                url: pg_url().unwrap(),
+                url,
                 max_connections: 2,
                 min_connections: 0,
                 acquire_timeout_secs: 5,
@@ -1495,9 +1434,8 @@ mod pg_tests {
         }
     }
 
-    async fn setup_store() -> PgContextStore {
-        let _url = require_pg();
-        let cfg = test_cfg();
+    async fn setup_store(url: String) -> PgContextStore {
+        let cfg = test_cfg(url);
         let pool = sql::build_pool(&cfg.database).await.unwrap();
         let arc_pool = Arc::new(pool);
 
@@ -1544,7 +1482,8 @@ mod pg_tests {
             .await
             .unwrap();
 
-        PgContextStore::new(arc_pool)
+        PgContextStore::new(arc_pool, GraphCentralityConfig::default())
+            .unwrap_or_else(|error| panic!("test postgres store construction failed: {error}"))
     }
 
     fn ctx_uri(path: &str) -> ContextUri {
@@ -1563,7 +1502,8 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_write_and_read_l0() {
-        let store = setup_store().await;
+        let Some(url) = pg_url() else { return };
+        let store = setup_store(url).await;
         let t = tenant();
         let uri = ctx_uri("mem/cases/c1");
         let e = entry(&uri, t, "hello world");
@@ -1579,7 +1519,8 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_write_updates_existing() {
-        let store = setup_store().await;
+        let Some(url) = pg_url() else { return };
+        let store = setup_store(url).await;
         let t = tenant();
         let uri = ctx_uri("mem/skills/s1");
 
@@ -1599,7 +1540,8 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_write_with_all_fields() {
-        let store = setup_store().await;
+        let Some(url) = pg_url() else { return };
+        let store = setup_store(url).await;
         let t = tenant();
         let uri = ctx_uri("full/entry");
         let now = chrono::Utc::now();
@@ -1646,7 +1588,8 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_delete_entry() {
-        let store = setup_store().await;
+        let Some(url) = pg_url() else { return };
+        let store = setup_store(url).await;
         let t = tenant();
         let uri = ctx_uri("tmp/to_delete");
 
@@ -1661,7 +1604,8 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_delete_nonexistent_returns_not_found() {
-        let store = setup_store().await;
+        let Some(url) = pg_url() else { return };
+        let store = setup_store(url).await;
         let uri = ctx_uri("nonexistent/xyz");
         let r = ContentRepo::delete(&store, &uri).await;
         assert!(r.is_err());
@@ -1671,7 +1615,8 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_rename_entry() {
-        let store = setup_store().await;
+        let Some(url) = pg_url() else { return };
+        let store = setup_store(url).await;
         let t = tenant();
         let from = ctx_uri("old/name");
         let to = ctx_uri("new/name");
@@ -1698,7 +1643,8 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_rename_nonexistent_returns_not_found() {
-        let store = setup_store().await;
+        let Some(url) = pg_url() else { return };
+        let store = setup_store(url).await;
         let r = agent_context_db_core::ContentRepo::rename(
             &store,
             &ctx_uri("ghost/src"),

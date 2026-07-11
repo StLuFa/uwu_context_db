@@ -2,6 +2,7 @@
 //!
 //! CDT Pipeline 阶段 1：从 trajectory 中提取 fact/error/hypothesis/skill/procedure/reflection 六类记忆。
 
+use crate::config::TrajectoryEncodingConfig;
 use agent_context_db_core::{
     ContentPayload, ContentType, ContextEntry, ContextMeta, ContextUri, EpistemicType, MediaType,
     TenantId,
@@ -33,14 +34,19 @@ pub struct TrajectoryEncoding {
 
 /// 轨迹编码器 — 将原始 trajectory 编码为分类的 ContextEntry。
 pub struct TrajectoryEncoder {
-    agent_scope: String,
+    base_uri: ContextUri,
+    config: TrajectoryEncodingConfig,
 }
 
 impl TrajectoryEncoder {
-    pub fn new(agent_scope: impl Into<String>) -> Self {
-        Self {
-            agent_scope: agent_scope.into(),
-        }
+    pub fn new(
+        agent_scope: impl Into<String>,
+        config: TrajectoryEncodingConfig,
+    ) -> agent_context_db_core::Result<Self> {
+        config.validate()?;
+        let agent_scope = agent_scope.into();
+        let base_uri = ContextUri::parse(format!("uwu://{agent_scope}"))?;
+        Ok(Self { base_uri, config })
     }
 
     /// 编码一个轨迹为所有类型的记忆。
@@ -193,7 +199,7 @@ impl TrajectoryEncoder {
         let mut procs = Vec::new();
 
         // 多步骤 → Procedure
-        if traj.steps.len() >= 2 {
+        if traj.steps.len() >= self.config.procedure_min_steps {
             let steps_text = traj
                 .steps
                 .iter()
@@ -248,24 +254,15 @@ impl TrajectoryEncoder {
 
     fn make_uri(&self, ctype: &str, index: usize, content: &str) -> ContextUri {
         let hash = blake3::hash(content.as_bytes()).to_hex();
-        let short = &hash[..8];
-        ContextUri::parse(format!(
-            "uwu://{}/memory/{}/{}/{:02}-{}",
-            self.agent_scope,
+        let short = &hash[..self.config.uri_hash_chars];
+        let segment = format!(
+            "memory/{}/{}/{:02}-{}",
             ctype,
             Utc::now().format("%Y%m%d"),
             index,
             short
-        ))
-        .unwrap_or_else(|_| {
-            ContextUri::parse(format!(
-                "uwu://{}/memory/{}/fallback-{}",
-                self.agent_scope,
-                ctype,
-                Uuid::new_v4()
-            ))
-            .unwrap()
-        })
+        );
+        self.base_uri.join(&segment)
     }
 
     fn text_entry(
@@ -326,7 +323,8 @@ mod tests {
 
     #[test]
     fn success_trajectory_produces_skills() {
-        let encoder = TrajectoryEncoder::new("t/agent-a");
+        let encoder =
+            TrajectoryEncoder::new("t/agent-a", TrajectoryEncodingConfig::default()).unwrap();
         let traj = make_trajectory(true);
         let encoding = encoder.encode(&traj);
 
@@ -341,7 +339,8 @@ mod tests {
 
     #[test]
     fn failure_trajectory_produces_errors() {
-        let encoder = TrajectoryEncoder::new("t/agent-a");
+        let encoder =
+            TrajectoryEncoder::new("t/agent-a", TrajectoryEncodingConfig::default()).unwrap();
         let traj = make_trajectory(false);
         let encoding = encoder.encode(&traj);
 
@@ -356,7 +355,8 @@ mod tests {
 
     #[test]
     fn encode_all_returns_flat_list() {
-        let encoder = TrajectoryEncoder::new("t/agent-a");
+        let encoder =
+            TrajectoryEncoder::new("t/agent-a", TrajectoryEncodingConfig::default()).unwrap();
         let traj = make_trajectory(true);
         let all = encoder.encode_all(&traj);
         assert!(all.len() >= 5); // facts + skills + procedures + hypotheses + reflections

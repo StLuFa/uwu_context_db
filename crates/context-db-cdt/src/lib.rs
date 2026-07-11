@@ -20,6 +20,7 @@
 //! - `multi_perspective` — 多视角巩固
 //! - `hybrid_retrieval` — 三维混合检索
 
+pub mod config;
 pub mod consolidation;
 pub mod curriculum;
 pub mod dpo;
@@ -42,7 +43,7 @@ pub mod voting;
 use agent_context_db_consolidation::{
     ConsolidationProduct, HypothesisOutcome as ProductHypothesisOutcome,
 };
-use agent_context_db_core::{ConsolidationStatus, ContentType, ContextEntry, ContextUri};
+use agent_context_db_core::{ConsolidationStatus, ContentType, ContextEntry, ContextUri, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -390,6 +391,7 @@ mod gradient_gate_tests {
             content: "tested claim".into(),
             quality_score: 0.9,
             confidence: 0.8,
+            evidence_required: false,
             superseded_claim: None,
             evidence_uris: vec![
                 ContextUri::parse("uwu://tenant/agent/a/memory/evidence/e1").unwrap(),
@@ -660,7 +662,7 @@ pub fn feedback_evaluation_to_memories(
     eval: &EvalResult,
     agent_scope: &str,
     tenant: agent_context_db_core::TenantId,
-) -> Vec<ContextEntry> {
+) -> agent_context_db_core::Result<Vec<ContextEntry>> {
     let mut entries = Vec::new();
 
     // 成功 case → Skill 记忆
@@ -670,10 +672,7 @@ pub fn feedback_evaluation_to_memories(
             agent_scope,
             eval.epoch,
             success.skill_extracted.len()
-        ))
-        .unwrap_or_else(|_| {
-            ContextUri::parse(format!("uwu://{}/memory/skill/fallback", agent_scope)).unwrap()
-        });
+        ))?;
 
         let entry = ContextEntry::new_text(uri, tenant, &success.skill_extracted);
         entries.push(entry);
@@ -686,16 +685,13 @@ pub fn feedback_evaluation_to_memories(
             agent_scope,
             eval.epoch,
             failure.description.len()
-        ))
-        .unwrap_or_else(|_| {
-            ContextUri::parse(format!("uwu://{}/memory/error/fallback", agent_scope)).unwrap()
-        });
+        ))?;
 
         let entry = ContextEntry::new_text(uri, tenant, &failure.analysis);
         entries.push(entry);
     }
 
-    entries
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -722,7 +718,7 @@ mod feedback_memory_tests {
                 root_cause_contradiction: None,
             }],
         };
-        let entries = feedback_evaluation_to_memories(&eval, "tenant/agent/a", tenant);
+        let entries = feedback_evaluation_to_memories(&eval, "tenant/agent/a", tenant).unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.tenant == tenant));
     }
@@ -789,8 +785,11 @@ pub struct PolicyGate {
 }
 
 impl PolicyGate {
-    pub fn new(threshold: f32) -> Self {
-        Self { threshold }
+    pub fn new(config: config::PolicyGateConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            threshold: config.threshold,
+        })
     }
 
     pub fn should_replace(&self, new_wins: usize, total: usize, avg_delta: f32) -> GateDecision {

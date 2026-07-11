@@ -67,10 +67,10 @@ pub use llm::{
 };
 pub use lsh::LshIndex;
 pub use model::{
-    BlobRef, ConsolidationMeta, ConsolidationStatus, ContentHash, ContentLevel, ContentPart,
-    ContentPayload, ContentType, ContextDiff, ContextEntry, ContextMeta, DecodedContent,
-    DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit, HalfLife,
-    LineageEntry, MediaType, MvccVersion, SchemaRef, StateScope, TenantId, TreeNode,
+    BlobRef, ConsolidationMeta, ConsolidationStatus, ContentHash, ContentIndexProjection,
+    ContentLevel, ContentPart, ContentPayload, ContentType, ContextDiff, ContextEntry, ContextMeta,
+    DecodedContent, DerivationChain, DerivationRule, DirEntry, EpistemicType, FindPattern, GrepHit,
+    HalfLife, LineageEntry, MediaType, MvccVersion, SchemaRef, StateScope, TenantId, TreeNode,
     ValidityRecord, VersionEntry,
 };
 pub use observability::{
@@ -88,8 +88,8 @@ pub use prompt::{
 };
 pub use read_cache::{MemoryReadCache, ReadCache};
 pub use similarity::{
-    Cluster, CrossAgentDedup, DedupRecommendation, KnowledgeNetwork, LocalKnowledgeNetwork,
-    SimilarityResult, VectorSimilarity,
+    Cluster, CrossAgentDedup, CrossAgentSimilarityConfig, DedupRecommendation, KnowledgeNetwork,
+    LocalKnowledgeNetwork, LocalKnowledgeNetworkConfig, SimilarityResult, VectorSimilarity,
 };
 pub use store::{
     BlobStore, BrowsingOps, ContentRepo, ContentStore, ContextStore, FsOps, GraphRelation,
@@ -97,7 +97,7 @@ pub use store::{
 };
 pub use tokenizer::{count_tokens, count_tokens_with_floor};
 pub use uri::{AsOfTime, ContextUri, QueryParams, SCHEME, UriCategory};
-pub use vector::{IndexHit, IndexPoint, VectorIndex};
+pub use vector::{IndexHit, IndexPoint, IndexVector, VectorIndex};
 pub use watch::{
     ChangeEvent, ChangeKind, WatchCheckpoint, WatchHub, WatchOptions, WatchSource, WatchStream,
     WatchableStore,

@@ -65,30 +65,40 @@ impl InheritanceChain {
 
     /// 解析一个 URI 在继承链中的有效来源。
     /// 返回 (有效的条目 URI, 是否来自父级)。
-    pub fn resolve(&self, uri: &ContextUri, agent_id: &str) -> Option<(ContextUri, bool)> {
+    pub fn resolve(
+        &self,
+        uri: &ContextUri,
+        agent_id: &str,
+    ) -> crate::Result<Option<(ContextUri, bool)>> {
         let nodes = self.nodes.lock();
-        let node = nodes.iter().find(|n| n.agent_id == agent_id)?;
+        let Some(node) = nodes.iter().find(|n| n.agent_id == agent_id) else {
+            return Ok(None);
+        };
 
         // 先查自己的覆盖
         for (pattern, rule) in &node.overrides {
             if uri.to_string().starts_with(pattern) {
                 return match rule.action {
-                    OverrideAction::Replace => Some((uri.clone(), false)),
-                    OverrideAction::Hide => None,
-                    OverrideAction::Merge | OverrideAction::Append => Some((uri.clone(), false)),
+                    OverrideAction::Replace => Ok(Some((uri.clone(), false))),
+                    OverrideAction::Hide => Ok(None),
+                    OverrideAction::Merge | OverrideAction::Append => {
+                        Ok(Some((uri.clone(), false)))
+                    }
                 };
             }
         }
 
         // 查父级
         if let Some(ref parent_id) = node.parent {
-            let parent_node = nodes.iter().find(|n| &n.agent_id == parent_id)?;
-            let mapped = uri
-                .to_string()
-                .replace(node.scope.as_str(), parent_node.scope.as_str());
-            Some((ContextUri::parse(mapped).unwrap(), true))
+            let Some(parent_node) = nodes.iter().find(|n| &n.agent_id == parent_id) else {
+                return Ok(None);
+            };
+            let mapped =
+                uri.to_string()
+                    .replacen(node.scope.as_str(), parent_node.scope.as_str(), 1);
+            Ok(Some((ContextUri::parse(mapped)?, true)))
         } else {
-            Some((uri.clone(), false))
+            Ok(Some((uri.clone(), false)))
         }
     }
 
@@ -140,7 +150,7 @@ impl TemplateEngine {
         template: &ContextTemplate,
         variables: &HashMap<String, String>,
         scope: &ContextUri,
-    ) -> Vec<ContextEntry> {
+    ) -> crate::Result<Vec<ContextEntry>> {
         let mut entries = Vec::new();
         let mut vars = template.defaults.clone();
         for (k, v) in variables {
@@ -152,14 +162,14 @@ impl TemplateEngine {
             let abstract_ = TemplateEngine::interpolate(&tpl.abstract_template, &vars);
 
             let full_uri = format!("{}/{}", scope, uri_str);
-            let uri = ContextUri::parse(full_uri).unwrap_or_else(|_| scope.clone());
+            let uri = ContextUri::parse(full_uri)?;
 
             let mut entry =
                 ContextEntry::new_text(uri, crate::TenantId(uuid::Uuid::nil()), abstract_);
             entry.metadata.content_type = tpl.content_type;
             entries.push(entry);
         }
-        entries
+        Ok(entries)
     }
 
     fn interpolate(template: &str, vars: &HashMap<String, String>) -> String {
@@ -191,10 +201,12 @@ mod tests {
             overrides: HashMap::new(),
         });
 
-        let result = chain.resolve(
-            &ContextUri::parse("uwu://t1/agent/child/memories/preferences/p1").unwrap(),
-            "child",
-        );
+        let result = chain
+            .resolve(
+                &ContextUri::parse("uwu://t1/agent/child/memories/preferences/p1").unwrap(),
+                "child",
+            )
+            .unwrap();
         assert!(result.is_some());
     }
 
@@ -213,7 +225,7 @@ mod tests {
 
         let vars = HashMap::from([("name".into(), "helper-bot".into())]);
         let scope = ContextUri::parse("uwu://t1/agent/helper-bot").unwrap();
-        let entries = TemplateEngine::instantiate(&template, &vars, &scope);
+        let entries = TemplateEngine::instantiate(&template, &vars, &scope).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert!(entries[0].l0_text().contains("helper-bot"));

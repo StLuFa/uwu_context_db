@@ -77,15 +77,21 @@ impl SecurityGate {
         }
     }
 
-    pub fn redact_entry(&self, entry: &ContextEntry) -> (ContextEntry, Vec<SensitiveFinding>) {
+    pub fn redact_entry(
+        &self,
+        entry: &ContextEntry,
+    ) -> agent_context_db_core::Result<(ContextEntry, Vec<SensitiveFinding>)> {
         redact_sensitive_entry(entry)
     }
 
-    pub fn sanitize_for_write(&self, entry: &ContextEntry) -> Result<ContextEntry, ThreatVerdict> {
+    pub fn sanitize_for_write(
+        &self,
+        entry: &ContextEntry,
+    ) -> agent_context_db_core::Result<Result<ContextEntry, ThreatVerdict>> {
         match self.scan(entry) {
-            ThreatVerdict::Safe | ThreatVerdict::Suspicious { .. } => Ok(entry.clone()),
-            ThreatVerdict::Redacted { .. } => Ok(self.redact_entry(entry).0),
-            blocked @ ThreatVerdict::Blocked { .. } => Err(blocked),
+            ThreatVerdict::Safe | ThreatVerdict::Suspicious { .. } => Ok(Ok(entry.clone())),
+            ThreatVerdict::Redacted { .. } => Ok(Ok(self.redact_entry(entry)?.0)),
+            blocked @ ThreatVerdict::Blocked { .. } => Ok(Err(blocked)),
         }
     }
 }
@@ -155,7 +161,7 @@ mod tests {
     use agent_context_db_core::{ContentPayload, ContextEntry, ContextUri, TenantId};
 
     #[test]
-    fn security_gate_redacts_pii_across_text_levels() {
+    fn security_gate_redacts_pii_across_text_levels() -> agent_context_db_core::Result<()> {
         let gate = SecurityGate::new();
         let mut entry = ContextEntry::new_text(
             ContextUri::parse("uwu://t/agent/a/memories/evidence/e1").unwrap(),
@@ -169,7 +175,11 @@ mod tests {
         };
 
         assert!(matches!(gate.scan(&entry), ThreatVerdict::Redacted { .. }));
-        let sanitized = gate.sanitize_for_write(&entry).unwrap();
+        let sanitized = gate.sanitize_for_write(&entry)?.map_err(|verdict| {
+            agent_context_db_core::ContextError::TrustPolicy(format!(
+                "entry unexpectedly blocked during sanitization: {verdict:?}"
+            ))
+        })?;
         let ContentPayload::Text {
             sparse,
             dense,
@@ -188,5 +198,6 @@ mod tests {
                 .get("security_redactions")
                 .is_some()
         );
+        Ok(())
     }
 }

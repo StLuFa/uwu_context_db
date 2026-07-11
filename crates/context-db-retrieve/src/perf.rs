@@ -34,7 +34,7 @@ impl QueryCompiler {
         &self,
         uris: &[ContextUri],
         level: agent_context_db_core::ContentLevel,
-    ) -> Vec<(ContextUri, Result<agent_context_db_core::ContentPayload>)> {
+    ) -> Result<Vec<(ContextUri, Result<agent_context_db_core::ContentPayload>)>> {
         let handles: Vec<_> = uris
             .iter()
             .map(|uri| {
@@ -44,19 +44,22 @@ impl QueryCompiler {
             })
             .collect();
         let mut results = Vec::new();
-        for h in handles {
-            if let Ok(r) = h.await {
-                results.push(r);
-            }
+        for handle in handles {
+            let result = handle.await.map_err(|error| {
+                agent_context_db_core::ContextError::Storage(format!(
+                    "partition search task failed: {error}"
+                ))
+            })?;
+            results.push(result);
         }
-        results
+        Ok(results)
     }
 
     /// 并行 grep：对多个 regex 一次搜索。
     pub async fn batch_grep(
         &self,
         patterns: &[(&str, &ContextUri)],
-    ) -> Vec<(String, Vec<agent_context_db_core::GrepHit>)> {
+    ) -> Result<Vec<(String, Vec<agent_context_db_core::GrepHit>)>> {
         let owned: Vec<(String, ContextUri)> = patterns
             .iter()
             .map(|(r, s)| (r.to_string(), (*s).clone()))
@@ -69,14 +72,15 @@ impl QueryCompiler {
             }));
         }
         let mut results = Vec::new();
-        for h in handles {
-            if let Ok((r, hits)) = h.await
-                && let Ok(hits) = hits
-            {
-                results.push((r, hits));
-            }
+        for handle in handles {
+            let (regex, hits) = handle.await.map_err(|error| {
+                agent_context_db_core::ContextError::Storage(format!(
+                    "batch grep task failed: {error}"
+                ))
+            })?;
+            results.push((regex, hits?));
         }
-        results
+        Ok(results)
     }
 }
 
@@ -370,7 +374,7 @@ impl ParallelGenerator {
     pub async fn batch_generate_abstracts(
         &self,
         uris: &[ContextUri],
-    ) -> Vec<(ContextUri, Result<String>)> {
+    ) -> Result<Vec<(ContextUri, Result<String>)>> {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrency));
         let handles: Vec<_> = uris
             .iter()
@@ -393,12 +397,14 @@ impl ParallelGenerator {
             })
             .collect();
         let mut results = Vec::new();
-        for h in handles {
-            if let Ok(r) = h.await {
-                results.push(r);
-            }
+        for handle in handles {
+            results.push(handle.await.map_err(|error| {
+                agent_context_db_core::ContextError::Storage(format!(
+                    "abstract generation task failed: {error}"
+                ))
+            })?);
         }
-        results
+        Ok(results)
     }
 
     /// 批量生成 embedding，并按 blake3(content) 缓存去重。
@@ -550,7 +556,7 @@ impl PartitionedRetriever {
     pub async fn parallel_find(
         &self,
         pattern_template: &agent_context_db_core::FindPattern,
-    ) -> Vec<(String, Vec<ContextUri>)> {
+    ) -> Result<Vec<(String, Vec<ContextUri>)>> {
         let owned_partitions = self.partitions.clone();
         let owned_pattern = pattern_template.clone();
         let handles: Vec<_> = owned_partitions
@@ -558,25 +564,24 @@ impl PartitionedRetriever {
             .map(|tenant| {
                 let fs = self.fs.clone();
                 let mut pattern = owned_pattern.clone();
-                pattern.scope = ContextUri::parse(format!("uwu://{tenant}")).ok();
                 tokio::spawn(async move {
-                    match fs
+                    pattern.scope = Some(ContextUri::parse(format!("uwu://{tenant}"))?);
+                    let uris = fs
                         .find(&pattern, agent_context_db_core::PageRequest::default())
-                        .await
-                    {
-                        Ok(uris) => Some((tenant, uris.items)),
-                        Err(_) => None,
-                    }
+                        .await?;
+                    Ok::<_, agent_context_db_core::ContextError>((tenant, uris.items))
                 })
             })
             .collect();
         let mut results = Vec::new();
-        for h in handles {
-            if let Ok(Some(r)) = h.await {
-                results.push(r);
-            }
+        for handle in handles {
+            results.push(handle.await.map_err(|error| {
+                agent_context_db_core::ContextError::Storage(format!(
+                    "batch read task failed: {error}"
+                ))
+            })??);
         }
-        results
+        Ok(results)
     }
 }
 

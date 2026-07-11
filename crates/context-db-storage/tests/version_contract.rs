@@ -7,7 +7,7 @@ use agent_context_db_storage::{
 use agent_context_db_testkit::MemoryVersionStore;
 use agent_context_db_version::{
     BranchName, BranchType, ChangeSet, CommitId, CommitMeta, ConflictStrategy, ContentHash,
-    MergeStrategy, UriChange, VersionRef, VersionStore,
+    MergeStrategy, UriChange, VersionAnalysisConfig, VersionRef, VersionStore,
 };
 use uwu_database::config::{
     CacheBackend, CacheConfig, DbConfig, DeployConfig, RuntimeConfig, SqlBackend, VectorBackend,
@@ -43,15 +43,19 @@ fn config(backend: SqlBackend, url: String) -> RuntimeConfig {
 }
 
 async fn stores() -> Vec<(&'static str, Arc<dyn VersionStore>)> {
-    let mut stores: Vec<(&str, Arc<dyn VersionStore>)> =
-        vec![("memory", Arc::new(MemoryVersionStore::new()))];
+    let mut stores: Vec<(&str, Arc<dyn VersionStore>)> = vec![(
+        "memory",
+        Arc::new(MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap()),
+    )];
     let db = uwu_database::Database::connect(&config(SqlBackend::Sqlite, "sqlite::memory:".into()))
         .await
         .unwrap();
     migrate_sqlite(&db.pool).await.unwrap();
     stores.push((
         "sqlite",
-        Arc::new(SqliteVersionStore::new(Arc::new(db.pool))),
+        Arc::new(
+            SqliteVersionStore::new(Arc::new(db.pool), VersionAnalysisConfig::default()).unwrap(),
+        ),
     ));
 
     if let Ok(url) = std::env::var("DATABASE_URL") {
@@ -63,7 +67,12 @@ async fn stores() -> Vec<(&'static str, Arc<dyn VersionStore>)> {
             migrator = migrator.add(migration);
         }
         migrator.up(&db.pool).await.unwrap();
-        stores.push(("postgres", Arc::new(PgVersionStore::new(Arc::new(db.pool)))));
+        stores.push((
+            "postgres",
+            Arc::new(
+                PgVersionStore::new(Arc::new(db.pool), VersionAnalysisConfig::default()).unwrap(),
+            ),
+        ));
     }
     stores
 }
@@ -128,8 +137,8 @@ async fn merge_contract(store: Arc<dyn VersionStore>, case: &str) {
         )
         .await
         .unwrap();
-    let main = BranchName::new("main");
-    let feature = BranchName::new("feature");
+    let main = BranchName::parse("main").unwrap();
+    let feature = BranchName::parse("feature").unwrap();
     store
         .create_branch(&s, main.clone(), root.clone(), BranchType::Main)
         .await
@@ -181,8 +190,8 @@ async fn merge_contract(store: Arc<dyn VersionStore>, case: &str) {
     );
 
     let conflict_root = merged.commit;
-    let left = BranchName::new("left");
-    let right = BranchName::new("right");
+    let left = BranchName::parse("left").unwrap();
+    let right = BranchName::parse("right").unwrap();
     store
         .create_branch(
             &s,
@@ -230,8 +239,8 @@ async fn rewrite_contract(store: Arc<dyn VersionStore>, case: &str) {
         .commit(&s, add(&u, "root"), CommitMeta::default())
         .await
         .unwrap();
-    let main = BranchName::new("main");
-    let feature = BranchName::new("feature");
+    let main = BranchName::parse("main").unwrap();
+    let feature = BranchName::parse("feature").unwrap();
     store
         .create_branch(&s, main.clone(), root.clone(), BranchType::Main)
         .await
@@ -299,7 +308,7 @@ async fn rewrite_contract(store: Arc<dyn VersionStore>, case: &str) {
         .commit(&detached_scope, add(&du, "one"), CommitMeta::default())
         .await
         .unwrap();
-    let detached = BranchName::new("detached-main");
+    let detached = BranchName::parse("detached-main").unwrap();
     store
         .create_branch(
             &detached_scope,

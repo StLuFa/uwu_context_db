@@ -215,11 +215,20 @@ pub trait GraphStore: Send + Sync {
     async fn add_edge(&self, from: &ContextUri, to: &ContextUri, kind: GraphRelation)
     -> Result<()>;
     async fn remove_edge(&self, from: &ContextUri, to: &ContextUri) -> Result<()>;
-    async fn neighbors(
+    /// Returns outgoing targets only. Implementations must not implicitly include incoming edges.
+    async fn outgoing_neighbors(
         &self,
         uri: &ContextUri,
         kind: Option<GraphRelation>,
     ) -> Result<Vec<ContextUri>>;
+    /// Returns incoming sources only. Implementations must not implicitly include outgoing edges.
+    async fn incoming_neighbors(
+        &self,
+        _uri: &ContextUri,
+        _kind: Option<GraphRelation>,
+    ) -> Result<Vec<ContextUri>> {
+        Ok(Vec::new())
+    }
     async fn batch_traverse(
         &self,
         seeds: &[ContextUri],

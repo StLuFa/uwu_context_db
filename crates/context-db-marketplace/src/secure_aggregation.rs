@@ -126,6 +126,8 @@ pub enum SecureAggregationError {
     InvalidChecksum(String),
     EntryMismatch,
     DuplicateContributor,
+    Serialization(String),
+    NoValidContributions,
 }
 
 impl std::fmt::Display for SecureAggregationError {
@@ -138,6 +140,8 @@ impl std::fmt::Display for SecureAggregationError {
             Self::InvalidChecksum(reason) => write!(f, "invalid share checksum: {reason}"),
             Self::EntryMismatch => write!(f, "all contributions must target the same market entry"),
             Self::DuplicateContributor => write!(f, "duplicate contributor"),
+            Self::Serialization(reason) => write!(f, "secure aggregation serialization: {reason}"),
+            Self::NoValidContributions => write!(f, "no valid contributions to aggregate"),
         }
     }
 }
@@ -271,12 +275,11 @@ impl SecureAggregationEngine {
         }
 
         let accepted = participants.len();
-        let mean_value = if accepted == 0 {
-            0.0
-        } else {
-            aggregate_value / accepted as f32
-        };
-        let aggregate_hash = aggregate_hash(entry_id, aggregate_value, &participants, &rejected);
+        if accepted == 0 {
+            return Err(SecureAggregationError::NoValidContributions);
+        }
+        let mean_value = aggregate_value / accepted as f32;
+        let aggregate_hash = aggregate_hash(entry_id, aggregate_value, &participants, &rejected)?;
         Ok(SecureAggregateReport {
             entry_id,
             participants,
@@ -439,7 +442,7 @@ fn aggregate_hash(
     aggregate_value: f32,
     participants: &[AgentId],
     rejected: &[SecureAggregationRejection],
-) -> String {
+) -> Result<String, SecureAggregationError> {
     let mut payload = HashMap::new();
     payload.insert("entry_id", entry_id.0.to_string());
     payload.insert("aggregate", format!("{aggregate_value:.6}"));
@@ -459,8 +462,9 @@ fn aggregate_hash(
             .collect::<Vec<_>>()
             .join(","),
     );
-    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
-    blake3::hash(&bytes).to_hex().to_string()
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| SecureAggregationError::Serialization(error.to_string()))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 #[cfg(test)]
@@ -541,11 +545,9 @@ mod tests {
             .unwrap();
         shared.shares[0].share_value += 1.0;
 
-        let report = engine
-            .aggregate(&[shared], &HashProvenanceVerifier)
-            .unwrap();
-
-        assert_eq!(report.accepted, 0);
-        assert_eq!(report.rejected.len(), 1);
+        assert!(matches!(
+            engine.aggregate(&[shared], &HashProvenanceVerifier),
+            Err(SecureAggregationError::NoValidContributions)
+        ));
     }
 }

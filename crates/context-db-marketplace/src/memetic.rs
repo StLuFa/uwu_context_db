@@ -18,6 +18,18 @@ pub struct MemeticEvolutionConfig {
     pub crossover_threshold: f32,
     pub cull_threshold: f32,
     pub max_offspring: usize,
+    pub quality_weight: f32,
+    pub confidence_weight: f32,
+    pub adoption_weight: f32,
+    pub corroboration_weight: f32,
+    pub hit_weight: f32,
+    pub novelty_weight: f32,
+    pub recency_weight: f32,
+    pub hit_log_scale: f32,
+    pub recency_half_life_days: f32,
+    pub contradiction_penalty: f32,
+    pub downvote_penalty: f32,
+    pub max_penalty: f32,
 }
 
 impl Default for MemeticEvolutionConfig {
@@ -28,7 +40,63 @@ impl Default for MemeticEvolutionConfig {
             crossover_threshold: 0.76,
             cull_threshold: 0.22,
             max_offspring: 8,
+            quality_weight: 0.30,
+            confidence_weight: 0.16,
+            adoption_weight: 0.20,
+            corroboration_weight: 0.14,
+            hit_weight: 0.08,
+            novelty_weight: 0.07,
+            recency_weight: 0.05,
+            hit_log_scale: 8.0,
+            recency_half_life_days: 90.0,
+            contradiction_penalty: 0.12,
+            downvote_penalty: 0.06,
+            max_penalty: 0.55,
         }
+    }
+}
+
+impl MemeticEvolutionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for value in [
+            self.elite_fraction,
+            self.mutation_threshold,
+            self.crossover_threshold,
+            self.cull_threshold,
+            self.quality_weight,
+            self.confidence_weight,
+            self.adoption_weight,
+            self.corroboration_weight,
+            self.hit_weight,
+            self.novelty_weight,
+            self.recency_weight,
+            self.contradiction_penalty,
+            self.downvote_penalty,
+            self.max_penalty,
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err("memetic fractions, weights, and penalties must be in [0, 1]".into());
+            }
+        }
+        let weight_sum = self.quality_weight
+            + self.confidence_weight
+            + self.adoption_weight
+            + self.corroboration_weight
+            + self.hit_weight
+            + self.novelty_weight
+            + self.recency_weight;
+        if (weight_sum - 1.0).abs() > f32::EPSILON * 8.0 {
+            return Err("memetic fitness weights must sum to 1".into());
+        }
+        if self.max_offspring == 0
+            || self.hit_log_scale <= 0.0
+            || self.recency_half_life_days <= 0.0
+            || !self.hit_log_scale.is_finite()
+            || !self.recency_half_life_days.is_finite()
+        {
+            return Err("memetic limits and scales must be finite and positive".into());
+        }
+        Ok(())
     }
 }
 
@@ -106,18 +174,13 @@ pub struct MemeticEvolutionEngine {
 }
 
 impl MemeticEvolutionEngine {
-    pub fn new(node_id: impl Into<String>) -> Self {
-        let node_id = node_id.into();
-        Self {
-            config: MemeticEvolutionConfig::default(),
-            merger: SemanticCrdtMerger::new(node_id),
+    pub fn new(node_id: impl Into<String>, config: MemeticEvolutionConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            merger: SemanticCrdtMerger::new(node_id.into()),
             llm: None,
-        }
-    }
-
-    pub fn with_config(mut self, config: MemeticEvolutionConfig) -> Self {
-        self.config = config;
-        self
+        })
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
@@ -208,18 +271,21 @@ impl MemeticEvolutionEngine {
             CorroborationLevel::Established => 1.0,
         };
         let novelty = domain_novelty(entry, population);
-        let hit_signal = ((signals.hit_count as f32 + 1.0).ln() / 8.0).clamp(0.0, 1.0);
-        let recency = (1.0 / (1.0 + signals.recency_days.max(0.0) / 90.0)).clamp(0.0, 1.0);
-        let penalty = (signals.contradiction_count as f32 * 0.12
-            + signals.downvote_count as f32 * 0.06)
-            .clamp(0.0, 0.55);
-        let score = (entry.quality_score * 0.30
-            + entry.confidence * 0.16
-            + signals.adoption_rate.clamp(0.0, 1.0) * 0.20
-            + corroboration * 0.14
-            + hit_signal * 0.08
-            + novelty * 0.07
-            + recency * 0.05
+        let hit_signal =
+            ((signals.hit_count as f32 + 1.0).ln() / self.config.hit_log_scale).clamp(0.0, 1.0);
+        let recency = (1.0
+            / (1.0 + signals.recency_days.max(0.0) / self.config.recency_half_life_days))
+            .clamp(0.0, 1.0);
+        let penalty = (signals.contradiction_count as f32 * self.config.contradiction_penalty
+            + signals.downvote_count as f32 * self.config.downvote_penalty)
+            .clamp(0.0, self.config.max_penalty);
+        let score = (entry.quality_score * self.config.quality_weight
+            + entry.confidence * self.config.confidence_weight
+            + signals.adoption_rate.clamp(0.0, 1.0) * self.config.adoption_weight
+            + corroboration * self.config.corroboration_weight
+            + hit_signal * self.config.hit_weight
+            + novelty * self.config.novelty_weight
+            + recency * self.config.recency_weight
             - penalty)
             .clamp(0.0, 1.0);
 
@@ -482,14 +548,17 @@ mod tests {
             },
         ];
 
-        let report = MemeticEvolutionEngine::new("test-node")
-            .with_config(MemeticEvolutionConfig {
+        let report = MemeticEvolutionEngine::new(
+            "test-node",
+            MemeticEvolutionConfig {
                 elite_fraction: 0.67,
                 max_offspring: 4,
                 ..Default::default()
-            })
-            .evolve(&candidates)
-            .await;
+            },
+        )
+        .unwrap()
+        .evolve(&candidates)
+        .await;
 
         assert!(report.fitness[0].score >= report.fitness[1].score);
         assert!(

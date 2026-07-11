@@ -111,6 +111,41 @@ pub struct AgmRevisionConfig {
     pub min_extraction_confidence: f32,
     /// Penalizes contracting beliefs that are supported by many literals or high entrenchment.
     pub complexity_penalty: f32,
+    /// Prior entrenchment used when an entry has no quality score.
+    pub default_entrenchment: f32,
+    /// Confidence assigned to a non-empty symbolic extraction.
+    pub symbolic_extraction_confidence: f32,
+    /// Weight of incoming advantage in the final confidence blend.
+    pub advantage_weight: f32,
+}
+
+impl AgmRevisionConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        for (name, value) in [
+            ("reject_margin", self.reject_margin),
+            ("defer_margin", self.defer_margin),
+            ("min_extraction_confidence", self.min_extraction_confidence),
+            ("complexity_penalty", self.complexity_penalty),
+            ("default_entrenchment", self.default_entrenchment),
+            (
+                "symbolic_extraction_confidence",
+                self.symbolic_extraction_confidence,
+            ),
+            ("advantage_weight", self.advantage_weight),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(crate::VersionError::InvalidConfig(format!(
+                    "{name} must be finite and in 0..=1"
+                )));
+            }
+        }
+        if self.max_component_width == 0 {
+            return Err(crate::VersionError::InvalidConfig(
+                "max_component_width must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for AgmRevisionConfig {
@@ -121,11 +156,14 @@ impl Default for AgmRevisionConfig {
             max_component_width: 16,
             min_extraction_confidence: 0.45,
             complexity_penalty: 0.12,
+            default_entrenchment: 0.5,
+            symbolic_extraction_confidence: 0.55,
+            advantage_weight: 0.7,
         }
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AgmBeliefReviser {
     config: AgmRevisionConfig,
     llm: Option<Arc<dyn LlmClient>>,
@@ -154,12 +192,9 @@ struct RawBeliefLiteral {
 }
 
 impl AgmBeliefReviser {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_config(config: AgmRevisionConfig) -> Self {
-        Self { config, llm: None }
+    pub fn new(config: AgmRevisionConfig) -> crate::Result<Self> {
+        config.validate()?;
+        Ok(Self { config, llm: None })
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
@@ -171,7 +206,10 @@ impl AgmBeliefReviser {
         self.sentence_from_text(
             entry.uri.clone(),
             entry.payload.sparse_text(),
-            entry.metadata.quality_score.unwrap_or(0.5),
+            entry
+                .metadata
+                .quality_score
+                .unwrap_or(self.config.default_entrenchment),
         )
         .await
     }
@@ -183,7 +221,11 @@ impl AgmBeliefReviser {
         entrenchment: f32,
     ) -> BeliefSentence {
         let source_text = text.into();
-        let symbolic = BeliefSentence::from_text(uri.clone(), source_text.clone(), entrenchment);
+        let mut symbolic =
+            BeliefSentence::from_text(uri.clone(), source_text.clone(), entrenchment);
+        if !symbolic.literals.is_empty() {
+            symbolic.extraction_confidence = self.config.symbolic_extraction_confidence;
+        }
         let Some(llm) = &self.llm else {
             return symbolic;
         };
@@ -331,7 +373,8 @@ impl AgmBeliefReviser {
                 "AGM partial-meet contraction removes the least entrenched inconsistent subset with weighted cost {:.3}",
                 contraction_cost
             ),
-            confidence: (incoming_advantage.max(0.0) * 0.7 + (1.0 - revision_distance) * 0.3)
+            confidence: (incoming_advantage.max(0.0) * self.config.advantage_weight
+                + (1.0 - revision_distance) * (1.0 - self.config.advantage_weight))
                 .clamp(0.0, 1.0),
             contraction_cost,
             revision_distance,
@@ -662,7 +705,7 @@ fn literal_from_claim(claim: &str, polarity: BeliefPolarity) -> Option<BeliefLit
     if tokens.is_empty() {
         return None;
     }
-    let subject = tokens.first().unwrap().to_string();
+    let subject = tokens.first()?.to_string();
     let object = if tokens.len() == 1 {
         "true".into()
     } else {
@@ -799,7 +842,9 @@ mod tests {
             BeliefSentence::from_text(uri("incoming"), "embedding-cache is not enabled", 0.7);
         incoming.extraction_confidence = 0.8;
 
-        let decision = AgmBeliefReviser::new().revise(&[weak.clone(), strong.clone()], incoming);
+        let decision = AgmBeliefReviser::new(AgmRevisionConfig::default())
+            .unwrap()
+            .revise(&[weak.clone(), strong.clone()], incoming);
 
         assert_eq!(decision.action, BeliefRevisionAction::ContractExisting);
         assert_eq!(decision.contractions, vec![weak.uri]);
@@ -813,7 +858,9 @@ mod tests {
         let mut incoming = BeliefSentence::from_text(uri("incoming"), "dp is not enabled", 0.35);
         incoming.extraction_confidence = 0.8;
 
-        let decision = AgmBeliefReviser::new().revise(&[base.clone()], incoming);
+        let decision = AgmBeliefReviser::new(AgmRevisionConfig::default())
+            .unwrap()
+            .revise(&[base.clone()], incoming);
 
         assert_eq!(decision.action, BeliefRevisionAction::RejectIncoming);
         assert!(decision.contractions.is_empty());
@@ -822,7 +869,9 @@ mod tests {
 
     #[tokio::test]
     async fn neural_symbolic_extraction_augments_symbolic_literals() {
-        let reviser = AgmBeliefReviser::new().with_llm(Arc::new(ExtractionLlm));
+        let reviser = AgmBeliefReviser::new(AgmRevisionConfig::default())
+            .unwrap()
+            .with_llm(Arc::new(ExtractionLlm));
         let sentence = reviser
             .sentence_from_text(uri("incoming"), "redis cache should be disabled", 0.7)
             .await;
@@ -844,7 +893,9 @@ mod tests {
             b: "cache is not enabled".into(),
         };
 
-        let resolution = AgmBeliefReviser::new().resolve_conflict(conflict);
+        let resolution = AgmBeliefReviser::new(AgmRevisionConfig::default())
+            .unwrap()
+            .resolve_conflict(conflict);
         assert!(matches!(
             resolution,
             Resolution::DeferToHuman { .. }

@@ -3,7 +3,8 @@
 //! 对同一主题从 4 个认知视角分别收集证据，再合成为高质量巩固产物。
 
 use agent_context_db_core::{
-    ContextEntry, ContextUri, EpistemicType, LlmClient, LlmOpts, LlmTaskKind, PromptOptimization,
+    ContextEntry, ContextError, ContextUri, EpistemicType, LlmClient, LlmOpts, LlmTaskKind,
+    PromptOptimization, Result,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -146,13 +147,13 @@ impl MultiPerspectiveConsolidator {
         topic_uri: &ContextUri,
         topic: &str,
         evidence: &[ContextEntry],
-    ) -> MultiPerspectiveProduct {
-        // 1. 多视角分析：有 LLM 时使用 batch_complete 一次提交全部视角 prompt。
+    ) -> Result<MultiPerspectiveProduct> {
+        // 1. 多视角分析：配置 LLM 后，传输或模型响应错误必须显式传播。
         let views = match &self.llm {
-            Some(llm) => self
-                .analyze_batch_with_llm(llm.as_ref(), topic, evidence)
-                .await
-                .unwrap_or_else(|| self.analyze_batch_locally(topic, evidence)),
+            Some(llm) => {
+                self.analyze_batch_with_llm(llm.as_ref(), topic, evidence)
+                    .await?
+            }
             None => self.analyze_batch_locally(topic, evidence),
         };
 
@@ -161,10 +162,10 @@ impl MultiPerspectiveConsolidator {
 
         // 3. 多视角合成
         let synthesized = match &self.llm {
-            Some(llm) => self
-                .synthesize_with_llm(llm.as_ref(), topic, &views, &gaps)
-                .await
-                .unwrap_or_else(|| self.synthesize(topic, &views, &gaps)),
+            Some(llm) => {
+                self.synthesize_with_llm(llm.as_ref(), topic, &views, &gaps)
+                    .await?
+            }
             None => self.synthesize(topic, &views, &gaps),
         };
 
@@ -172,7 +173,7 @@ impl MultiPerspectiveConsolidator {
         let overall_confidence =
             views.iter().map(|v| v.confidence).sum::<f32>() / views.len().max(1) as f32;
 
-        MultiPerspectiveProduct {
+        Ok(MultiPerspectiveProduct {
             topic_uri: topic_uri.clone(),
             topic_summary: topic.to_string(),
             views,
@@ -180,7 +181,7 @@ impl MultiPerspectiveConsolidator {
             discovered_gaps: gaps,
             overall_confidence,
             epistemic_type: EpistemicType::Fact,
-        }
+        })
     }
 
     fn analyze_batch_locally(
@@ -199,7 +200,7 @@ impl MultiPerspectiveConsolidator {
         llm: &dyn LlmClient,
         topic: &str,
         evidence: &[ContextEntry],
-    ) -> Option<Vec<PerspectiveView>> {
+    ) -> Result<Vec<PerspectiveView>> {
         let evidence_text = evidence_prompt(evidence);
         let prompts = self
             .perspectives
@@ -215,61 +216,62 @@ impl MultiPerspectiveConsolidator {
                 .target_tokens(1_500),
             ..Default::default()
         };
-        let responses = llm.batch_complete(&prompts, &opts).await.ok()?;
+        let responses = llm.batch_complete(&prompts, &opts).await?;
         if responses.len() != self.perspectives.len() {
-            return None;
+            return Err(ContextError::Llm(
+                agent_context_db_core::LlmError::Provider(format!(
+                    "perspective batch returned {} responses for {} prompts",
+                    responses.len(),
+                    self.perspectives.len()
+                )),
+            ));
         }
 
-        Some(
-            self.perspectives
-                .iter()
-                .zip(responses)
-                .map(|(perspective, response)| {
-                    self.view_from_llm_response(*perspective, topic, evidence, &response)
-                })
-                .collect(),
-        )
+        self.perspectives
+            .iter()
+            .zip(responses)
+            .map(|(perspective, response)| {
+                self.view_from_llm_response(*perspective, evidence, &response)
+            })
+            .collect()
     }
 
     fn view_from_llm_response(
         &self,
         perspective: Perspective,
-        topic: &str,
         evidence: &[ContextEntry],
         response: &str,
-    ) -> PerspectiveView {
-        let fallback = self.analyze_from(perspective, topic, evidence);
+    ) -> Result<PerspectiveView> {
         let trimmed = response.trim();
         if trimmed.is_empty() {
-            return fallback;
+            return Err(ContextError::Llm(
+                agent_context_db_core::LlmError::Provider(format!(
+                    "{} perspective response was empty",
+                    perspective.name()
+                )),
+            ));
         }
-
-        if let Ok(raw) = serde_json::from_str::<RawPerspectiveView>(trimmed) {
-            return PerspectiveView {
-                perspective,
-                summary: raw.summary,
-                key_insights: raw.key_insights.into_iter().take(8).collect(),
-                // Model confidence is optional and never allowed to exceed the evidence-derived
-                // ceiling. Missing confidence means no additional epistemic signal.
-                confidence: if raw.confidence.is_finite() {
-                    raw.confidence.clamp(0.0, fallback.confidence)
-                } else {
-                    0.0
-                },
-                evidence_uris: evidence.iter().map(|entry| entry.uri.clone()).collect(),
-                gaps: raw.gaps.into_iter().take(8).collect(),
-                validation_errors: Vec::new(),
-            };
+        let raw: RawPerspectiveView = serde_json::from_str(trimmed)?;
+        if raw.summary.trim().is_empty()
+            || raw.key_insights.iter().any(|value| value.trim().is_empty())
+            || raw.gaps.iter().any(|value| value.trim().is_empty())
+            || !raw.confidence.is_finite()
+            || !(0.0..=1.0).contains(&raw.confidence)
+        {
+            return Err(ContextError::TrustPolicy(format!(
+                "{} perspective response contains invalid required values",
+                perspective.name()
+            )));
         }
-
-        PerspectiveView {
-            // Invalid model text is never promoted into summary or insights.
-            confidence: (fallback.confidence * 0.5).clamp(0.0, 1.0),
-            validation_errors: vec![
-                "LLM perspective response failed strict JSON schema validation".into(),
-            ],
-            ..fallback
-        }
+        Ok(PerspectiveView {
+            perspective,
+            summary: raw.summary,
+            key_insights: raw.key_insights.into_iter().take(8).collect(),
+            confidence: raw.confidence,
+            evidence_uris: evidence.iter().map(|entry| entry.uri.clone()).collect(),
+            gaps: raw.gaps.into_iter().take(8).collect(),
+            validation_errors: Vec::new(),
+        })
     }
 
     /// 从单个视角分析证据。
@@ -364,7 +366,7 @@ impl MultiPerspectiveConsolidator {
             }
         }
 
-        gaps.sort_by(|a, b| b.severity.partial_cmp(&a.severity).unwrap());
+        gaps.sort_by(|a, b| b.severity.total_cmp(&a.severity));
         gaps
     }
 
@@ -374,7 +376,7 @@ impl MultiPerspectiveConsolidator {
         topic: &str,
         views: &[PerspectiveView],
         gaps: &[KnowledgeGap],
-    ) -> Option<String> {
+    ) -> Result<String> {
         let prompt = synthesis_prompt(topic, views, gaps);
         let opts = LlmOpts {
             max_tokens: Some(1200),
@@ -385,11 +387,16 @@ impl MultiPerspectiveConsolidator {
                 .target_tokens(2_500),
             ..Default::default()
         };
-        llm.complete(&prompt, &opts)
-            .await
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        let value = llm.complete(&prompt, &opts).await?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ContextError::Llm(
+                agent_context_db_core::LlmError::Provider(
+                    "multi-perspective synthesis response was empty".into(),
+                ),
+            ));
+        }
+        Ok(value.to_string())
     }
 
     /// 多视角合成 — 从多个视角结果生成统一摘要。
@@ -507,27 +514,26 @@ mod tests {
     fn llm_json_response_becomes_structured_perspective_view() {
         let consolidator = MultiPerspectiveConsolidator::new();
         let response = r#"{"summary":"causal summary","key_insights":["a causes b"],"gaps":["need counterexample"],"confidence":0.81}"#;
-        let view = consolidator.view_from_llm_response(Perspective::Causal, "topic", &[], response);
+        let view = consolidator
+            .view_from_llm_response(Perspective::Causal, &[], response)
+            .unwrap();
         assert_eq!(view.summary, "causal summary");
         assert_eq!(view.key_insights, vec!["a causes b".to_string()]);
         assert_eq!(view.gaps, vec!["need counterexample".to_string()]);
-        assert_eq!(view.confidence, 0.1);
+        assert_eq!(view.confidence, 0.81);
     }
 
     #[test]
-    fn malformed_response_reduces_fallback_confidence() {
+    fn malformed_response_is_rejected() {
         let consolidator = MultiPerspectiveConsolidator::new();
-        let fallback = consolidator.analyze_from(Perspective::Causal, "topic", &[]);
-        let view = consolidator.view_from_llm_response(
-            Perspective::Causal,
-            "topic",
-            &[],
-            "provider error: upstream unavailable",
-        );
-        assert!(view.confidence < fallback.confidence);
-        assert_eq!(view.summary, fallback.summary);
-        assert_eq!(view.key_insights, fallback.key_insights);
-        assert_eq!(view.validation_errors.len(), 1);
+        let error = consolidator
+            .view_from_llm_response(
+                Perspective::Causal,
+                &[],
+                "provider error: upstream unavailable",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("serialization"));
     }
 
     #[test]
@@ -537,11 +543,11 @@ mod tests {
             r#"{\"summary\":\"x\",\"key_insights\":[],\"gaps\":[],\"confidence\":0.9,\"extra\":true}"#,
             r#"{\"summary\":\"x\",\"confidence\":0.9}"#,
         ] {
-            let fallback = consolidator.analyze_from(Perspective::Causal, "topic", &[]);
-            let view =
-                consolidator.view_from_llm_response(Perspective::Causal, "topic", &[], response);
-            assert!(view.confidence < fallback.confidence);
-            assert!(!view.validation_errors.is_empty());
+            assert!(
+                consolidator
+                    .view_from_llm_response(Perspective::Causal, &[], response)
+                    .is_err()
+            );
         }
     }
 
@@ -549,7 +555,10 @@ mod tests {
     async fn consolidator_basic() {
         let consolidator = MultiPerspectiveConsolidator::new();
         let uri = ContextUri::parse("uwu://t/a/memory/fact/test").unwrap();
-        let product = consolidator.consolidate(&uri, "test topic", &[]).await;
+        let product = consolidator
+            .consolidate(&uri, "test topic", &[])
+            .await
+            .unwrap();
         assert_eq!(product.views.len(), 4);
         assert!(product.overall_confidence < 0.5); // 无证据 → 低置信度
     }

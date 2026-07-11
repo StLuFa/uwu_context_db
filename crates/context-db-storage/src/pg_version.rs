@@ -26,10 +26,11 @@ use agent_context_db_version::{
     AsOfTime, Author, Branch, BranchLifecycle, BranchName, BranchType, ChangeSet, Commit, CommitId,
     CommitMeta, ConflictItem, ConflictResolution, ConflictResolutionSet, ConflictSession,
     ConflictSessionId, ConflictSessionPersistence, ConflictStrategy, ConflictValueOp, ContentHash,
-    GcPolicy, GcReport, ImpactAnalysis, InteractiveOperation, InteractiveVersionStore,
-    KnowledgeMergeStrategy, LogOpts, MergeResult, MergeStrategy, ProvenanceGraph, Result,
-    SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion, TreeDiff, VersionError,
-    VersionRef, VersionStore,
+    ContradictionDetector, GcPolicy, GcReport, ImpactAnalysis, InteractiveOperation,
+    InteractiveVersionStore, KnowledgeMergeStrategy, LogOpts, MergeResult, MergeStrategy,
+    ProvenanceGraph, Result, SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion,
+    TreeDiff, VersionAnalysisConfig, VersionError, VersionRef, VersionStore,
+    detect_snapshot_contradictions,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -56,7 +57,7 @@ use uwu_database::{Cache, DbPool};
 /// checkpoint 优先保留。L1 需手动 `cache_del_snapshot`。
 #[derive(Clone)]
 pub struct PgVersionStore {
-    pool: Arc<DbPool>,
+    pool: sqlx::PgPool,
     cache: Option<Arc<dyn Cache>>,
     cache_ttl: Option<Duration>,
     /// 链长超过此值时写入 L2 checkpoint。0 表示禁用 L2 写入。
@@ -67,15 +68,16 @@ pub struct PgVersionStore {
     checkpoint_hot_rows: usize,
     /// 交互式冲突 session 的默认持久化策略。
     conflict_session_persistence: ConflictSessionPersistence,
+    contradiction_detector: Option<Arc<dyn ContradictionDetector>>,
+    analysis_config: VersionAnalysisConfig,
 }
 
 impl PgVersionStore {
     /// 构造 —— 构造时验证后端是 postgres。
-    pub fn new(pool: Arc<DbPool>) -> Self {
-        let _ = pool
-            .as_postgres()
-            .expect("PgVersionStore requires postgres backend");
-        Self {
+    pub fn new(pool: Arc<DbPool>, analysis_config: VersionAnalysisConfig) -> Result<Self> {
+        analysis_config.validate()?;
+        let pool = pool.as_postgres().map_err(Self::storage_err)?.clone();
+        Ok(Self {
             pool,
             cache: None,
             cache_ttl: Some(Duration::from_secs(3600)),
@@ -83,7 +85,14 @@ impl PgVersionStore {
             checkpoint_max_rows: 4096,
             checkpoint_hot_rows: 256,
             conflict_session_persistence: ConflictSessionPersistence::Disabled,
-        }
+            contradiction_detector: None,
+            analysis_config,
+        })
+    }
+
+    pub fn with_contradiction_detector(mut self, detector: Arc<dyn ContradictionDetector>) -> Self {
+        self.contradiction_detector = Some(detector);
+        self
     }
 
     /// 注入快照缓存 —— 大幅降低深链下 `read_at` / `merge` 的 I/O 次数。
@@ -125,9 +134,7 @@ impl PgVersionStore {
     }
 
     fn pg(&self) -> &sqlx::PgPool {
-        self.pool
-            .as_postgres()
-            .expect("PgVersionStore: backend validated at construction")
+        &self.pool
     }
 
     fn scope_key(scope: &ContextUri) -> String {
@@ -164,14 +171,10 @@ impl PgVersionStore {
         let parents = self.load_parents(id).await?;
         let author_val: serde_json::Value =
             row.try_get("author_json").map_err(Self::storage_err)?;
-        let author: Author = serde_json::from_value(author_val).unwrap_or(Author {
-            agent_id: None,
-            user_id: None,
-            system: true,
-        });
+        let author: Author = serde_json::from_value(author_val).map_err(Self::storage_err)?;
         let meta_val: serde_json::Value =
             row.try_get("metadata_json").map_err(Self::storage_err)?;
-        let metadata: CommitMeta = serde_json::from_value(meta_val).unwrap_or_default();
+        let metadata: CommitMeta = serde_json::from_value(meta_val).map_err(Self::storage_err)?;
         let tree_hash_str: String = row.try_get("tree_hash").map_err(Self::storage_err)?;
         let timestamp: DateTime<Utc> = row.try_get("timestamp").map_err(Self::storage_err)?;
         let message: String = row.try_get("message").map_err(Self::storage_err)?;
@@ -195,11 +198,13 @@ impl PgVersionStore {
         .fetch_all(self.pg())
         .await
         .map_err(Self::storage_err)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| r.try_get::<Uuid, _>("parent_id").ok())
-            .map(CommitId)
-            .collect())
+        rows.into_iter()
+            .map(|r| {
+                r.try_get::<Uuid, _>("parent_id")
+                    .map(CommitId)
+                    .map_err(Self::storage_err)
+            })
+            .collect()
     }
 
     async fn first_parent(&self, id: &CommitId) -> Result<Option<CommitId>> {
@@ -211,9 +216,12 @@ impl PgVersionStore {
         .fetch_optional(self.pg())
         .await
         .map_err(Self::storage_err)?;
-        Ok(row
-            .and_then(|r| r.try_get::<Uuid, _>("parent_id").ok())
-            .map(CommitId))
+        row.map(|r| {
+            r.try_get::<Uuid, _>("parent_id")
+                .map(CommitId)
+                .map_err(Self::storage_err)
+        })
+        .transpose()
     }
 
     async fn commit_timestamp(&self, id: &CommitId) -> Result<Option<DateTime<Utc>>> {
@@ -222,7 +230,8 @@ impl PgVersionStore {
             .fetch_optional(self.pg())
             .await
             .map_err(Self::storage_err)?;
-        Ok(row.and_then(|r| r.try_get("timestamp").ok()))
+        row.map(|r| r.try_get("timestamp").map_err(Self::storage_err))
+            .transpose()
     }
 
     // ---- 差量 ---------------------------------------------------------------
@@ -237,20 +246,16 @@ impl PgVersionStore {
         .fetch_all(self.pg())
         .await
         .map_err(Self::storage_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| DeltaRow {
-                uri: r.try_get::<String, _>("uri").unwrap_or_default(),
-                op: r
-                    .try_get::<String, _>("op")
-                    .unwrap_or_else(|_| "update".into()),
-                entry_json: r
-                    .try_get::<Option<serde_json::Value>, _>("entry_json")
-                    .ok()
-                    .flatten(),
-                rename_from: r.try_get::<Option<String>, _>("rename_from").ok().flatten(),
+        rows.into_iter()
+            .map(|r| {
+                Ok(DeltaRow {
+                    uri: r.try_get("uri").map_err(Self::storage_err)?,
+                    op: r.try_get("op").map_err(Self::storage_err)?,
+                    entry_json: r.try_get("entry_json").map_err(Self::storage_err)?,
+                    rename_from: r.try_get("rename_from").map_err(Self::storage_err)?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// 快照缓存 key —— commit_id 全局唯一，无需 scope 前缀。
@@ -266,7 +271,7 @@ impl PgVersionStore {
         serde_json::from_slice(&bytes).ok()
     }
 
-    /// 回填缓存（best-effort，失败静默）。
+    /// 回填缓存。该优化为 best-effort；失败按 operation/key/error 记录，不影响快照正确性。
     async fn cache_put_snapshot(&self, id: &CommitId, snap: &HashMap<String, String>) {
         let Some(cache) = self.cache.as_ref() else {
             return;
@@ -275,16 +280,20 @@ impl PgVersionStore {
             return;
         };
         let key = Self::snapshot_cache_key(id);
-        let _ = cache.set(&key, &bytes, self.cache_ttl).await;
+        if let Err(error) = cache.set(&key, &bytes, self.cache_ttl).await {
+            tracing::warn!(operation = "snapshot_cache_put", %key, %error, "best-effort snapshot cache operation failed");
+        }
     }
 
-    /// gc 时清理已删 commit 的缓存条目。
+    /// gc 时 best-effort 清理已删 commit 的缓存条目；失败只影响缓存空间。
     async fn cache_del_snapshot(&self, id: &CommitId) {
         let Some(cache) = self.cache.as_ref() else {
             return;
         };
         let key = Self::snapshot_cache_key(id);
-        let _ = cache.del(&key).await;
+        if let Err(error) = cache.del(&key).await {
+            tracing::warn!(operation = "snapshot_cache_delete", %key, %error, "best-effort snapshot cache operation failed");
+        }
     }
 
     // ---- L2 checkpoint --------------------------------------------------------
@@ -307,14 +316,17 @@ impl PgVersionStore {
 
     /// L2 checkpoint 命中后更新热度（best-effort）。
     async fn checkpoint_touch(&self, id: &CommitId) {
-        let _ = sqlx::query(
+        if let Err(error) = sqlx::query(
             r#"UPDATE version_commit_checkpoints
                SET last_accessed_at = now(), access_count = access_count + 1
                WHERE commit_id = $1"#,
         )
         .bind(id.0)
         .execute(self.pg())
-        .await;
+        .await
+        {
+            tracing::warn!(operation = "checkpoint_touch", key = %id.0, %error, "best-effort checkpoint heat update failed");
+        }
     }
 
     /// 写入 L2 checkpoint（best-effort，冲突时更新）。
@@ -348,7 +360,7 @@ impl PgVersionStore {
     async fn checkpoint_prune(&self) {
         let max_rows = self.checkpoint_max_rows as i64;
         let hot_rows = self.checkpoint_hot_rows.min(self.checkpoint_max_rows) as i64;
-        let _ = sqlx::query(
+        if let Err(error) = sqlx::query(
             r#"
             WITH protected_refs AS (
                 SELECT commit_id FROM version_heads
@@ -388,7 +400,10 @@ impl PgVersionStore {
         .bind(max_rows)
         .bind(hot_rows)
         .execute(self.pg())
-        .await;
+        .await
+        {
+            tracing::warn!(operation = "checkpoint_prune", key = "version_commit_checkpoints", %error, "best-effort checkpoint pruning failed");
+        }
     }
 
     /// 沿 parent[0] 链重建 commit 的完整快照（URI → 序列化 entry JSON）。
@@ -1022,7 +1037,9 @@ fn branch_from_row(row: sqlx::postgres::PgRow) -> Result<Branch> {
         .try_get("lifecycle_json")
         .map_err(PgVersionStore::storage_err)?;
     Ok(Branch {
-        name: BranchName::new(name),
+        name: BranchName::parse(name).map_err(|error| {
+            VersionError::Storage(format!("invalid persisted branch name: {error}"))
+        })?,
         head: CommitId(head),
         created_from: CommitId(created_from),
         created_at,
@@ -1049,24 +1066,6 @@ fn branch_type_str(bt: BranchType) -> &'static str {
         BranchType::Collaboration => "Collaboration",
         BranchType::Staging => "Staging",
     }
-}
-
-/// Jaccard 相似度（用于知识合并的冲突检测）。
-fn jaccard(a: &str, b: &str) -> f64 {
-    let tokens = |s: &str| -> HashSet<String> {
-        s.split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_lowercase())
-            .collect()
-    };
-    let sa = tokens(a);
-    let sb = tokens(b);
-    if sa.is_empty() && sb.is_empty() {
-        return 1.0;
-    }
-    let inter = sa.intersection(&sb).count() as f64;
-    let union = sa.union(&sb).count() as f64;
-    if union == 0.0 { 0.0 } else { inter / union }
 }
 
 // ===========================================================================
@@ -1353,7 +1352,9 @@ impl VersionStore for PgVersionStore {
                 _ => TagType::Mutable,
             };
             out.push(Tag {
-                name: TagName::new(name),
+                name: TagName::parse(name).map_err(|e| {
+                    VersionError::Storage(format!("invalid persisted tag name: {e}"))
+                })?,
                 target: CommitId(target),
                 tag_type,
                 message: message.unwrap_or_default(),
@@ -1465,8 +1466,11 @@ impl VersionStore for PgVersionStore {
             let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
             self.update_branch_head(&mut tx, &scope_key, into, &into_head, &from_head)
                 .await?;
-            let _ =
-                Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &from_head).await?;
+            if !Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &from_head).await? {
+                return Err(VersionError::Storage(
+                    "HEAD changed concurrently during merge".into(),
+                ));
+            }
             tx.commit().await.map_err(Self::storage_err)?;
             return Ok(MergeResult {
                 commit: from_head,
@@ -1556,7 +1560,11 @@ impl VersionStore for PgVersionStore {
         self.insert_deltas(&mut tx, &commit_id, &deltas).await?;
         self.update_branch_head(&mut tx, &scope_key, into, &into_head, &commit_id)
             .await?;
-        let _ = Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &commit_id).await?;
+        if !Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &commit_id).await? {
+            return Err(VersionError::Storage(
+                "HEAD changed concurrently during merge".into(),
+            ));
+        }
         tx.commit().await.map_err(Self::storage_err)?;
         Ok(MergeResult {
             commit: commit_id,
@@ -1673,8 +1681,12 @@ impl VersionStore for PgVersionStore {
         }
         let scope_key = Self::scope_key(scope);
         // 假设 commits 按新旧顺序给出（最新在末尾）
-        let newest = commits.last().unwrap().clone();
-        let oldest = commits.first().unwrap().clone();
+        let newest = commits.last().cloned().ok_or_else(|| {
+            VersionError::Storage("squash received no commits after validation".into())
+        })?;
+        let oldest = commits.first().cloned().ok_or_else(|| {
+            VersionError::Storage("squash received no commits after validation".into())
+        })?;
         let parent = self.first_parent(&oldest).await?;
         let base_snap = if let Some(p) = &parent {
             self.reconstruct_snapshot(p).await?
@@ -1802,7 +1814,12 @@ impl VersionStore for PgVersionStore {
             let name: String = row.try_get("name").map_err(Self::storage_err)?;
             let expr: String = row.try_get("condition_expr").map_err(Self::storage_err)?;
             match Program::compile(&expr) {
-                Ok(prog) => compiled.push((TagName::new(name), prog)),
+                Ok(prog) => match TagName::parse(&name) {
+                    Ok(name) => compiled.push((name, prog)),
+                    Err(e) => tracing::warn!(
+                        "evaluate_semantic_tags: skip invalid persisted tag {name}: {e}"
+                    ),
+                },
                 Err(e) => {
                     tracing::warn!("evaluate_semantic_tags: skip tag {name} — invalid CEL: {e}");
                 }
@@ -1813,14 +1830,14 @@ impl VersionStore for PgVersionStore {
         }
 
         // 遍历该 scope 最近 500 个 commit，逐个求值
-        const MAX_COMMITS: i64 = 500;
+        let max_commits = self.analysis_config.sql_limit();
         let commit_rows = sqlx::query(
             r#"SELECT id, message, timestamp, metadata_json
                FROM version_commits WHERE scope = $1
                ORDER BY timestamp DESC LIMIT $2"#,
         )
         .bind(&scope_key)
-        .bind(MAX_COMMITS)
+        .bind(max_commits)
         .fetch_all(self.pg())
         .await
         .map_err(Self::storage_err)?;
@@ -1923,9 +1940,15 @@ impl VersionStore for PgVersionStore {
             .map_err(Self::storage_err)?;
         let affected_branches = branch_rows
             .into_iter()
-            .filter_map(|r| r.try_get::<String, _>("name").ok())
-            .map(BranchName::new)
-            .collect();
+            .map(|row| {
+                let name = row
+                    .try_get::<String, _>("name")
+                    .map_err(Self::storage_err)?;
+                BranchName::parse(name).map_err(|error| {
+                    VersionError::Storage(format!("invalid persisted branch name: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(ImpactAnalysis {
             commit: commit.clone(),
             downstream_uris,
@@ -2041,8 +2064,11 @@ impl VersionStore for PgVersionStore {
             let mut tx = self.pg().begin().await.map_err(Self::storage_err)?;
             self.update_branch_head(&mut tx, &scope_key, into, &into_head, &from_head)
                 .await?;
-            let _ =
-                Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &from_head).await?;
+            if !Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &from_head).await? {
+                return Err(VersionError::Storage(
+                    "HEAD changed concurrently during merge".into(),
+                ));
+            }
             tx.commit().await.map_err(Self::storage_err)?;
             return Ok(MergeResult {
                 commit: from_head,
@@ -2075,20 +2101,12 @@ impl VersionStore for PgVersionStore {
 
         let conflicts: Vec<ContextUri> = match strategy {
             KnowledgeMergeStrategy::ContradictionDetection { threshold } => {
-                let mut cs = Vec::new();
-                for (uri_str, fv) in &from_snap {
-                    if let Some(iv) = into_snap.get(uri_str) {
-                        if fv == iv {
-                            continue;
-                        }
-                        if jaccard(fv, iv) < threshold as f64
-                            && let Ok(u) = ContextUri::parse(uri_str.as_str())
-                        {
-                            cs.push(u);
-                        }
-                    }
-                }
-                cs
+                let detector = self.contradiction_detector.as_ref().ok_or_else(|| {
+                    VersionError::MergeConflict(
+                        "ContradictionDetection requires an injected detector".into(),
+                    )
+                })?;
+                detect_snapshot_contradictions(detector, &from_snap, &into_snap, threshold).await?
             }
             KnowledgeMergeStrategy::EntityAutoMerge | KnowledgeMergeStrategy::GraphMerge { .. } => {
                 Vec::new()
@@ -2126,7 +2144,11 @@ impl VersionStore for PgVersionStore {
         self.insert_deltas(&mut tx, &new_id, &deltas).await?;
         self.update_branch_head(&mut tx, &scope_key, into, &into_head, &new_id)
             .await?;
-        let _ = Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &new_id).await?;
+        if !Self::advance_head_if_matches(&mut tx, &scope_key, &into_head, &new_id).await? {
+            return Err(VersionError::Storage(
+                "HEAD changed concurrently during rewrite".into(),
+            ));
+        }
         tx.commit().await.map_err(Self::storage_err)?;
         Ok(MergeResult {
             commit: new_id,
@@ -2273,9 +2295,10 @@ impl PgVersionStore {
         onto_branch: Option<&BranchName>,
         strategy: ConflictStrategy,
     ) -> Result<CommitId> {
-        let onto = onto_branch
-            .cloned()
-            .unwrap_or_else(|| BranchName::new(target.0.to_string()));
+        let onto = match onto_branch {
+            Some(branch) => branch.clone(),
+            None => BranchName::parse(target.0.to_string())?,
+        };
         let session = self
             .build_cherry_pick_session(scope, commit, target, &onto)
             .await?;

@@ -82,28 +82,66 @@ struct VoteState {
     replay_ids: HashSet<Uuid>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VotingConfig {
+    pub max_age: Duration,
+    pub max_future_skew: Duration,
+    pub downvote_margin: u32,
+    pub flag_threshold: u32,
+    pub outdated_flag_weight: f32,
+}
+
+impl Default for VotingConfig {
+    fn default() -> Self {
+        Self {
+            max_age: Duration::minutes(5),
+            max_future_skew: Duration::seconds(30),
+            downvote_margin: 3,
+            flag_threshold: 5,
+            outdated_flag_weight: 0.5,
+        }
+    }
+}
+
+impl VotingConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_age <= Duration::zero() || self.max_future_skew < Duration::zero() {
+            return Err("voting time bounds are invalid".into());
+        }
+        if self.flag_threshold == 0 {
+            return Err("flag_threshold must be non-zero".into());
+        }
+        if !self.outdated_flag_weight.is_finite()
+            || !(0.0..=1.0).contains(&self.outdated_flag_weight)
+        {
+            return Err("outdated_flag_weight must be finite and in [0, 1]".into());
+        }
+        Ok(())
+    }
+}
+
 /// Authenticated social voter. All externally reachable voting goes through
 /// `submit`; there is no API that accepts a caller-selected weight.
 pub struct SocialVoter {
     state: parking_lot::RwLock<VoteState>,
     verifier: Box<dyn VoteSignatureVerifier>,
     reputation: Box<dyn VoteReputationPolicy>,
-    max_age: Duration,
-    max_future_skew: Duration,
+    config: VotingConfig,
 }
 
 impl SocialVoter {
     pub fn new(
         verifier: Box<dyn VoteSignatureVerifier>,
         reputation: Box<dyn VoteReputationPolicy>,
-    ) -> Self {
-        Self {
+        config: VotingConfig,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
             state: parking_lot::RwLock::new(VoteState::default()),
             verifier,
             reputation,
-            max_age: Duration::minutes(5),
-            max_future_skew: Duration::seconds(30),
-        }
+            config,
+        })
     }
 
     /// Verifies identity/signature, freshness and replay protection, computes
@@ -111,10 +149,10 @@ impl SocialVoter {
     /// unique `(entry_id, voter)` vote.
     pub fn submit(&self, signed: SignedVote, now: DateTime<Utc>) -> Result<(), VoteError> {
         let payload = signed.payload;
-        if payload.timestamp < now - self.max_age {
+        if payload.timestamp < now - self.config.max_age {
             return Err(VoteError::Stale);
         }
-        if payload.timestamp > now + self.max_future_skew {
+        if payload.timestamp > now + self.config.max_future_skew {
             return Err(VoteError::FutureDated);
         }
         if !self
@@ -197,7 +235,7 @@ impl SocialVoter {
                 value: match vote.op {
                     VoteOp::Upvote => vote.weight,
                     VoteOp::Downvote => -vote.weight,
-                    VoteOp::FlagOutdated => -0.5 * vote.weight,
+                    VoteOp::FlagOutdated => -self.config.outdated_flag_weight * vote.weight,
                 },
                 evidence_uris: entry.evidence_uris.clone(),
                 quality_score: entry.quality_score,
@@ -211,7 +249,8 @@ impl SocialVoter {
 
     pub fn should_delist(&self, entry_id: &MarketId) -> bool {
         let tally = self.tally(entry_id);
-        tally.downvotes > tally.upvotes + 3 || tally.flags >= 5
+        tally.downvotes > tally.upvotes + self.config.downvote_margin
+            || tally.flags >= self.config.flag_threshold
     }
 }
 
@@ -248,7 +287,12 @@ mod tests {
 
     #[test]
     fn repeat_voter_updates_instead_of_stacking() {
-        let voter = SocialVoter::new(Box::new(Verifier), Box::new(Reputation(0.7)));
+        let voter = SocialVoter::new(
+            Box::new(Verifier),
+            Box::new(Reputation(0.7)),
+            VotingConfig::default(),
+        )
+        .unwrap();
         let now = Utc::now();
         let entry = MarketId::new();
         voter
@@ -264,7 +308,12 @@ mod tests {
 
     #[test]
     fn consensus_is_zero_without_direction_or_for_even_split_and_one_when_unanimous() {
-        let voter = SocialVoter::new(Box::new(Verifier), Box::new(Reputation(1.0)));
+        let voter = SocialVoter::new(
+            Box::new(Verifier),
+            Box::new(Reputation(1.0)),
+            VotingConfig::default(),
+        )
+        .unwrap();
         let now = Utc::now();
         let entry = MarketId::new();
         assert_eq!(voter.consensus_factor(&entry), 0.0);
@@ -286,7 +335,12 @@ mod tests {
     fn rejects_bad_identity_stale_future_replay_and_illegal_weights() {
         let now = Utc::now();
         let entry = MarketId::new();
-        let voter = SocialVoter::new(Box::new(Verifier), Box::new(Reputation(1.0)));
+        let voter = SocialVoter::new(
+            Box::new(Verifier),
+            Box::new(Reputation(1.0)),
+            VotingConfig::default(),
+        )
+        .unwrap();
         let mut bad = request(entry, "a", VoteOp::Upvote, now);
         bad.public_key = "b".into();
         assert_eq!(voter.submit(bad, now), Err(VoteError::InvalidSignature));
@@ -308,7 +362,12 @@ mod tests {
         voter.submit(replay.clone(), now).unwrap();
         assert_eq!(voter.submit(replay, now), Err(VoteError::Replay));
         for weight in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
-            let invalid = SocialVoter::new(Box::new(Verifier), Box::new(Reputation(weight)));
+            let invalid = SocialVoter::new(
+                Box::new(Verifier),
+                Box::new(Reputation(weight)),
+                VotingConfig::default(),
+            )
+            .unwrap();
             assert!(matches!(
                 invalid.submit(request(entry, "a", VoteOp::Upvote, now), now),
                 Err(VoteError::InvalidWeight(_))

@@ -13,10 +13,6 @@ use crate::{
     Result, TenantId, TenantOps, TreeNode, VersionEntry, VersionOps,
 };
 
-const DEFAULT_SCAN_LIMIT: usize = 256;
-const DEFAULT_JACCARD_THRESHOLD: f32 = 0.86;
-const DEFAULT_MIN_TOKENS: usize = 5;
-
 #[derive(Debug, Clone)]
 pub struct SemanticWriteDedupConfig {
     pub scan_limit: usize,
@@ -27,10 +23,34 @@ pub struct SemanticWriteDedupConfig {
 impl Default for SemanticWriteDedupConfig {
     fn default() -> Self {
         Self {
-            scan_limit: DEFAULT_SCAN_LIMIT,
-            jaccard_threshold: DEFAULT_JACCARD_THRESHOLD,
-            min_tokens: DEFAULT_MIN_TOKENS,
+            scan_limit: 256,
+            jaccard_threshold: 0.86,
+            min_tokens: 5,
         }
+    }
+}
+
+impl SemanticWriteDedupConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.scan_limit == 0 {
+            return Err(ContextError::Unsupported(
+                "semantic dedup scan_limit must be greater than zero".into(),
+            ));
+        }
+        if !self.jaccard_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.jaccard_threshold)
+            || self.jaccard_threshold == 0.0
+        {
+            return Err(ContextError::Unsupported(
+                "semantic dedup jaccard_threshold must be finite and in (0, 1]".into(),
+            ));
+        }
+        if self.min_tokens == 0 {
+            return Err(ContextError::Unsupported(
+                "semantic dedup min_tokens must be greater than zero".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -48,12 +68,13 @@ pub struct SemanticWriteDedupStore<R> {
 }
 
 impl<R> SemanticWriteDedupStore<R> {
-    pub fn new(inner: R) -> Self {
+    pub fn new(inner: R) -> Result<Self> {
         Self::with_config(inner, SemanticWriteDedupConfig::default())
     }
 
-    pub fn with_config(inner: R, config: SemanticWriteDedupConfig) -> Self {
-        Self { inner, config }
+    pub fn with_config(inner: R, config: SemanticWriteDedupConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self { inner, config })
     }
 
     pub fn into_inner(self) -> R {
@@ -484,7 +505,8 @@ mod tests {
                 min_tokens: 3,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         let first = store
             .write(entry(

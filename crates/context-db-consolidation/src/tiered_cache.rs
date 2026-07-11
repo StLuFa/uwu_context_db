@@ -56,6 +56,29 @@ pub struct PredictivePromotionConfig {
     pub warm_ttl_multiplier: f32,
 }
 
+impl PredictivePromotionConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        crate::validate_unit_f32("hot_threshold", self.hot_threshold)?;
+        crate::validate_unit_f32("warm_threshold", self.warm_threshold)?;
+        if self.warm_threshold > self.hot_threshold {
+            return Err(crate::ConfigError(
+                "warm_threshold must not exceed hot_threshold".into(),
+            ));
+        }
+        for (name, value) in [
+            ("hot_ttl_multiplier", self.hot_ttl_multiplier),
+            ("warm_ttl_multiplier", self.warm_ttl_multiplier),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(crate::ConfigError(format!(
+                    "{name} must be finite and positive"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for PredictivePromotionConfig {
     fn default() -> Self {
         Self {
@@ -93,8 +116,18 @@ pub struct TieredCache {
 }
 
 impl TieredCache {
-    pub fn new(hot_cap: usize, warm_cap: usize) -> Self {
-        Self {
+    pub fn new(
+        hot_cap: usize,
+        warm_cap: usize,
+        predictive_config: PredictivePromotionConfig,
+    ) -> Result<Self, crate::ConfigError> {
+        if hot_cap == 0 || warm_cap == 0 {
+            return Err(crate::ConfigError(
+                "cache capacities must be nonzero".into(),
+            ));
+        }
+        predictive_config.validate()?;
+        Ok(Self {
             hot: moka::future::Cache::builder()
                 .max_capacity(hot_cap.max(1) as u64)
                 .expire_after(CacheEntryExpiry)
@@ -103,13 +136,8 @@ impl TieredCache {
             warm_capacity: warm_cap.max(1),
             hot_ttl: Duration::from_secs(300),
             warm_ttl: Duration::from_secs(3600),
-            predictive_config: PredictivePromotionConfig::default(),
-        }
-    }
-
-    pub fn with_predictive_config(mut self, config: PredictivePromotionConfig) -> Self {
-        self.predictive_config = config;
-        self
+            predictive_config,
+        })
     }
 
     /// 读取 — 先查 hot，再查 warm；warm 命中会提升到 hot，未命中由调用方回源。
@@ -299,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn predictive_promotion_splits_hot_warm_and_skip() {
-        let cache = TieredCache::new(8, 8);
+        let cache = TieredCache::new(8, 8, PredictivePromotionConfig::default()).unwrap();
         let predictions = vec![
             prediction("uwu://t/agent/a/memory/fact/hot", 0.9),
             prediction("uwu://t/agent/a/memory/fact/warm", 0.4),
@@ -323,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn warm_capacity_evicts_lowest_prediction() {
-        let cache = TieredCache::new(8, 1);
+        let cache = TieredCache::new(8, 1, PredictivePromotionConfig::default()).unwrap();
         let predictions = vec![
             prediction("uwu://t/agent/a/memory/fact/a", 0.3),
             prediction("uwu://t/agent/a/memory/fact/b", 0.6),

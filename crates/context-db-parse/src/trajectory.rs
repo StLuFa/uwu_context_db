@@ -27,20 +27,33 @@ impl TrajectoryExtractorImpl {
 impl TrajectoryExtractor for TrajectoryExtractorImpl {
     async fn extract_trajectory(&self, archive: &ContextUri) -> Result<Trajectory> {
         // 读取归档内容
-        let content = self
-            .fs
-            .read(archive, ContentLevel::L1)
-            .await
-            .unwrap_or_else(|_| agent_context_db_core::ContentPayload::Text {
-                sparse: "empty".into(),
-                dense: String::new(),
-                full: String::new(),
-            });
+        let content = self.fs.read(archive, ContentLevel::L1).await?;
 
         let text = match &content {
-            agent_context_db_core::ContentPayload::Text { dense, .. } => dense.clone(),
-            _ => String::new(),
+            agent_context_db_core::ContentPayload::Text {
+                dense,
+                full,
+                sparse,
+            } => {
+                if !dense.trim().is_empty() {
+                    dense.clone()
+                } else if !full.trim().is_empty() {
+                    full.clone()
+                } else {
+                    sparse.clone()
+                }
+            }
+            _ => {
+                return Err(agent_context_db_core::ContextError::Unsupported(format!(
+                    "trajectory archive {archive} is not text"
+                )));
+            }
         };
+        if text.trim().is_empty() {
+            return Err(agent_context_db_core::ContextError::Storage(format!(
+                "trajectory archive {archive} is empty"
+            )));
+        }
 
         let prompt = format!(
             r#"Analyze this conversation archive and extract a structured trajectory.
@@ -72,12 +85,19 @@ Return a JSON object with these fields:
             result: String,
         }
 
-        let raw: RawTrajectory =
-            serde_json::from_str(&response).unwrap_or_else(|_| RawTrajectory {
-                did_what: "session completed".into(),
-                how: "conversation".into(),
-                result: response.chars().take(200).collect(),
-            });
+        let raw: RawTrajectory = serde_json::from_str(&response).map_err(|error| {
+            agent_context_db_core::ContextError::Storage(format!(
+                "llm trajectory returned invalid JSON: {error}"
+            ))
+        })?;
+        if raw.did_what.trim().is_empty()
+            || raw.how.trim().is_empty()
+            || raw.result.trim().is_empty()
+        {
+            return Err(agent_context_db_core::ContextError::Storage(
+                "llm trajectory returned empty required fields".into(),
+            ));
+        }
 
         let traj_uri = archive.join("trajectory.json");
 
@@ -95,24 +115,36 @@ Return a JSON object with these fields:
     async fn induce_experience(&self, trajectories: Vec<ContextUri>) -> Result<Experience> {
         // 读取每条轨迹的内容
         let mut traj_texts = Vec::new();
-        for uri in &trajectories {
-            if let Ok(content) = self.fs.read(uri, ContentLevel::L1).await
-                && let agent_context_db_core::ContentPayload::Text { dense, .. } = content
-            {
-                traj_texts.push(dense)
-            }
+        if trajectories.is_empty() {
+            return Err(agent_context_db_core::ContextError::Storage(
+                "cannot induce experience from an empty trajectory list".into(),
+            ));
         }
-
-        if traj_texts.is_empty() {
-            return Ok(Experience {
-                uri: trajectories.first().cloned().unwrap_or_else(|| {
-                    ContextUri::parse("uwu://default/experiences/empty").expect("static uri")
-                }),
-                situation: "no data".into(),
-                approach: "none".into(),
-                reflect: "nothing to reflect on".into(),
-                related_trajectories: trajectories,
-            });
+        for uri in &trajectories {
+            let content = self.fs.read(uri, ContentLevel::L1).await?;
+            let agent_context_db_core::ContentPayload::Text {
+                dense,
+                full,
+                sparse,
+            } = content
+            else {
+                return Err(agent_context_db_core::ContextError::Unsupported(format!(
+                    "trajectory {uri} is not text"
+                )));
+            };
+            let text = if !dense.trim().is_empty() {
+                dense
+            } else if !full.trim().is_empty() {
+                full
+            } else {
+                sparse
+            };
+            if text.trim().is_empty() {
+                return Err(agent_context_db_core::ContextError::Storage(format!(
+                    "trajectory {uri} is empty"
+                )));
+            }
+            traj_texts.push(text);
         }
 
         let combined = traj_texts.join("\n---\n");
@@ -147,18 +179,31 @@ Return a JSON object with:
             reflect: String,
         }
 
-        let raw: RawExperience =
-            serde_json::from_str(&response).unwrap_or_else(|_| RawExperience {
-                situation: "general task".into(),
-                approach: "standard approach".into(),
-                reflect: response.chars().take(200).collect(),
-            });
+        let raw: RawExperience = serde_json::from_str(&response).map_err(|error| {
+            agent_context_db_core::ContextError::Storage(format!(
+                "llm experience returned invalid JSON: {error}"
+            ))
+        })?;
+        if raw.situation.trim().is_empty()
+            || raw.approach.trim().is_empty()
+            || raw.reflect.trim().is_empty()
+        {
+            return Err(agent_context_db_core::ContextError::Storage(
+                "llm experience returned empty required fields".into(),
+            ));
+        }
 
-        let exp_uri = trajectories
-            .first()
-            .and_then(|u| u.parent())
-            .unwrap_or_else(|| ContextUri::parse("uwu://default/experiences").expect("static uri"))
-            .join("experience.json");
+        let first = trajectories.first().ok_or_else(|| {
+            agent_context_db_core::ContextError::Storage(
+                "cannot induce experience from an empty trajectory list".into(),
+            )
+        })?;
+        let parent = first.parent().ok_or_else(|| {
+            agent_context_db_core::ContextError::InvalidUri(format!(
+                "trajectory URI has no parent: {first}"
+            ))
+        })?;
+        let exp_uri = parent.join("experience.json");
 
         Ok(Experience {
             uri: exp_uri,

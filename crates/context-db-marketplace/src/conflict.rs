@@ -64,6 +64,69 @@ impl Default for DebateConfig {
     }
 }
 
+impl DebateConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.rounds == 0 || self.max_tokens_per_turn == 0 {
+            return Err("debate limits must be non-zero".into());
+        }
+        for (name, value) in [
+            ("judge_temperature", self.judge_temperature),
+            ("advocate_temperature", self.advocate_temperature),
+            ("min_judge_confidence", self.min_judge_confidence),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(format!("{name} must be finite and in [0, 1]"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictConfig {
+    pub duplicate_similarity: f32,
+    pub conflict_similarity: f32,
+    pub direct_contradiction_similarity: f32,
+    pub corroboration_advantage: usize,
+    pub quality_advantage: f32,
+    pub debate: DebateConfig,
+}
+
+impl Default for ConflictConfig {
+    fn default() -> Self {
+        Self {
+            duplicate_similarity: 0.8,
+            conflict_similarity: 0.4,
+            direct_contradiction_similarity: 0.6,
+            corroboration_advantage: 2,
+            quality_advantage: 0.2,
+            debate: DebateConfig::default(),
+        }
+    }
+}
+
+impl ConflictConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for value in [
+            self.duplicate_similarity,
+            self.conflict_similarity,
+            self.direct_contradiction_similarity,
+            self.quality_advantage,
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err("conflict thresholds must be finite and in [0, 1]".into());
+            }
+        }
+        if self.conflict_similarity > self.direct_contradiction_similarity
+            || self.direct_contradiction_similarity > self.duplicate_similarity
+            || self.corroboration_advantage == 0
+        {
+            return Err("conflict thresholds are inconsistent".into());
+        }
+        self.debate.validate()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DebateRole {
@@ -97,24 +160,17 @@ pub struct DebateReport {
 /// 冲突仲裁器。
 pub struct ConflictResolver {
     llm: Option<Arc<dyn LlmClient>>,
-    debate_config: DebateConfig,
+    config: ConflictConfig,
 }
 
 impl ConflictResolver {
-    pub fn new() -> Self {
-        Self {
-            llm: None,
-            debate_config: DebateConfig::default(),
-        }
+    pub fn new(config: ConflictConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self { llm: None, config })
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
         self.llm = Some(llm);
-        self
-    }
-
-    pub fn with_debate_config(mut self, config: DebateConfig) -> Self {
-        self.debate_config = config;
         self
     }
 
@@ -134,15 +190,17 @@ impl ConflictResolver {
             0.0
         };
 
-        if jaccard > 0.8 {
+        if jaccard > self.config.duplicate_similarity {
             return None;
         }
 
-        if jaccard > 0.4 && has_contradiction_marker(&a.principle, &b.principle) {
+        if jaccard > self.config.conflict_similarity
+            && has_contradiction_marker(&a.principle, &b.principle)
+        {
             let common_evidence = a.evidence_uris.iter().any(|u| b.evidence_uris.contains(u));
             let conflict_type = if common_evidence {
                 ConflictType::SameEvidenceDifferentConclusion
-            } else if jaccard > 0.6 {
+            } else if jaccard > self.config.direct_contradiction_similarity {
                 ConflictType::DirectContradiction
             } else {
                 ConflictType::Overlapping
@@ -174,7 +232,7 @@ impl ConflictResolver {
 
     /// 仲裁冲突。证据强弱悬殊时直接裁决；其余高价值冲突走多智能体辩论。
     pub async fn arbitrate(&self, conflict: &MarketConflict) -> MarketConflictResolution {
-        if let Some(resolution) = strong_evidence_resolution(conflict) {
+        if let Some(resolution) = strong_evidence_resolution(conflict, &self.config) {
             return resolution;
         }
 
@@ -197,7 +255,7 @@ impl ConflictResolver {
         };
 
         let mut turns = Vec::new();
-        for round in 0..self.debate_config.rounds.max(1) {
+        for round in 0..self.config.debate.rounds.max(1) {
             let prompts = vec![
                 debate_prompt(conflict, DebateRole::AdvocateA, round, &turns),
                 debate_prompt(conflict, DebateRole::AdvocateB, round, &turns),
@@ -206,8 +264,8 @@ impl ConflictResolver {
                 .batch_complete(
                     &prompts,
                     &LlmOpts {
-                        max_tokens: Some(self.debate_config.max_tokens_per_turn),
-                        temperature: Some(self.debate_config.advocate_temperature),
+                        max_tokens: Some(self.config.debate.max_tokens_per_turn),
+                        temperature: Some(self.config.debate.advocate_temperature),
                         task: LlmTaskKind::Arbitration,
                         prompt: PromptOptimization::default()
                             .force_cache()
@@ -230,25 +288,24 @@ impl ConflictResolver {
             });
         }
 
-        let verdict = judge_verdict(llm, conflict, &turns, &self.debate_config).await;
-        let resolution = resolution_from_verdict(&verdict, self.debate_config.min_judge_confidence);
+        let verdict = judge_verdict(llm, conflict, &turns, &self.config.debate).await;
+        let resolution = resolution_from_verdict(&verdict, self.config.debate.min_judge_confidence);
         (resolution, DebateReport { turns, verdict })
     }
 }
 
-impl Default for ConflictResolver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn strong_evidence_resolution(conflict: &MarketConflict) -> Option<MarketConflictResolution> {
+fn strong_evidence_resolution(
+    conflict: &MarketConflict,
+    config: &ConflictConfig,
+) -> Option<MarketConflictResolution> {
     let a = &conflict.entry_a;
     let b = &conflict.entry_b;
     let a_corrob = a.corroboration.independent_sources;
     let b_corrob = b.corroboration.independent_sources;
 
-    if a_corrob > b_corrob * 2 && a.quality_score > b.quality_score + 0.2 {
+    if a_corrob > b_corrob * config.corroboration_advantage
+        && a.quality_score > b.quality_score + config.quality_advantage
+    {
         return Some(MarketConflictResolution::KeepA {
             reason: format!(
                 "{} corroborators vs {}, quality {:.2} vs {:.2}",
@@ -256,7 +313,9 @@ fn strong_evidence_resolution(conflict: &MarketConflict) -> Option<MarketConflic
             ),
         });
     }
-    if b_corrob > a_corrob * 2 && b.quality_score > a.quality_score + 0.2 {
+    if b_corrob > a_corrob * config.corroboration_advantage
+        && b.quality_score > a.quality_score + config.quality_advantage
+    {
         return Some(MarketConflictResolution::KeepB {
             reason: format!(
                 "{} corroborators vs {}, quality {:.2} vs {:.2}",
@@ -401,7 +460,13 @@ fn parse_verdict(raw: &str) -> Option<DebateVerdict> {
         resolution: value["resolution"].as_str()?.to_ascii_lowercase(),
         reason: value["reason"].as_str().unwrap_or("debate judged").into(),
         merged: value["merged"].as_str().map(ToOwned::to_owned),
-        confidence: value["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32,
+        confidence: {
+            let confidence = value["confidence"].as_f64()?;
+            if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+                return None;
+            }
+            confidence as f32
+        },
         hidden_assumptions: value["hidden_assumptions"]
             .as_array()
             .map(|items| {
@@ -564,12 +629,15 @@ mod tests {
             conflict_type: ConflictType::DirectContradiction,
             similarity: 0.7,
         };
-        let resolver = ConflictResolver::new()
-            .with_llm(Arc::new(DebateLlm))
-            .with_debate_config(DebateConfig {
+        let resolver = ConflictResolver::new(ConflictConfig {
+            debate: DebateConfig {
                 rounds: 2,
                 ..Default::default()
-            });
+            },
+            ..Default::default()
+        })
+        .unwrap()
+        .with_llm(Arc::new(DebateLlm));
 
         let (resolution, report) = resolver.debate_arbitrate(&conflict).await;
 

@@ -12,7 +12,8 @@ use agent_context_db_consolidation::{
 };
 use agent_context_db_core::{
     ConsolidationMeta as EntryConsolidationMeta, ConsolidationStatus, ContentType, ContextEntry,
-    ContextUri, EpistemicType, LineageEntry, MvccVersion, StateScope, TenantId, ValidityRecord,
+    ContextError, ContextUri, EpistemicType, LineageEntry, MvccVersion, StateScope, TenantId,
+    ValidityRecord,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -86,12 +87,13 @@ impl CdtConsolidationBridge {
         &self,
         index: usize,
         gradient: &SemanticGradient,
-    ) -> CdtConsolidationSignal {
-        CdtConsolidationSignal {
-            uri: gradient
-                .source_uri
-                .clone()
-                .unwrap_or_else(|| self.make_uri("reflection", index, &gradient.reflection_text)),
+    ) -> Result<CdtConsolidationSignal, ContextError> {
+        let uri = match &gradient.source_uri {
+            Some(uri) => uri.clone(),
+            None => self.make_uri("reflection", index, &gradient.reflection_text)?,
+        };
+        Ok(CdtConsolidationSignal {
+            uri,
             content_type: ContentType::Reflection,
             epistemic_type: EpistemicType::Heuristic,
             content: format!(
@@ -105,13 +107,13 @@ impl CdtConsolidationBridge {
             source: CdtSignalSource::Reflexion,
             tags: gradient.epistemic_tags.clone(),
             hypothesis_outcome: None,
-        }
+        })
     }
 
     pub fn entries_from_semantic_gradients(
         &self,
         gradients: &[SemanticGradient],
-    ) -> Vec<ContextEntry> {
+    ) -> Result<Vec<ContextEntry>, ContextError> {
         let config = ReflectionWritebackConfig {
             agent_scope: self.agent_scope.clone(),
             tenant: self.tenant,
@@ -120,32 +122,36 @@ impl CdtConsolidationBridge {
         gradients
             .iter()
             .enumerate()
-            .flat_map(|(index, gradient)| gradient.to_memory_entries(&config, index))
-            .collect()
+            .map(|(index, gradient)| gradient.to_memory_entries(&config, index))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|entries| entries.into_iter().flatten().collect())
     }
 
     pub fn signal_from_insight(
         &self,
         index: usize,
         insight: &EvolvableInsight,
-    ) -> CdtConsolidationSignal {
-        CdtConsolidationSignal {
+    ) -> Result<CdtConsolidationSignal, ContextError> {
+        Ok(CdtConsolidationSignal {
             uri: insight.uri.clone(),
             content_type: insight.epistemic_type,
             epistemic_type: epistemic_from_content_type(insight.epistemic_type),
             content: insight.content.clone(),
             quality_score: insight.votes.net_score.clamp(0.0, 1.0),
             confidence: insight.votes.net_score.clamp(0.0, 1.0),
-            evidence_uris: vec![self.make_uri("reflection", index, &insight.content)],
+            evidence_uris: vec![self.make_uri("reflection", index, &insight.content)?],
             contradiction_uris: vec![],
             source: CdtSignalSource::ExpeLInsight,
             tags: insight.evidence.clone(),
             hypothesis_outcome: None,
-        }
+        })
     }
 
-    pub fn batch_from_signals(&self, signals: &[CdtConsolidationSignal]) -> CdtConsolidationBatch {
-        CdtConsolidationBatch {
+    pub fn batch_from_signals(
+        &self,
+        signals: &[CdtConsolidationSignal],
+    ) -> Result<CdtConsolidationBatch, ContextError> {
+        Ok(CdtConsolidationBatch {
             products: signals
                 .iter()
                 .map(|signal| self.product_from_signal(signal))
@@ -153,8 +159,8 @@ impl CdtConsolidationBridge {
             entries: signals
                 .iter()
                 .map(|signal| self.entry_from_signal(signal))
-                .collect(),
-        }
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 
     pub fn product_from_signal(&self, signal: &CdtConsolidationSignal) -> ConsolidationProduct {
@@ -181,6 +187,7 @@ impl CdtConsolidationBridge {
             content: signal.content.clone(),
             quality_score: signal.quality_score.clamp(0.0, 1.0),
             confidence: signal.confidence.clamp(0.0, 1.0),
+            evidence_required: false,
             superseded_claim,
             evidence_uris: signal.evidence_uris.clone(),
             contradiction_uris: signal.contradiction_uris.clone(),
@@ -213,7 +220,10 @@ impl CdtConsolidationBridge {
         }
     }
 
-    pub fn entry_from_signal(&self, signal: &CdtConsolidationSignal) -> ContextEntry {
+    pub fn entry_from_signal(
+        &self,
+        signal: &CdtConsolidationSignal,
+    ) -> Result<ContextEntry, ContextError> {
         let mut entry =
             ContextEntry::new_text(signal.uri.clone(), self.tenant, signal.content.clone());
         entry.metadata.content_type = Some(signal.content_type);
@@ -244,10 +254,11 @@ impl CdtConsolidationBridge {
             }),
             entangled_with: signal.contradiction_uris.clone(),
         });
-        let _ = entry
-            .metadata
-            .set_custom_field("cdt_signal_source", &format!("{:?}", signal.source));
         entry
+            .metadata
+            .set_custom_field("cdt_signal_source", &format!("{:?}", signal.source))
+            .map_err(ContextError::Serialization)?;
+        Ok(entry)
     }
 
     pub fn signal_from_gradient(&self, gradient: &CognitiveGradient) -> CdtConsolidationSignal {
@@ -334,14 +345,18 @@ impl CdtConsolidationBridge {
         }
     }
 
-    fn make_uri(&self, content_type: &str, index: usize, content: &str) -> ContextUri {
-        let hash = blake3::hash(content.as_bytes()).to_hex();
-        let short = &hash[..8];
+    fn make_uri(
+        &self,
+        content_type: &str,
+        index: usize,
+        content: &str,
+    ) -> Result<ContextUri, ContextError> {
+        let hash = blake3::hash(content.as_bytes());
+        let short = hash.to_hex().chars().take(8).collect::<String>();
         ContextUri::parse(format!(
             "uwu://{}/memory/{}/{:02}-{}",
             self.agent_scope, content_type, index, short
         ))
-        .unwrap_or_else(|_| ContextUri::parse("uwu://t/agent/cdt/meta/fallback").unwrap())
     }
 }
 
@@ -428,7 +443,7 @@ mod tests {
         };
 
         let signal = bridge.signal_from_gradient(&gradient);
-        let batch = bridge.batch_from_signals(&[signal]);
+        let batch = bridge.batch_from_signals(&[signal]).unwrap();
         assert_eq!(batch.products.len(), 1);
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(batch.products[0].content_type, ContentType::Skill);

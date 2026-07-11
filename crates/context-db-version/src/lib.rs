@@ -10,6 +10,7 @@
 //! - `VersionStore` 是端口（零实现）；线性快照 / DAG 后端由宿主注入。
 
 pub mod belief_revision;
+pub mod contradiction;
 pub mod crdt_merge;
 pub mod innovation;
 pub mod model;
@@ -20,6 +21,7 @@ pub use belief_revision::{
     BeliefPredicate, BeliefRevisionAction, BeliefRevisionDecision, BeliefSentence,
     NeuralBeliefExtraction, revision_to_resolution,
 };
+pub use contradiction::{ContradictionDetector, detect_snapshot_contradictions};
 pub use crdt_merge::{CrdtMergeResult, CrdtMerger, CrdtStrategy};
 pub use innovation::{
     CausalDiscoveryConfig, CausalEdge, CausalGraph, CausalHypothesis, CausalInference,
@@ -36,8 +38,8 @@ pub use model::{
     TemporalIndex, TemporalVersion, UriChange, VersionRef,
 };
 pub use reasoning::{
-    ChangeCategory, DiffChangeType, DiffImpact, DiffReasoner, SemanticChange, SemanticDiff,
-    TemporalPattern, TemporalReasoner, TimelineEvent,
+    ChangeCategory, DiffChangeType, DiffImpact, DiffReasoner, ReasoningConfig, SemanticChange,
+    SemanticDiff, TemporalPattern, TemporalReasoner, TimelineEvent,
 };
 
 pub use agent_context_db_core::ContentHash;
@@ -61,9 +63,39 @@ pub enum VersionError {
     ConflictSessionIncomplete(String),
     #[error("storage: {0}")]
     Storage(String),
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
 }
 
 pub type Result<T> = std::result::Result<T, VersionError>;
+
+/// Shared limits for version-history analysis across all store backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionAnalysisConfig {
+    /// Maximum number of recent commits inspected by bounded analyses.
+    pub max_commits: usize,
+}
+
+impl VersionAnalysisConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_commits == 0 || self.max_commits > i64::MAX as usize {
+            return Err(VersionError::InvalidConfig(
+                "version analysis max_commits must be in 1..=i64::MAX".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn sql_limit(&self) -> i64 {
+        self.max_commits as i64
+    }
+}
+
+impl Default for VersionAnalysisConfig {
+    fn default() -> Self {
+        Self { max_commits: 500 }
+    }
+}
 
 /// 时间旅行读取的时间点。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -667,7 +699,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             metadata: CommitMeta {
                 trigger: CommitTrigger::Merge {
-                    branches: vec![BranchName::new("main")],
+                    branches: vec![BranchName::parse("main").unwrap()],
                 },
                 changes: ChangeSet::default(),
                 provenance: vec![],

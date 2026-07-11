@@ -82,7 +82,10 @@ impl CrystalMemoryWriter {
         self
     }
 
-    pub fn entries_from_crystals(&self, crystals: &[KnowledgeCrystal]) -> CrystalWritebackReport {
+    pub fn entries_from_crystals(
+        &self,
+        crystals: &[KnowledgeCrystal],
+    ) -> crate::Result<CrystalWritebackReport> {
         let mut report = CrystalWritebackReport::default();
         for (index, crystal) in crystals.iter().enumerate() {
             if crystal.confidence < self.config.min_confidence {
@@ -91,15 +94,18 @@ impl CrystalMemoryWriter {
             }
             report
                 .entries
-                .push(entry_from_crystal(&self.config, crystal, index));
+                .push(entry_from_crystal(&self.config, crystal, index)?);
         }
-        report
+        Ok(report)
     }
 
-    pub fn entries_from_dream_insights(&self, insights: &[String]) -> CrystalWritebackReport {
+    pub fn entries_from_dream_insights(
+        &self,
+        insights: &[String],
+    ) -> crate::Result<CrystalWritebackReport> {
         let mut report = CrystalWritebackReport::default();
         if !self.config.write_dream_insights {
-            return report;
+            return Ok(report);
         }
         for (index, insight) in insights.iter().enumerate() {
             let trimmed = insight.trim();
@@ -109,32 +115,38 @@ impl CrystalMemoryWriter {
             }
             report
                 .entries
-                .push(entry_from_dream_insight(&self.config, trimmed, index));
+                .push(entry_from_dream_insight(&self.config, trimmed, index)?);
         }
-        report
+        Ok(report)
     }
 
-    pub async fn write_crystals(&self, crystals: &[KnowledgeCrystal]) -> CrystalWritebackReport {
-        let mut report = self.entries_from_crystals(crystals);
-        report.written = self.write_entries(&report.entries).await;
-        report
+    pub async fn write_crystals(
+        &self,
+        crystals: &[KnowledgeCrystal],
+    ) -> crate::Result<CrystalWritebackReport> {
+        let mut report = self.entries_from_crystals(crystals)?;
+        report.written = self.write_entries(&report.entries).await?;
+        Ok(report)
     }
 
-    pub async fn write_dream_insights(&self, insights: &[String]) -> CrystalWritebackReport {
-        let mut report = self.entries_from_dream_insights(insights);
-        report.written = self.write_entries(&report.entries).await;
-        report
+    pub async fn write_dream_insights(
+        &self,
+        insights: &[String],
+    ) -> crate::Result<CrystalWritebackReport> {
+        let mut report = self.entries_from_dream_insights(insights)?;
+        report.written = self.write_entries(&report.entries).await?;
+        Ok(report)
     }
 
-    async fn write_entries(&self, entries: &[ContextEntry]) -> usize {
+    async fn write_entries(&self, entries: &[ContextEntry]) -> crate::Result<usize> {
         let Some(store) = &self.store else {
-            return 0;
+            return Ok(0);
         };
         store
             .batch_write(entries)
             .await
             .map(|versions| versions.len())
-            .unwrap_or(0)
+            .map_err(|error| crate::VersionError::Storage(error.to_string()))
     }
 }
 
@@ -142,14 +154,14 @@ fn entry_from_crystal(
     config: &CrystalWritebackConfig,
     crystal: &KnowledgeCrystal,
     index: usize,
-) -> ContextEntry {
+) -> crate::Result<ContextEntry> {
     let now = chrono::Utc::now();
     let slug = stable_slug(&format!("{}-{}", crystal.id, crystal.principle));
     let uri = ContextUri::parse(format!(
         "uwu://{}/memory/skill/crystal/{:02}-{}",
         config.agent_scope, index, slug
     ))
-    .unwrap_or_else(|_| ContextUri::parse("uwu://t/a/memory/skill/crystal/fallback").unwrap());
+    .map_err(|error| crate::VersionError::Storage(format!("invalid crystal URI: {error}")))?;
     let mut entry = ContextEntry {
         uri,
         tenant: config.tenant,
@@ -206,24 +218,25 @@ fn entry_from_crystal(
         half_life: Some(agent_context_db_core::HalfLife::Finite { days: 180.0 }),
         entangled_with: crystal.evidence.clone(),
     });
-    let _ = entry
-        .metadata
-        .set_custom_field("knowledge_crystal", crystal);
     entry
+        .metadata
+        .set_custom_field("knowledge_crystal", crystal)
+        .map_err(|error| crate::VersionError::Storage(error.to_string()))?;
+    Ok(entry)
 }
 
 fn entry_from_dream_insight(
     config: &CrystalWritebackConfig,
     insight: &str,
     index: usize,
-) -> ContextEntry {
+) -> crate::Result<ContextEntry> {
     let now = chrono::Utc::now();
     let slug = stable_slug(insight);
     let uri = ContextUri::parse(format!(
         "uwu://{}/memory/heuristic/dream/{:02}-{}",
         config.agent_scope, index, slug
     ))
-    .unwrap_or_else(|_| ContextUri::parse("uwu://t/a/memory/heuristic/dream/fallback").unwrap());
+    .map_err(|error| crate::VersionError::Storage(format!("invalid dream insight URI: {error}")))?;
     let mut entry = ContextEntry::new_text(uri, config.tenant, insight.to_string());
     entry.metadata.content_type = Some(ContentType::Heuristic);
     entry.metadata.state_scope = Some(StateScope::Long);
@@ -244,8 +257,11 @@ fn entry_from_dream_insight(
         half_life: Some(agent_context_db_core::HalfLife::Finite { days: 90.0 }),
         entangled_with: vec![],
     });
-    let _ = entry.metadata.set_custom_field("dream_insight", &insight);
     entry
+        .metadata
+        .set_custom_field("dream_insight", &insight)
+        .map_err(|error| crate::VersionError::Storage(error.to_string()))?;
+    Ok(entry)
 }
 
 fn stable_slug(text: &str) -> String {
@@ -270,7 +286,7 @@ fn blake3_like(text: &str) -> String {
         acc ^= *byte as u64;
         acc = acc.wrapping_mul(0x100000001b3);
     }
-    format!("{:x}", acc)[..8].to_string()
+    format!("{acc:016x}").chars().take(8).collect()
 }
 
 impl CrystalDistiller {
@@ -491,6 +507,27 @@ pub struct ReplaySleepConfig {
     pub skill_success_floor: f32,
 }
 
+impl ReplaySleepConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.max_commits == 0 || self.min_cluster_size == 0 {
+            return Err(crate::VersionError::InvalidConfig(
+                "replay limits must be greater than zero".into(),
+            ));
+        }
+        for (name, value) in [
+            ("min_crystal_confidence", self.min_crystal_confidence),
+            ("skill_success_floor", self.skill_success_floor),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(crate::VersionError::InvalidConfig(format!(
+                    "{name} must be finite and in 0..=1"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for ReplaySleepConfig {
     fn default() -> Self {
         Self {
@@ -529,18 +566,19 @@ struct DreamClusterPrompt {
 }
 
 impl<V: VersionStore> DreamConsolidator<V> {
-    pub fn new(store: Arc<V>, llm: Arc<dyn LlmClient>, fs: Arc<dyn FsOps>) -> Self {
-        Self {
+    pub fn new(
+        store: Arc<V>,
+        llm: Arc<dyn LlmClient>,
+        fs: Arc<dyn FsOps>,
+        replay_config: ReplaySleepConfig,
+    ) -> crate::Result<Self> {
+        replay_config.validate()?;
+        Ok(Self {
             store,
             llm,
             fs,
-            replay_config: ReplaySleepConfig::default(),
-        }
-    }
-
-    pub fn with_replay_config(mut self, config: ReplaySleepConfig) -> Self {
-        self.replay_config = config;
-        self
+            replay_config,
+        })
     }
 
     /// 执行一次"梦境"巩固周期。
@@ -688,8 +726,8 @@ impl<V: VersionStore> DreamConsolidator<V> {
             .await
             .map_err(|e| crate::VersionError::Storage(format!("dream crystal distill: {e}")))?;
 
-        let mut memory_writeback = writer.write_crystals(&crystals).await;
-        let dream_report = writer.write_dream_insights(&insights).await;
+        let mut memory_writeback = writer.write_crystals(&crystals).await?;
+        let dream_report = writer.write_dream_insights(&insights).await?;
         memory_writeback.entries.extend(dream_report.entries);
         memory_writeback.skipped_low_confidence += dream_report.skipped_low_confidence;
         memory_writeback.written += dream_report.written;
@@ -701,7 +739,7 @@ impl<V: VersionStore> DreamConsolidator<V> {
             .map(|(index, crystal)| {
                 skill_candidate_from_crystal(crystal, index, self.replay_config.skill_success_floor)
             })
-            .collect::<Vec<_>>();
+            .collect::<crate::Result<Vec<_>>>()?;
 
         Ok(ReplaySleepReport {
             replayed_commits: log.len(),
@@ -736,15 +774,13 @@ fn skill_candidate_from_crystal(
     crystal: &KnowledgeCrystal,
     index: usize,
     success_floor: f32,
-) -> ReplaySkillCandidate {
+) -> crate::Result<ReplaySkillCandidate> {
     let slug = stable_slug(&format!("{}-{}", crystal.id, crystal.principle));
     let uri = ContextUri::parse(format!(
         "uwu://dream/agent/replay/memory/skill/{index:02}-{slug}"
     ))
-    .unwrap_or_else(|_| {
-        ContextUri::parse("uwu://dream/agent/replay/memory/skill/fallback").unwrap()
-    });
-    ReplaySkillCandidate {
+    .map_err(|error| crate::VersionError::Storage(format!("invalid replay skill URI: {error}")))?;
+    Ok(ReplaySkillCandidate {
         uri,
         name: crystal
             .principle
@@ -756,7 +792,7 @@ fn skill_candidate_from_crystal(
         precondition: crystal.preconditions.join("; "),
         success_rate: crystal.confidence.max(success_floor).clamp(0.0, 1.0),
         evidence: crystal.evidence.clone(),
-    }
+    })
 }
 
 fn dream_cluster_prompt(count: usize, summaries: Vec<String>) -> String {
@@ -803,6 +839,55 @@ pub struct CausalDiscoveryConfig {
     pub bic_penalty: f32,
     /// 每个 effect 最多保留多少个直接父节点。
     pub max_parents: usize,
+    pub ate_confidence_weight: f32,
+    pub bic_confidence_weight: f32,
+    pub support_confidence_weight: f32,
+    pub bic_gain_scale: f32,
+}
+
+impl CausalDiscoveryConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.max_log_count == 0
+            || self.max_variables == 0
+            || self.min_support == 0
+            || self.max_parents == 0
+        {
+            return Err(crate::VersionError::InvalidConfig(
+                "causal limits and min_support must be greater than zero".into(),
+            ));
+        }
+        if !self.independence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.independence_threshold)
+        {
+            return Err(crate::VersionError::InvalidConfig(
+                "independence_threshold must be finite and in 0..=1".into(),
+            ));
+        }
+        if !self.bic_penalty.is_finite()
+            || self.bic_penalty < 0.0
+            || !self.bic_gain_scale.is_finite()
+            || self.bic_gain_scale <= 0.0
+        {
+            return Err(crate::VersionError::InvalidConfig(
+                "BIC penalty must be non-negative and gain scale positive".into(),
+            ));
+        }
+        let weights = [
+            self.ate_confidence_weight,
+            self.bic_confidence_weight,
+            self.support_confidence_weight,
+        ];
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || (weights.iter().sum::<f32>() - 1.0).abs() > f32::EPSILON
+        {
+            return Err(crate::VersionError::InvalidConfig(
+                "causal confidence weights must be non-negative and sum to 1".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for CausalDiscoveryConfig {
@@ -815,6 +900,10 @@ impl Default for CausalDiscoveryConfig {
             independence_threshold: 0.08,
             bic_penalty: 1.0,
             max_parents: 4,
+            ate_confidence_weight: 0.62,
+            bic_confidence_weight: 0.28,
+            support_confidence_weight: 0.10,
+            bic_gain_scale: 8.0,
         }
     }
 }
@@ -977,17 +1066,14 @@ pub struct CausalInference<V: VersionStore> {
 }
 
 impl<V: VersionStore> CausalInference<V> {
-    pub fn new(store: Arc<V>) -> Self {
-        Self::with_config(store, CausalDiscoveryConfig::default())
-    }
-
-    pub fn with_config(store: Arc<V>, config: CausalDiscoveryConfig) -> Self {
-        let temporal = TemporalReasoner::new(store.clone());
-        Self {
+    pub fn new(store: Arc<V>, config: CausalDiscoveryConfig) -> crate::Result<Self> {
+        config.validate()?;
+        let temporal = TemporalReasoner::new(store.clone(), crate::ReasoningConfig::default())?;
+        Ok(Self {
             store,
             _temporal: temporal,
             config,
-        }
+        })
     }
 
     /// 学习可干预因果图：PC 条件独立检验去混淆，GES/BIC 选择直接父边。
@@ -1129,9 +1215,10 @@ fn learn_causal_graph(samples: &CausalSamples, config: &CausalDiscoveryConfig) -
             if graph.has_path(&effect_uri, &cause_uri) {
                 continue;
             }
-            let confidence = (ate * 0.62
-                + parent.bic_gain.min(8.0) / 8.0 * 0.28
-                + support_confidence(support) * 0.10)
+            let confidence = (ate * config.ate_confidence_weight
+                + parent.bic_gain.min(config.bic_gain_scale) / config.bic_gain_scale
+                    * config.bic_confidence_weight
+                + support_confidence(support) * config.support_confidence_weight)
                 .clamp(0.0, 1.0);
             edges.push(CausalEdge {
                 cause_uri,
@@ -1570,7 +1657,7 @@ mod tests {
             min_confidence: 0.35,
             write_dream_insights: true,
         });
-        let report = writer.entries_from_crystals(&[crystal]);
+        let report = writer.entries_from_crystals(&[crystal]).unwrap();
         assert_eq!(report.entries.len(), 1);
         let entry = &report.entries[0];
         assert_eq!(entry.metadata.content_type, Some(ContentType::Skill));
@@ -1591,7 +1678,8 @@ mod tests {
     fn crystal_writer_turns_dream_insights_into_heuristics() {
         let writer = CrystalMemoryWriter::new(CrystalWritebackConfig::for_agent("t/a"));
         let report = writer
-            .entries_from_dream_insights(&["cluster auth failures into retry heuristic".into()]);
+            .entries_from_dream_insights(&["cluster auth failures into retry heuristic".into()])
+            .unwrap();
         assert_eq!(report.entries.len(), 1);
         let entry = &report.entries[0];
         assert_eq!(entry.metadata.content_type, Some(ContentType::Heuristic));

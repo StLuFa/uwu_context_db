@@ -13,6 +13,7 @@
 //! - PG 适配器通过 `uwu_database` 基础库注入连接池与向量后端，不自行管理连接。
 use agent_context_db_core::{Page, PageRequest};
 
+pub mod graph;
 pub mod migrations;
 pub mod outbox;
 pub mod perf;
@@ -29,6 +30,7 @@ pub use agent_context_db_core::{
     VectorIndex, WatchHub, WatchSource, WatchableStore,
 };
 
+pub use graph::GraphCentralityConfig;
 pub use migrations::context_db_migrations;
 pub use perf::{
     BatchWriteBuffer, DedupStore, WalEntry, WriteAheadLogger, compress, content_hash, decompress,
@@ -282,6 +284,9 @@ pub async fn service_from_uwu_db(
     db: uwu_database::Database,
     acl: Arc<PathAcl>,
     principal: Principal,
+    contradiction_detector: Arc<dyn agent_context_db_version::ContradictionDetector>,
+    centrality_config: GraphCentralityConfig,
+    version_analysis_config: agent_context_db_version::VersionAnalysisConfig,
 ) -> Result<
     ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>>,
 > {
@@ -293,9 +298,20 @@ pub async fn service_from_uwu_db(
     ) = match db.pool.backend() {
         uwu_database::SqlBackend::Sqlite => {
             migrate_sqlite(&db.pool).await?;
-            let versions = Arc::new(SqliteVersionStore::new(pool.clone()));
+            let versions = Arc::new(
+                SqliteVersionStore::new(pool.clone(), version_analysis_config.clone())
+                    .map_err(|error| {
+                        ContextError::Storage(format!(
+                            "construct sqlite version store failed: {error}"
+                        ))
+                    })?
+                    .with_contradiction_detector(contradiction_detector.clone()),
+            );
             (
-                SqlContextStore::Sqlite(SqliteContextStore::try_new(pool.clone())?),
+                SqlContextStore::Sqlite(SqliteContextStore::try_new(
+                    pool.clone(),
+                    centrality_config,
+                )?),
                 versions.clone(),
                 versions,
             )
@@ -309,9 +325,17 @@ pub async fn service_from_uwu_db(
                 .up(&db.pool)
                 .await
                 .map_err(|e| ContextError::Storage(format!("postgres migration failed: {e}")))?;
-            let versions = Arc::new(PgVersionStore::new(pool.clone()));
+            let versions = Arc::new(
+                PgVersionStore::new(pool.clone(), version_analysis_config.clone())
+                    .map_err(|error| {
+                        ContextError::Storage(format!(
+                            "construct postgres version store failed: {error}"
+                        ))
+                    })?
+                    .with_contradiction_detector(contradiction_detector.clone()),
+            );
             (
-                SqlContextStore::Postgres(PgContextStore::new(pool.clone())),
+                SqlContextStore::Postgres(PgContextStore::new(pool.clone(), centrality_config)?),
                 versions.clone(),
                 versions,
             )
@@ -324,7 +348,7 @@ pub async fn service_from_uwu_db(
     };
 
     let content = Arc::new(WatchableStore::new(
-        SemanticWriteDedupStore::new(AclProtectedStore::new(store, acl, principal)),
+        SemanticWriteDedupStore::new(AclProtectedStore::new(store, acl, principal))?,
         Arc::new(WatchHub::default()),
     ));
     let vector = db.vector.ok_or_else(|| {
@@ -340,10 +364,27 @@ pub async fn service_from_uwu_db(
     )
 }
 
+pub(crate) fn max_connections(
+    config: &agent_context_db_core::config::StorageConfig,
+) -> Result<u32> {
+    if config.max_connections == 0 {
+        return Err(ContextError::Storage(
+            "invalid storage configuration: max_connections must be greater than zero".into(),
+        ));
+    }
+    u32::try_from(config.max_connections).map_err(|_| {
+        ContextError::Storage(format!(
+            "invalid storage configuration: max_connections ({}) exceeds u32::MAX",
+            config.max_connections
+        ))
+    })
+}
+
 /// Convert context-db storage settings into an `uwu_database` runtime configuration.
 pub fn runtime_config(
     config: &agent_context_db_core::config::StorageConfig,
-) -> uwu_database::RuntimeConfig {
+) -> Result<uwu_database::RuntimeConfig> {
+    let max_connections = max_connections(config)?;
     let sql_backend = match config.backend {
         agent_context_db_core::config::SqlStorageBackend::Sqlite => {
             uwu_database::SqlBackend::Sqlite
@@ -360,12 +401,12 @@ pub fn runtime_config(
             uwu_database::VectorBackend::Memory
         }
     };
-    uwu_database::RuntimeConfig {
+    Ok(uwu_database::RuntimeConfig {
         deploy: uwu_database::config::DeployConfig::default(),
         database: uwu_database::DbConfig {
             backend: sql_backend,
             url: config.database_url.clone(),
-            max_connections: config.max_connections.try_into().unwrap_or(u32::MAX),
+            max_connections,
             min_connections: 0,
             acquire_timeout_secs: 5,
             idle_timeout_secs: 600,
@@ -384,11 +425,11 @@ pub fn runtime_config(
             url: config.vector_url.clone(),
             api_key: None,
         },
-    }
+    })
 }
 
 /// Default embedded runtime: SQLite for content and Qdrant Edge for vectors.
-pub fn default_runtime_config() -> uwu_database::RuntimeConfig {
+pub fn default_runtime_config() -> Result<uwu_database::RuntimeConfig> {
     runtime_config(&agent_context_db_core::config::StorageConfig::default())
 }
 
@@ -396,13 +437,81 @@ pub fn default_runtime_config() -> uwu_database::RuntimeConfig {
 pub async fn default_embedded_service(
     acl: Arc<PathAcl>,
     principal: Principal,
+    contradiction_detector: Arc<dyn agent_context_db_version::ContradictionDetector>,
 ) -> Result<
     ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>>,
 > {
-    let db = uwu_database::Database::connect_with_vector(&default_runtime_config())
+    let config = default_runtime_config()?;
+    let db = uwu_database::Database::connect_with_vector(&config)
         .await
         .map_err(|e| ContextError::Storage(format!("connect embedded database failed: {e}")))?;
-    service_from_uwu_db(db, acl, principal).await
+    service_from_uwu_db(
+        db,
+        acl,
+        principal,
+        contradiction_detector,
+        GraphCentralityConfig::default(),
+        agent_context_db_version::VersionAnalysisConfig::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use crate::pg::PgStoreConfig;
+    use agent_context_db_core::config::StorageConfig;
+
+    #[test]
+    fn max_connections_accepts_boundaries() {
+        let config = StorageConfig {
+            max_connections: 1,
+            ..Default::default()
+        };
+        assert_eq!(runtime_config(&config).unwrap().database.max_connections, 1);
+        assert_eq!(
+            PgStoreConfig::from_uwu_config(&config)
+                .unwrap()
+                .max_connections,
+            1
+        );
+
+        let maximum = StorageConfig {
+            max_connections: u32::MAX as usize,
+            ..Default::default()
+        };
+        assert_eq!(
+            runtime_config(&maximum).unwrap().database.max_connections,
+            u32::MAX
+        );
+        assert_eq!(
+            PgStoreConfig::from_uwu_config(&maximum)
+                .unwrap()
+                .max_connections,
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn max_connections_rejects_zero() {
+        let config = StorageConfig {
+            max_connections: 0,
+            ..Default::default()
+        };
+        assert!(runtime_config(&config).is_err());
+        assert!(PgStoreConfig::from_uwu_config(&config).is_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn max_connections_rejects_values_exceeding_u32() {
+        let config = StorageConfig {
+            max_connections: u32::MAX as usize + 1,
+            ..Default::default()
+        };
+        assert!(runtime_config(&config).is_err());
+        assert!(PgStoreConfig::from_uwu_config(&config).is_err());
+    }
 }
 
 // ===========================================================================
@@ -423,10 +532,6 @@ mod pg_tests {
         std::env::var("DATABASE_URL").ok()
     }
 
-    fn require_pg() -> String {
-        pg_url().expect("SKIP: DATABASE_URL not set")
-    }
-
     fn full_acl() -> Arc<PathAcl> {
         let acl = Arc::new(PathAcl::new());
         acl.add_rule(AclRule {
@@ -442,12 +547,29 @@ mod pg_tests {
         Principal::User("test".into())
     }
 
-    fn test_cfg() -> RuntimeConfig {
+    struct TestContradictionDetector;
+
+    #[async_trait::async_trait]
+    impl agent_context_db_version::ContradictionDetector for TestContradictionDetector {
+        async fn contradiction_confidence(
+            &self,
+            _left: &str,
+            _right: &str,
+        ) -> agent_context_db_version::Result<f32> {
+            Ok(0.0)
+        }
+    }
+
+    fn test_detector() -> Arc<dyn agent_context_db_version::ContradictionDetector> {
+        Arc::new(TestContradictionDetector)
+    }
+
+    fn test_cfg(url: String) -> RuntimeConfig {
         RuntimeConfig {
             deploy: DeployConfig::default(),
             database: DbConfig {
                 backend: SqlBackend::Postgres,
-                url: pg_url().unwrap(),
+                url,
                 max_connections: 2,
                 min_connections: 0,
                 acquire_timeout_secs: 5,
@@ -472,13 +594,20 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_service_from_uwu_db_assembles() {
-        let _url = require_pg();
-        let cfg = test_cfg();
+        let Some(url) = pg_url() else { return };
+        let cfg = test_cfg(url);
         let db = Database::connect_with_vector(&cfg).await.unwrap();
 
-        let service = service_from_uwu_db(db, full_acl(), test_principal())
-            .await
-            .unwrap();
+        let service = service_from_uwu_db(
+            db,
+            full_acl(),
+            test_principal(),
+            test_detector(),
+            GraphCentralityConfig::default(),
+            agent_context_db_version::VersionAnalysisConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // 验证各端口可用
         let _fs = service.fs_ops();
@@ -491,21 +620,35 @@ mod pg_tests {
 
     #[tokio::test]
     async fn test_service_from_uwu_db_migration_idempotent() {
-        let _url = require_pg();
-        let cfg = test_cfg();
+        let Some(url) = pg_url() else { return };
+        let cfg = test_cfg(url);
 
         // 第一次：创建表
         let db1 = Database::connect_with_vector(&cfg).await.unwrap();
-        let svc1 = service_from_uwu_db(db1, full_acl(), test_principal())
-            .await
-            .unwrap();
+        let svc1 = service_from_uwu_db(
+            db1,
+            full_acl(),
+            test_principal(),
+            test_detector(),
+            GraphCentralityConfig::default(),
+            agent_context_db_version::VersionAnalysisConfig::default(),
+        )
+        .await
+        .unwrap();
         drop(svc1);
 
         // 第二次：不应报错（表已存在）
         let db2 = Database::connect_with_vector(&cfg).await.unwrap();
-        let svc2 = service_from_uwu_db(db2, full_acl(), test_principal())
-            .await
-            .unwrap();
+        let svc2 = service_from_uwu_db(
+            db2,
+            full_acl(),
+            test_principal(),
+            test_detector(),
+            GraphCentralityConfig::default(),
+            agent_context_db_version::VersionAnalysisConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // 向量后端已实际装配，而不是静默 no-op。
         let _idx = svc2.vector_index();

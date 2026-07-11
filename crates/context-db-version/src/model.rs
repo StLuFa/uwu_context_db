@@ -236,7 +236,7 @@ pub struct Branch {
 
 /// 分支名 —— 保证非空、仅含 `[A-Za-z0-9._/-]`，长度 ≤ 255。
 ///
-/// 使用 [`BranchName::parse`] 或 [`BranchName::new`] 构造；字段私有以强制走验证。
+/// 使用 [`BranchName::parse`] 构造；字段私有以强制走验证。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct BranchName(String);
@@ -247,12 +247,6 @@ impl BranchName {
         let s = name.into();
         Self::validate(&s)?;
         Ok(Self(s))
-    }
-
-    /// 宽松构造（推荐调用点已知名称合法时使用）；非法字符会 panic。
-    pub fn new(name: impl Into<String>) -> Self {
-        Self::parse(name)
-            .expect("BranchName::new called with invalid name — use parse() for fallible")
     }
 
     pub fn as_str(&self) -> &str {
@@ -297,8 +291,36 @@ impl TryFrom<String> for BranchName {
 }
 
 impl From<BranchName> for String {
-    fn from(b: BranchName) -> String {
-        b.0
+    fn from(name: BranchName) -> Self {
+        name.0
+    }
+}
+
+#[cfg(test)]
+mod branch_name_tests {
+    use super::BranchName;
+    use crate::VersionError;
+
+    #[test]
+    fn accepts_valid_branch_names() {
+        for name in ["main", "feature/auth_v2", "release-1.2.3"] {
+            let parsed = BranchName::parse(name).unwrap();
+            assert_eq!(parsed.as_str(), name);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_branch_names() {
+        for name in ["", "has space", "bad:name", "分支"] {
+            assert!(matches!(
+                BranchName::parse(name),
+                Err(VersionError::Storage(_))
+            ));
+        }
+        assert!(matches!(
+            BranchName::parse("a".repeat(256)),
+            Err(VersionError::Storage(_))
+        ));
     }
 }
 
@@ -343,10 +365,6 @@ impl TagName {
         let s = name.into();
         Self::validate(&s)?;
         Ok(Self(s))
-    }
-
-    pub fn new(name: impl Into<String>) -> Self {
-        Self::parse(name).expect("TagName::new called with invalid name — use parse() for fallible")
     }
 
     pub fn as_str(&self) -> &str {

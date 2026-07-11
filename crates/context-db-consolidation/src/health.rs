@@ -9,7 +9,9 @@ use crate::quality::{
     ActiveLearningAction, ActiveLearningPlanner, ActiveLearningTask, DimensionBelief,
     HorizonAwareQualityScorer, HorizonQualitySignals, QualityBeliefDimension, QualityBeliefState,
 };
-use agent_context_db_core::{ContentType, ContextEntry, ContextUri, GraphStore, ValidityRecord};
+use agent_context_db_core::{
+    ContentType, ContextEntry, ContextError, ContextUri, GraphStore, ValidityRecord,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -32,6 +34,19 @@ pub struct KnowledgeHealthConfig {
     pub bridge_score_threshold: f32,
     pub min_dependency_count: usize,
     pub graph_centrality_weight: f32,
+}
+
+impl KnowledgeHealthConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.max_nodes == 0 || self.max_issues == 0 || self.min_dependency_count == 0 {
+            return Err(crate::ConfigError(
+                "knowledge health limits must be nonzero".into(),
+            ));
+        }
+        crate::validate_unit_f32("risky_quality_threshold", self.risky_quality_threshold)?;
+        crate::validate_unit_f32("bridge_score_threshold", self.bridge_score_threshold)?;
+        crate::validate_unit_f32("graph_centrality_weight", self.graph_centrality_weight)
+    }
 }
 
 impl Default for KnowledgeHealthConfig {
@@ -81,18 +96,18 @@ pub struct KnowledgeHealthReport {
     pub issues: Vec<NodeHealth>,
 }
 
-#[derive(Default)]
 pub struct KnowledgeHealthDiagnostician {
     config: KnowledgeHealthConfig,
     graph: Option<Arc<dyn GraphStore>>,
 }
 
 impl KnowledgeHealthDiagnostician {
-    pub fn new(config: KnowledgeHealthConfig) -> Self {
-        Self {
+    pub fn new(config: KnowledgeHealthConfig) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self {
             config,
             graph: None,
-        }
+        })
     }
 
     pub fn with_graph(mut self, graph: Arc<dyn GraphStore>) -> Self {
@@ -104,7 +119,7 @@ impl KnowledgeHealthDiagnostician {
         &self,
         entries: &[ContextEntry],
         now: DateTime<Utc>,
-    ) -> KnowledgeHealthReport {
+    ) -> Result<KnowledgeHealthReport, ContextError> {
         let limited = entries
             .iter()
             .take(self.config.max_nodes)
@@ -116,7 +131,7 @@ impl KnowledgeHealthDiagnostician {
         for entry in limited {
             let quality = entry.metadata.quality_score.unwrap_or(0.5).clamp(0.0, 1.0);
             let dependency_count = *dependencies.get(&entry.uri).unwrap_or(&0);
-            let graph_centrality = self.graph_centrality(&entry.uri).await;
+            let graph_centrality = self.graph_centrality(&entry.uri).await?;
             let local_centrality = dependency_count as f32 / max_degree;
             let centrality = (local_centrality * (1.0 - self.config.graph_centrality_weight)
                 + graph_centrality * self.config.graph_centrality_weight)
@@ -198,17 +213,17 @@ impl KnowledgeHealthDiagnostician {
                 .unwrap_or(Ordering::Equal)
         });
         issues.truncate(self.config.max_issues);
-        KnowledgeHealthReport {
+        Ok(KnowledgeHealthReport {
             generated_at: now,
             issues,
-        }
+        })
     }
 
     pub fn apply_repairs(
         &self,
         entries: &mut [ContextEntry],
         report: &KnowledgeHealthReport,
-    ) -> usize {
+    ) -> Result<usize, ContextError> {
         let by_uri = report
             .issues
             .iter()
@@ -230,17 +245,20 @@ impl KnowledgeHealthDiagnostician {
                     HealthRepairAction::DemoteRetrieval => "health:demote-retrieval",
                 },
             );
-            let _ = entry.metadata.set_custom_field(HEALTH_REPORT_KEY, issue);
+            entry
+                .metadata
+                .set_custom_field(HEALTH_REPORT_KEY, issue)
+                .map_err(ContextError::Serialization)?;
             updated += 1;
         }
-        updated
+        Ok(updated)
     }
 
-    async fn graph_centrality(&self, uri: &ContextUri) -> f32 {
+    async fn graph_centrality(&self, uri: &ContextUri) -> Result<f32, ContextError> {
         let Some(graph) = &self.graph else {
-            return 0.0;
+            return Ok(0.0);
         };
-        graph.centrality(uri).await.unwrap_or(0.0).clamp(0.0, 1.0)
+        Ok(graph.centrality(uri).await?.clamp(0.0, 1.0))
     }
 }
 
@@ -250,6 +268,16 @@ pub struct ConsistencyGuardianConfig {
     pub overlap_threshold: f32,
     pub strong_quality_delta: f32,
     pub allow_auto_invalidate: bool,
+}
+
+impl ConsistencyGuardianConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.max_pairs == 0 {
+            return Err(crate::ConfigError("max_pairs must be nonzero".into()));
+        }
+        crate::validate_unit_f32("overlap_threshold", self.overlap_threshold)?;
+        crate::validate_unit_f32("strong_quality_delta", self.strong_quality_delta)
+    }
 }
 
 impl Default for ConsistencyGuardianConfig {
@@ -286,14 +314,14 @@ pub struct ConsistencyGuardPlan {
     pub tasks: Vec<ConsistencyGuardTask>,
 }
 
-#[derive(Default)]
 pub struct ActiveConsistencyGuardian {
     config: ConsistencyGuardianConfig,
 }
 
 impl ActiveConsistencyGuardian {
-    pub fn new(config: ConsistencyGuardianConfig) -> Self {
-        Self { config }
+    pub fn new(config: ConsistencyGuardianConfig) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     pub fn plan(&self, entries: &[ContextEntry], now: DateTime<Utc>) -> ConsistencyGuardPlan {
@@ -360,7 +388,7 @@ impl ActiveConsistencyGuardian {
         entries: &mut [ContextEntry],
         plan: &ConsistencyGuardPlan,
         now: DateTime<Utc>,
-    ) -> usize {
+    ) -> Result<usize, ContextError> {
         let by_uri = entries
             .iter()
             .enumerate()
@@ -395,17 +423,19 @@ impl ActiveConsistencyGuardian {
                         &mut entries[weaker].metadata.tags,
                         "consistency:auto-invalidated",
                     );
-                    let _ = entries[weaker]
+                    entries[weaker]
                         .metadata
-                        .set_custom_field(CONSISTENCY_GUARD_KEY, task);
+                        .set_custom_field(CONSISTENCY_GUARD_KEY, task)
+                        .map_err(ContextError::Serialization)?;
                     touched.insert(weaker);
                 }
                 ConsistencyRepairAction::RevalidateBoth => {
                     for idx in [idx_a, idx_b] {
                         push_tag(&mut entries[idx].metadata.tags, "consistency:revalidate");
-                        let _ = entries[idx]
+                        entries[idx]
                             .metadata
-                            .set_custom_field(CONSISTENCY_GUARD_KEY, task);
+                            .set_custom_field(CONSISTENCY_GUARD_KEY, task)
+                            .map_err(ContextError::Serialization)?;
                         touched.insert(idx);
                     }
                 }
@@ -415,15 +445,16 @@ impl ActiveConsistencyGuardian {
                             &mut entries[idx].metadata.tags,
                             "consistency:contextual-conflict",
                         );
-                        let _ = entries[idx]
+                        entries[idx]
                             .metadata
-                            .set_custom_field(CONSISTENCY_GUARD_KEY, task);
+                            .set_custom_field(CONSISTENCY_GUARD_KEY, task)
+                            .map_err(ContextError::Serialization)?;
                         touched.insert(idx);
                     }
                 }
             }
         }
-        touched.len()
+        Ok(touched.len())
     }
 }
 
@@ -432,6 +463,17 @@ pub struct ActiveLearningExecutionConfig {
     pub max_entries: usize,
     pub max_tasks_total: usize,
     pub min_quality_for_learning: f32,
+}
+
+impl ActiveLearningExecutionConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.max_entries == 0 || self.max_tasks_total == 0 {
+            return Err(crate::ConfigError(
+                "active learning limits must be nonzero".into(),
+            ));
+        }
+        crate::validate_unit_f32("min_quality_for_learning", self.min_quality_for_learning)
+    }
 }
 
 impl Default for ActiveLearningExecutionConfig {
@@ -453,7 +495,6 @@ pub struct ActiveLearningObservation {
     pub note: String,
 }
 
-#[derive(Default)]
 pub struct ActiveLearningLoop {
     planner: ActiveLearningPlanner,
     scorer: HorizonAwareQualityScorer,
@@ -468,6 +509,33 @@ pub struct EmbeddingDriftConfig {
     pub centroid_shift_threshold: f32,
     pub norm_kl_threshold: f32,
     pub bins: usize,
+}
+
+impl EmbeddingDriftConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.max_entries == 0 || self.min_sample_size == 0 || self.bins < 2 {
+            return Err(crate::ConfigError(
+                "embedding limits must be nonzero and bins must be at least 2".into(),
+            ));
+        }
+        if self.min_sample_size > self.max_entries {
+            return Err(crate::ConfigError(
+                "min_sample_size must not exceed max_entries".into(),
+            ));
+        }
+        for (name, value) in [
+            ("psi_threshold", self.psi_threshold),
+            ("centroid_shift_threshold", self.centroid_shift_threshold),
+            ("norm_kl_threshold", self.norm_kl_threshold),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(crate::ConfigError(format!(
+                    "{name} must be finite and nonnegative"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for EmbeddingDriftConfig {
@@ -512,14 +580,14 @@ pub struct EmbeddingDriftReport {
     pub snapshot: Option<EmbeddingDistributionSnapshot>,
 }
 
-#[derive(Default)]
 pub struct EmbeddingDriftMonitor {
     config: EmbeddingDriftConfig,
 }
 
 impl EmbeddingDriftMonitor {
-    pub fn new(config: EmbeddingDriftConfig) -> Self {
-        Self { config }
+    pub fn new(config: EmbeddingDriftConfig) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     pub fn analyze(&self, entries: &[ContextEntry], now: DateTime<Utc>) -> EmbeddingDriftReport {
@@ -585,15 +653,20 @@ impl EmbeddingDriftMonitor {
         }
     }
 
-    pub fn apply(&self, entries: &mut [ContextEntry], report: &EmbeddingDriftReport) -> usize {
+    pub fn apply(
+        &self,
+        entries: &mut [ContextEntry],
+        report: &EmbeddingDriftReport,
+    ) -> Result<usize, ContextError> {
         let Some(snapshot) = &report.snapshot else {
-            return 0;
+            return Ok(0);
         };
         let mut updated = 0usize;
         for entry in entries.iter_mut().take(1) {
-            let _ = entry
+            entry
                 .metadata
-                .set_custom_field(EMBEDDING_SNAPSHOT_KEY, snapshot);
+                .set_custom_field(EMBEDDING_SNAPSHOT_KEY, snapshot)
+                .map_err(ContextError::Serialization)?;
             push_tag(&mut entry.metadata.tags, "embedding-drift:baseline");
             match report.action {
                 EmbeddingDriftAction::Observe => {
@@ -608,7 +681,7 @@ impl EmbeddingDriftMonitor {
             }
             updated += 1;
         }
-        updated
+        Ok(updated)
     }
 }
 
@@ -617,6 +690,16 @@ pub struct CuriosityExplorerConfig {
     pub max_tasks: usize,
     pub min_gap_severity: f32,
     pub min_uncertainty: f32,
+}
+
+impl CuriosityExplorerConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.max_tasks == 0 {
+            return Err(crate::ConfigError("max_tasks must be nonzero".into()));
+        }
+        crate::validate_unit_f32("min_gap_severity", self.min_gap_severity)?;
+        crate::validate_unit_f32("min_uncertainty", self.min_uncertainty)
+    }
 }
 
 impl Default for CuriosityExplorerConfig {
@@ -647,14 +730,14 @@ pub struct CuriosityTask {
     pub reason: String,
 }
 
-#[derive(Default)]
 pub struct CuriosityExplorer {
     config: CuriosityExplorerConfig,
 }
 
 impl CuriosityExplorer {
-    pub fn new(config: CuriosityExplorerConfig) -> Self {
-        Self { config }
+    pub fn new(config: CuriosityExplorerConfig) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     pub fn plan(&self, entries: &[ContextEntry], now: DateTime<Utc>) -> Vec<CuriosityTask> {
@@ -728,7 +811,11 @@ impl CuriosityExplorer {
         tasks
     }
 
-    pub fn apply_tasks(&self, entries: &mut [ContextEntry], tasks: &[CuriosityTask]) -> usize {
+    pub fn apply_tasks(
+        &self,
+        entries: &mut [ContextEntry],
+        tasks: &[CuriosityTask],
+    ) -> Result<usize, ContextError> {
         let grouped = tasks.iter().fold(
             HashMap::<ContextUri, Vec<CuriosityTask>>::new(),
             |mut acc, task| {
@@ -747,10 +834,13 @@ impl CuriosityExplorer {
             for task in tasks {
                 push_tag(&mut entry.metadata.tags, curiosity_tag(task.action));
             }
-            let _ = entry.metadata.set_custom_field(CURIOSITY_TASKS_KEY, tasks);
+            entry
+                .metadata
+                .set_custom_field(CURIOSITY_TASKS_KEY, tasks)
+                .map_err(ContextError::Serialization)?;
             updated += 1;
         }
-        updated
+        Ok(updated)
     }
 }
 
@@ -766,12 +856,13 @@ impl ActiveLearningLoop {
         planner: ActiveLearningPlanner,
         scorer: HorizonAwareQualityScorer,
         config: ActiveLearningExecutionConfig,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self {
             planner,
             scorer,
             config,
-        }
+        })
     }
 
     pub fn plan(&self, entries: &[ContextEntry], now: DateTime<Utc>) -> Vec<ActiveLearningTask> {
@@ -803,7 +894,11 @@ impl ActiveLearningLoop {
         tasks
     }
 
-    pub fn apply_tasks(&self, entries: &mut [ContextEntry], tasks: &[ActiveLearningTask]) -> usize {
+    pub fn apply_tasks(
+        &self,
+        entries: &mut [ContextEntry],
+        tasks: &[ActiveLearningTask],
+    ) -> Result<usize, ContextError> {
         let mut grouped: HashMap<ContextUri, Vec<ActiveLearningTask>> = HashMap::new();
         for task in tasks {
             grouped
@@ -820,10 +915,13 @@ impl ActiveLearningLoop {
             for task in tasks {
                 push_tag(&mut entry.metadata.tags, action_tag(task.action));
             }
-            let _ = entry.metadata.set_custom_field(ACTIVE_LEARNING_KEY, tasks);
+            entry
+                .metadata
+                .set_custom_field(ACTIVE_LEARNING_KEY, tasks)
+                .map_err(ContextError::Serialization)?;
             updated += 1;
         }
-        updated
+        Ok(updated)
     }
 
     pub fn apply_observations(
@@ -831,7 +929,7 @@ impl ActiveLearningLoop {
         entries: &mut [ContextEntry],
         observations: &[ActiveLearningObservation],
         now: DateTime<Utc>,
-    ) -> usize {
+    ) -> Result<usize, ContextError> {
         let mut by_uri: HashMap<ContextUri, Vec<&ActiveLearningObservation>> = HashMap::new();
         for observation in observations {
             by_uri
@@ -865,11 +963,14 @@ impl ActiveLearningLoop {
             state.confidence = (1.0 - state.uncertainty).clamp(0.0, 1.0);
             state.overall = average_mean(&state);
             entry.metadata.quality_score = Some(state.overall);
-            let _ = entry.metadata.set_custom_field(QUALITY_BELIEF_KEY, &state);
+            entry
+                .metadata
+                .set_custom_field(QUALITY_BELIEF_KEY, &state)
+                .map_err(ContextError::Serialization)?;
             push_tag(&mut entry.metadata.tags, "active-learning:observed");
             updated += 1;
         }
-        updated
+        Ok(updated)
     }
 }
 
@@ -1288,7 +1389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_diagnoses_and_marks_dangerous_bridge() {
+    async fn health_diagnoses_and_marks_dangerous_bridge() -> Result<(), ContextError> {
         let mut hub = entry(
             "uwu://t/a/memory/fact/hub",
             "shared policy",
@@ -1315,25 +1416,27 @@ mod tests {
         leaf_b.metadata.consolidation = Some(consolidation(vec![hub_uri], vec![], 1));
         let mut entries = vec![hub, leaf_a, leaf_b];
 
-        let diagnostician = KnowledgeHealthDiagnostician::default();
-        let report = diagnostician.diagnose(&entries, Utc::now()).await;
+        let diagnostician =
+            KnowledgeHealthDiagnostician::new(KnowledgeHealthConfig::default()).unwrap();
+        let report = diagnostician.diagnose(&entries, Utc::now()).await?;
         assert!(
             report
                 .issues
                 .iter()
                 .any(|issue| issue.issue == HealthIssueKind::DangerousBridge)
         );
-        assert_eq!(diagnostician.apply_repairs(&mut entries, &report), 1);
+        assert_eq!(diagnostician.apply_repairs(&mut entries, &report)?, 1);
         assert!(
             entries[0]
                 .metadata
                 .tags
                 .contains(&"health:revalidate".to_string())
         );
+        Ok(())
     }
 
     #[test]
-    fn guardian_invalidates_weaker_contradiction() {
+    fn guardian_invalidates_weaker_contradiction() -> Result<(), ContextError> {
         let strong = entry(
             "uwu://t/a/memory/fact/strong",
             "cache must be enabled for writes",
@@ -1347,26 +1450,29 @@ mod tests {
             0.4,
         );
         let mut entries = vec![strong, weak];
-        let guardian = ActiveConsistencyGuardian::default();
+        let guardian =
+            ActiveConsistencyGuardian::new(ConsistencyGuardianConfig::default()).unwrap();
         let plan = guardian.plan(&entries, Utc::now());
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(
             plan.tasks[0].action,
             ConsistencyRepairAction::InvalidateWeaker
         );
-        assert_eq!(guardian.apply(&mut entries, &plan, Utc::now()), 1);
+        assert_eq!(guardian.apply(&mut entries, &plan, Utc::now())?, 1);
         assert!(entries[1].metadata.validity.is_some());
+        Ok(())
     }
 
     #[test]
-    fn embedding_drift_detects_shift_and_marks_rebuild() {
+    fn embedding_drift_detects_shift_and_marks_rebuild() -> Result<(), ContextError> {
         let monitor = EmbeddingDriftMonitor::new(EmbeddingDriftConfig {
             min_sample_size: 2,
             centroid_shift_threshold: 0.05,
             psi_threshold: 0.05,
             norm_kl_threshold: 0.05,
             ..Default::default()
-        });
+        })
+        .unwrap();
         let mut baseline_anchor =
             entry("uwu://t/a/memory/fact/base", "base", ContentType::Fact, 0.8);
         let baseline = snapshot_from_vectors(&[vec![1.0, 0.0], vec![0.9, 0.1]], 5, Utc::now());
@@ -1387,17 +1493,18 @@ mod tests {
         let mut entries = vec![baseline_anchor, shifted_a, shifted_b];
         let report = monitor.analyze(&entries, Utc::now());
         assert_eq!(report.action, EmbeddingDriftAction::RebuildIndex);
-        assert_eq!(monitor.apply(&mut entries, &report), 1);
+        assert_eq!(monitor.apply(&mut entries, &report)?, 1);
         assert!(
             entries[0]
                 .metadata
                 .tags
                 .contains(&"embedding-drift:rebuild-index".to_string())
         );
+        Ok(())
     }
 
     #[test]
-    fn curiosity_explorer_promotes_uncertainty_and_gaps() {
+    fn curiosity_explorer_promotes_uncertainty_and_gaps() -> Result<(), ContextError> {
         let mut target = entry(
             "uwu://t/a/memory/fact/gap",
             "cache audit policy",
@@ -1416,24 +1523,25 @@ mod tests {
             )
             .unwrap();
         let mut entries = vec![target];
-        let explorer = CuriosityExplorer::default();
+        let explorer = CuriosityExplorer::new(CuriosityExplorerConfig::default()).unwrap();
         let tasks = explorer.plan(&entries, Utc::now());
         assert!(
             tasks
                 .iter()
                 .any(|task| task.action == CuriosityAction::StormSynthesis)
         );
-        assert_eq!(explorer.apply_tasks(&mut entries, &tasks), 1);
+        assert_eq!(explorer.apply_tasks(&mut entries, &tasks)?, 1);
         assert!(
             entries[0]
                 .metadata
                 .tags
                 .contains(&"curiosity:planned".to_string())
         );
+        Ok(())
     }
 
     #[test]
-    fn active_learning_plans_and_applies_observations() {
+    fn active_learning_plans_and_applies_observations() -> Result<(), ContextError> {
         let mut target = entry(
             "uwu://t/a/memory/fact/uncertain",
             "external vector index can support audit search",
@@ -1442,10 +1550,15 @@ mod tests {
         );
         target.metadata.consolidation = Some(consolidation(vec![], vec![], 0));
         let mut entries = vec![target];
-        let loop_ = ActiveLearningLoop::default();
+        let loop_ = ActiveLearningLoop::new(
+            ActiveLearningPlanner::default(),
+            HorizonAwareQualityScorer::default(),
+            ActiveLearningExecutionConfig::default(),
+        )
+        .unwrap();
         let tasks = loop_.plan(&entries, Utc::now());
         assert!(!tasks.is_empty());
-        assert_eq!(loop_.apply_tasks(&mut entries, &tasks), 1);
+        assert_eq!(loop_.apply_tasks(&mut entries, &tasks)?, 1);
         assert!(
             entries[0]
                 .metadata
@@ -1462,7 +1575,7 @@ mod tests {
             note: "confirmed by external source".into(),
         };
         assert_eq!(
-            loop_.apply_observations(&mut entries, &[observation], Utc::now()),
+            loop_.apply_observations(&mut entries, &[observation], Utc::now())?,
             1
         );
         assert!(
@@ -1471,5 +1584,6 @@ mod tests {
                 .custom_field::<QualityBeliefState>(QUALITY_BELIEF_KEY)
                 .is_some()
         );
+        Ok(())
     }
 }

@@ -43,7 +43,7 @@ impl ContextRotGuard {
             })
             .collect();
 
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         scored
             .iter()
             .take(excess)
@@ -65,7 +65,8 @@ impl ContextRotGuard {
         let best_existing = existing_similar
             .iter()
             .filter_map(|e| e.metadata.quality_score)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .filter(|quality| quality.is_finite())
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(0.5);
 
         // 新条目质量必须显著高于已有最好条目

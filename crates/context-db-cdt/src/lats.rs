@@ -4,6 +4,9 @@
 //! 将低价值路径转成失败轨迹，再用反思 guidance 改写下一轮认知状态。
 
 use crate::CognitivePreferencePair;
+#[cfg(test)]
+use crate::config::ReflectionConfig;
+use crate::config::VotingConfig;
 use crate::policy_value::CognitiveState;
 use crate::reflection::{FailureTrace, ReflectionGenerator, ReflexionEvolutionResult};
 use crate::tree_search::{CognitiveTreeSearch, SearchTree};
@@ -57,15 +60,18 @@ pub struct LatsLoop {
 }
 
 impl LatsLoop {
-    pub fn new(config: LatsConfig, reflector: Arc<ReflectionGenerator>) -> Self {
+    pub fn new(
+        config: LatsConfig,
+        reflector: Arc<ReflectionGenerator>,
+    ) -> agent_context_db_core::Result<Self> {
         let search = CognitiveTreeSearch::new(config.branching_factor, config.max_depth)
             .with_simulations(config.simulations);
-        Self {
+        Ok(Self {
             config,
             search,
             reflector,
-            evolution: InsightEvolutionEngine::new(),
-        }
+            evolution: InsightEvolutionEngine::new(VotingConfig::default())?,
+        })
     }
 
     pub fn with_evolution(mut self, evolution: InsightEvolutionEngine) -> Self {
@@ -80,7 +86,7 @@ impl LatsLoop {
         self
     }
 
-    pub async fn run(&self, initial: CognitiveState) -> LatsReport {
+    pub async fn run(&self, initial: CognitiveState) -> agent_context_db_core::Result<LatsReport> {
         let mut state = initial;
         let mut insights = Vec::new();
         let mut iterations = Vec::new();
@@ -97,7 +103,7 @@ impl LatsLoop {
                 Some(
                     self.reflector
                         .evolve_failures(&failures, &mut insights, &self.evolution)
-                        .await,
+                        .await?,
                 )
             } else {
                 None
@@ -123,11 +129,11 @@ impl LatsLoop {
             });
         }
 
-        LatsReport {
+        Ok(LatsReport {
             iterations,
             final_state: state,
             insights,
-        }
+        })
     }
 }
 
@@ -237,10 +243,14 @@ mod tests {
                 reflection_threshold: 0.99,
                 ..Default::default()
             },
-            Arc::new(ReflectionGenerator::new(Arc::new(FailingLlm))),
-        );
+            Arc::new(
+                ReflectionGenerator::new(Arc::new(FailingLlm), ReflectionConfig::default())
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
 
-        let report = loop_runner.run(state.clone()).await;
+        let report = loop_runner.run(state.clone()).await.unwrap();
         assert_eq!(report.iterations.len(), 2);
         assert_eq!(report.final_state, state);
         assert!(report.iterations.iter().any(|i| i.reflection.is_some()));

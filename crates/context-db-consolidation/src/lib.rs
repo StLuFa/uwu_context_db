@@ -43,8 +43,9 @@ use crate::health::{
 };
 use crate::quality::{HorizonAwareQualityScorer, HorizonQualitySignals, QualityRoute};
 use agent_context_db_core::{
-    ConsolidationStatus, ContentType, ContextEntry, ContextUri, EpistemicType, LineageEntry,
-    LlmClient, LlmOpts, PageRequest, Result, StateScope, ValidityRecord,
+    ConsolidationStatus, ContentType, ContextEntry, ContextError, ContextUri, EpistemicType,
+    JsonSchema, LineageEntry, LlmClient, LlmError, LlmOpts, PageRequest, Result, StateScope,
+    ValidityRecord,
 };
 use agent_context_db_knowledge_network::identity::IdentityRegistry;
 use agent_context_db_marketplace::{
@@ -54,6 +55,25 @@ use agent_context_db_marketplace::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Error returned when a consolidation component receives an invalid configuration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid consolidation configuration: {0}")]
+pub struct ConfigError(pub String);
+
+impl From<ConfigError> for ContextError {
+    fn from(error: ConfigError) -> Self {
+        ContextError::Unsupported(error.to_string())
+    }
+}
+
+fn validate_unit_f32(name: &str, value: f32) -> std::result::Result<(), ConfigError> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(ConfigError(format!("{name} must be finite and in [0, 1]")))
+    }
+}
 
 // ===========================================================================
 // ConsolidationProduct — 巩固产物
@@ -68,6 +88,8 @@ pub struct ConsolidationProduct {
     pub content: String,
     pub quality_score: f32,
     pub confidence: f32,
+    /// Whether this product explicitly claims that supporting evidence is required.
+    pub evidence_required: bool,
     pub superseded_claim: Option<String>,
     pub evidence_uris: Vec<ContextUri>,
     pub contradiction_uris: Vec<ContextUri>,
@@ -331,7 +353,7 @@ impl IgnoranceMap {
 
     pub fn top_blind_spots(&self, n: usize) -> Vec<BlindSpot> {
         let mut spots: Vec<_> = self.blind_spots.read().values().cloned().collect();
-        spots.sort_by(|a, b| b.severity.partial_cmp(&a.severity).unwrap());
+        spots.sort_by(|a, b| b.severity.total_cmp(&a.severity));
         spots.truncate(n);
         spots
     }
@@ -481,6 +503,23 @@ pub struct ConsolidationConfig {
     pub quality_threshold_update: f32,
 }
 
+impl ConsolidationConfig {
+    pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+        if self.max_iterations == 0 {
+            return Err(ConfigError("max_iterations must be nonzero".into()));
+        }
+        validate_unit_f32("convergence_threshold", self.convergence_threshold)?;
+        validate_unit_f32("quality_threshold_add", self.quality_threshold_add)?;
+        validate_unit_f32("quality_threshold_update", self.quality_threshold_update)?;
+        if self.quality_threshold_update > self.quality_threshold_add {
+            return Err(ConfigError(
+                "quality_threshold_update must not exceed quality_threshold_add".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for ConsolidationConfig {
     fn default() -> Self {
         Self {
@@ -501,22 +540,17 @@ pub struct ConsolidationEngine {
 }
 
 impl ConsolidationEngine {
-    pub fn new(llm: Arc<dyn LlmClient>) -> Self {
-        Self {
-            config: ConsolidationConfig::default(),
-            llm,
-            calibrator: ConfidenceCalibrator::new(),
-            ignorance: IgnoranceMap::new(),
-        }
-    }
-
-    pub fn with_config(config: ConsolidationConfig, llm: Arc<dyn LlmClient>) -> Self {
-        Self {
+    pub fn new(
+        config: ConsolidationConfig,
+        llm: Arc<dyn LlmClient>,
+    ) -> std::result::Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
             config,
             llm,
             calibrator: ConfidenceCalibrator::new(),
             ignorance: IgnoranceMap::new(),
-        }
+        })
     }
 
     /// Generate→Critique→Revise 收敛循环。
@@ -530,12 +564,12 @@ impl ConsolidationEngine {
             .unwrap_or(EpistemicType::Fact);
 
         // Generate (LLM-driven)
-        let mut current = self.generate(entry, &content, ct, et).await;
+        let mut current = self.generate(entry, &content, ct, et).await?;
         let mut prev_score = 0.0;
 
         for iteration in 1..=self.config.max_iterations {
             // Critique
-            let critique = self.critique(&current, entry).await;
+            let critique = self.critique(&current, entry).await?;
             let calibrated = self.calibrator.calibrate(critique.confidence, et);
 
             // 收敛检查
@@ -559,8 +593,9 @@ impl ConsolidationEngine {
                 break;
             }
 
-            let revised = self.revise(&current, &critique).await;
+            let revised = self.revise(&current, &critique).await?;
             current = revised;
+            current.confidence = calibrated;
             current.metadata.generation = iteration;
         }
 
@@ -578,47 +613,56 @@ impl ConsolidationEngine {
         content: &str,
         ct: ContentType,
         et: EpistemicType,
-    ) -> ConsolidationProduct {
+    ) -> Result<ConsolidationProduct> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct GeneratedInsight {
+            content: String,
+            confidence: f32,
+            evidence_required: bool,
+        }
+
         let prompt = format!(
-            r#"Consolidate the following memory into a structured insight.
-
-Memory content: "{content}"
-Content type: {ct:?}
-
-
-Epistemic type: {et:?}
-
-
-
-Produce a concise, self-contained principle that captures the key knowledge.
-Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup)."#
+            "Consolidate this memory into a concise, self-contained principle. Preserve its language and do not invent evidence. Memory: {content:?}; content type: {ct:?}; epistemic type: {et:?}. Return the required JSON object."
         );
-
-        let consolidated = match self
+        let schema = JsonSchema::new(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["content", "confidence", "evidence_required"],
+            "properties": {
+                "content": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "evidence_required": {"type": "boolean"}
+            }
+        }));
+        let response = self
             .llm
-            .complete(
-                &prompt,
-                &LlmOpts {
-                    max_tokens: Some(512),
-                    temperature: Some(0.1),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(text) => text.trim().to_string(),
-            Err(_) => content.to_string(),
-        };
+            .complete_json(&prompt, &schema, &strict_llm_opts())
+            .await?;
+        let generated: GeneratedInsight = serde_json::from_str(&response)?;
+        let consolidated = validate_llm_content(&generated.content, "generated content")?;
+        let declared = validate_probability(generated.confidence, "generated confidence")?;
+        let evidence_uris = entry
+            .metadata
+            .consolidation
+            .as_ref()
+            .map(|meta| meta.evidence_uris.clone())
+            .unwrap_or_default();
 
-        ConsolidationProduct {
+        Ok(ConsolidationProduct {
             uri: entry.uri.clone(),
             content_type: ct,
             epistemic_type: et,
             content: consolidated,
-            quality_score: entry.metadata.quality_score.unwrap_or(0.5),
-            confidence: 0.5,
+            quality_score: entry
+                .metadata
+                .quality_score
+                .unwrap_or(declared)
+                .clamp(0.0, 1.0),
+            confidence: declared,
+            evidence_required: generated.evidence_required,
             superseded_claim: None,
-            evidence_uris: vec![],
+            evidence_uris,
             contradiction_uris: vec![],
             error_pattern: None,
             hypothesis_outcome: None,
@@ -633,16 +677,20 @@ Return ONLY the consolidated principle text (1-3 sentences, no JSON, no markup).
                 patch_count: 0,
                 lineage: vec![],
                 validity: entry.metadata.validity.clone(),
-                half_life: None,
+                half_life: entry
+                    .metadata
+                    .consolidation
+                    .as_ref()
+                    .and_then(|meta| meta.half_life),
             },
-        }
+        })
     }
 
     async fn critique(
         &self,
         product: &ConsolidationProduct,
-        entry: &ContextEntry,
-    ) -> CritiqueResult {
+        _entry: &ContextEntry,
+    ) -> Result<CritiqueResult> {
         let prompt = format!(
             r#"Evaluate the quality of this consolidated insight:
 
@@ -665,49 +713,45 @@ Return a JSON object with:
             product.content, product.content_type, product.epistemic_type
         );
 
-        let opts = LlmOpts {
-            max_tokens: Some(512),
-            temperature: Some(0.0),
-            ..Default::default()
-        };
-
-        match self.llm.complete(&prompt, &opts).await {
-            Ok(response) => {
-                let parsed: Option<serde_json::Value> = serde_json::from_str(&response).ok();
-                match parsed {
-                    Some(ref v) => CritiqueResult {
-                        quality_score: v["quality_score"]
-                            .as_f64()
-                            .map(|score| score as f32)
-                            .unwrap_or_else(|| deterministic_critique(product, entry).quality_score)
-                            .clamp(0.0, 1.0),
-                        confidence: v["confidence"]
-                            .as_f64()
-                            .map(|confidence| confidence as f32)
-                            .unwrap_or_else(|| deterministic_critique(product, entry).confidence)
-                            .clamp(0.0, 1.0),
-                        suggestions: v["suggestions"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|s| s.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    },
-                    None => deterministic_critique(product, entry),
-                }
-            }
-
-            Err(_) => deterministic_critique(product, entry),
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StructuredCritique {
+            quality_score: f32,
+            confidence: f32,
+            suggestions: Vec<String>,
         }
+        let schema = JsonSchema::new(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["quality_score", "confidence", "suggestions"],
+            "properties": {
+                "quality_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "suggestions": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 500}}
+            }
+        }));
+        let response = self
+            .llm
+            .complete_json(&prompt, &schema, &strict_llm_opts())
+            .await?;
+        let parsed: StructuredCritique = serde_json::from_str(&response)?;
+        let suggestions = parsed
+            .suggestions
+            .into_iter()
+            .map(|value| validate_llm_content(&value, "critique suggestion"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CritiqueResult {
+            quality_score: validate_probability(parsed.quality_score, "quality score")?,
+            confidence: validate_probability(parsed.confidence, "critique confidence")?,
+            suggestions,
+        })
     }
 
     async fn revise(
         &self,
         product: &ConsolidationProduct,
         critique: &CritiqueResult,
-    ) -> ConsolidationProduct {
+    ) -> Result<ConsolidationProduct> {
         let mut revised = product.clone();
         revised.quality_score = critique.quality_score;
         revised.confidence = critique.confidence;
@@ -726,25 +770,27 @@ Return ONLY the revised insight text (no JSON, no markup)."#,
                 product.content, critique.suggestions
             );
 
-            if let Ok(response) = self
-                .llm
-                .complete(
-                    &prompt,
-                    &LlmOpts {
-                        max_tokens: Some(512),
-                        temperature: Some(0.0),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                revised.content = response.trim().to_string();
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Revision {
+                content: String,
             }
-
+            let schema = JsonSchema::new(serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["content"],
+                "properties": {"content": {"type": "string", "minLength": 1, "maxLength": 4000}}
+            }));
+            let response = self
+                .llm
+                .complete_json(&prompt, &schema, &strict_llm_opts())
+                .await?;
+            let revision: Revision = serde_json::from_str(&response)?;
+            revised.content = validate_llm_content(&revision.content, "revised content")?;
             revised.metadata.status = ConsolidationStatus::InProgress;
         }
 
-        revised
+        Ok(revised)
     }
 
     /// 批量巩固。
@@ -761,6 +807,34 @@ Return ONLY the revised insight text (no JSON, no markup)."#,
     }
 }
 
+fn strict_llm_opts() -> LlmOpts {
+    LlmOpts {
+        max_tokens: Some(512),
+        temperature: Some(0.0),
+        ..Default::default()
+    }
+}
+
+fn validate_probability(value: f32, field: &str) -> Result<f32> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(agent_context_db_core::ContextError::Llm(
+            LlmError::Provider(format!("invalid {field}: expected finite value in [0, 1]")),
+        ))
+    }
+}
+
+fn validate_llm_content(value: &str, field: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 4000 {
+        return Err(agent_context_db_core::ContextError::Llm(
+            LlmError::Provider(format!("invalid {field}: expected 1..=4000 characters")),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// 评估结果。
 #[derive(Debug, Clone)]
 pub struct CritiqueResult {
@@ -769,6 +843,7 @@ pub struct CritiqueResult {
     pub suggestions: Vec<String>,
 }
 
+/* Obsolete heuristic critique removed: structured LLM failures must remain explicit.
 fn deterministic_critique(product: &ConsolidationProduct, entry: &ContextEntry) -> CritiqueResult {
     let content = product.content.trim();
     let word_count = content.split_whitespace().count();
@@ -1012,6 +1087,7 @@ fn repeated_token_ratio(content: &str) -> f32 {
         .len();
     1.0 - (unique as f32 / tokens.len() as f32)
 }
+*/
 
 // ===========================================================================
 // 双时序— valid/invalid + created/expired，持久化到 ValidityRecord
@@ -1307,7 +1383,7 @@ pub struct SleeptimeExecutor {
 
 #[async_trait::async_trait]
 pub trait LifecycleExecutorPort: Send + Sync {
-    async fn run_pending(&self) -> Vec<crate::lifecycle_execution::LifecycleJob>;
+    async fn run_pending(&self) -> Result<Vec<crate::lifecycle_execution::LifecycleJob>>;
     async fn submit(
         &self,
         uri: ContextUri,
@@ -1317,7 +1393,7 @@ pub trait LifecycleExecutorPort: Send + Sync {
 
 #[async_trait::async_trait]
 impl LifecycleExecutorPort for crate::lifecycle_execution::LifecycleActionExecutor {
-    async fn run_pending(&self) -> Vec<crate::lifecycle_execution::LifecycleJob> {
+    async fn run_pending(&self) -> Result<Vec<crate::lifecycle_execution::LifecycleJob>> {
         self.run_pending().await
     }
 
@@ -1337,6 +1413,7 @@ impl SleeptimeExecutor {
         graph: Arc<dyn agent_context_db_core::GraphStore>,
         progress: Arc<dyn ProgressStore>,
         signals: Arc<dyn SignalProvider>,
+        llm: Arc<dyn LlmClient>,
         batch_limit: usize,
     ) -> Result<Self> {
         let segments = root_scope.segments();
@@ -1370,8 +1447,10 @@ impl SleeptimeExecutor {
                 SleeptimeTask::CuriosityExploration,
             ],
             interval: std::time::Duration::from_secs(3600),
-            checker: ConsistencyChecker::new(),
-            entanglement: crate::entanglement::EntanglementDetector::new(0.3),
+            checker: ConsistencyChecker::new(llm),
+            entanglement: crate::entanglement::EntanglementDetector::new(
+                crate::entanglement::EntanglementConfig::default(),
+            )?,
             root_scope,
             batch_limit,
             store,
@@ -1515,7 +1594,7 @@ impl SleeptimeExecutor {
         }
 
         if let Some(executor) = &self.lifecycle_executor {
-            let recovered = executor.run_pending().await;
+            let recovered = executor.run_pending().await?;
             report.lifecycle_succeeded += recovered
                 .iter()
                 .filter(|j| {
@@ -1565,18 +1644,21 @@ impl SleeptimeExecutor {
 
                         let mut updated = entry.clone();
                         updated.metadata.quality_score = Some(outcome.posterior.overall);
+                        let mut route_promoted_mid = false;
+                        let mut route_promoted_long = false;
+                        let mut route_archived = false;
+                        let mut route_training_candidate = false;
                         match outcome.route {
                             QualityRoute::CompressToMidTerm => {
                                 updated.metadata.state_scope = Some(StateScope::Mid);
-                                promoted_mid += 1;
+                                route_promoted_mid = true;
                             }
 
                             QualityRoute::PromoteToLongTerm | QualityRoute::IncludeInTraining => {
                                 updated.metadata.state_scope = Some(StateScope::Long);
-                                promoted_long += 1;
-                                if matches!(outcome.route, QualityRoute::IncludeInTraining) {
-                                    training_candidates += 1;
-                                }
+                                route_promoted_long = true;
+                                route_training_candidate =
+                                    matches!(outcome.route, QualityRoute::IncludeInTraining);
                             }
 
                             QualityRoute::Archive
@@ -1586,7 +1668,7 @@ impl SleeptimeExecutor {
                                     .metadata
                                     .tags
                                     .push("quality:archive-candidate".into());
-                                archived += 1;
+                                route_archived = true;
                                 if let Some(executor) = &self.lifecycle_executor {
                                     match executor
                                         .submit(
@@ -1619,9 +1701,12 @@ impl SleeptimeExecutor {
                             _ => {}
                         }
 
-                        if store.write(updated).await.is_ok() {
-                            reassessed += 1;
-                        }
+                        store.write(updated).await?;
+                        reassessed += 1;
+                        promoted_mid += usize::from(route_promoted_mid);
+                        promoted_long += usize::from(route_promoted_long);
+                        archived += usize::from(route_archived);
+                        training_candidates += usize::from(route_training_candidate);
                     }
 
                     report.quality_reassessed = reassessed;
@@ -1646,8 +1731,14 @@ impl SleeptimeExecutor {
                             content: e.l0_text().to_string(),
                             quality_score: e.metadata.quality_score.unwrap_or(0.5),
                             confidence: 0.5,
+                            evidence_required: false,
                             superseded_claim: None,
-                            evidence_uris: vec![],
+                            evidence_uris: e
+                                .metadata
+                                .consolidation
+                                .as_ref()
+                                .map(|meta| meta.evidence_uris.clone())
+                                .unwrap_or_default(),
                             contradiction_uris: vec![],
                             error_pattern: None,
                             hypothesis_outcome: None,
@@ -1666,7 +1757,7 @@ impl SleeptimeExecutor {
                             },
                         })
                         .collect();
-                    let violations = self.checker.check(&products);
+                    let violations = self.checker.check(&products).await?;
                     report.contradictions_found = violations.len();
                     report.tasks_executed += 1;
                 }
@@ -1718,8 +1809,14 @@ impl SleeptimeExecutor {
                             content: e.l0_text().to_string(),
                             quality_score: e.metadata.quality_score.unwrap_or(0.5),
                             confidence: 0.5,
+                            evidence_required: false,
                             superseded_claim: None,
-                            evidence_uris: vec![],
+                            evidence_uris: e
+                                .metadata
+                                .consolidation
+                                .as_ref()
+                                .map(|meta| meta.evidence_uris.clone())
+                                .unwrap_or_default(),
                             contradiction_uris: vec![],
                             error_pattern: None,
                             hypothesis_outcome: None,
@@ -1749,9 +1846,10 @@ impl SleeptimeExecutor {
                 }
 
                 SleeptimeTask::SpacedRepetitionReview => {
-                    let scheduler = SpacedRepetitionScheduler::default();
+                    let scheduler = SpacedRepetitionScheduler::new(
+                        crate::halflife::SpacedRepetitionConfig::default(),
+                    )?;
                     let tasks = scheduler.plan(&entries, Utc::now());
-                    report.review_tasks = tasks.len();
                     {
                         let store = &self.store;
                         let by_uri = tasks
@@ -1772,12 +1870,12 @@ impl SleeptimeExecutor {
                                         "forget-candidate",
                                 }
                             ));
-                            if store.write(updated).await.is_ok() {
-                                report.review_tasks_written += 1;
-                            }
+                            store.write(updated).await?;
+                            report.review_tasks_written += 1;
                         }
                     }
 
+                    report.review_tasks = tasks.len();
                     report.tasks_executed += 1;
                 }
 
@@ -1793,7 +1891,9 @@ impl SleeptimeExecutor {
                                 .is_some()
                         })
                         .collect::<Vec<_>>();
-                    let detector = Arc::new(crate::entanglement::EntanglementDetector::new(0.3));
+                    let detector = Arc::new(crate::entanglement::EntanglementDetector::new(
+                        crate::entanglement::EntanglementConfig::default(),
+                    )?);
                     for entry in &entries {
                         if let Some(meta) = &entry.metadata.consolidation {
                             for partner in &meta.entangled_with {
@@ -1802,7 +1902,10 @@ impl SleeptimeExecutor {
                         }
                     }
 
-                    let mut invalidator = crate::entanglement::CascadeInvalidator::new(detector);
+                    let mut invalidator = crate::entanglement::CascadeInvalidator::new(
+                        detector,
+                        crate::entanglement::CascadeInvalidationConfig::default(),
+                    )?;
                     invalidator = invalidator.with_graph(self.graph.clone());
                     let mut mutable = entries.clone();
                     for entry in invalidated {
@@ -1839,7 +1942,7 @@ impl SleeptimeExecutor {
                                 .iter()
                                 .any(|tag| tag.starts_with("cascade:"))
                             {
-                                let _ = store.write(updated).await;
+                                store.write(updated).await?;
                             }
                         }
                     }
@@ -1848,13 +1951,14 @@ impl SleeptimeExecutor {
                 }
 
                 SleeptimeTask::KnowledgeHealthDiagnosis => {
-                    let mut diagnostician = KnowledgeHealthDiagnostician::default();
+                    let mut diagnostician = KnowledgeHealthDiagnostician::new(
+                        crate::health::KnowledgeHealthConfig::default(),
+                    )?;
                     diagnostician = diagnostician.with_graph(self.graph.clone());
-                    let report_health = diagnostician.diagnose(&entries, Utc::now()).await;
+                    let report_health = diagnostician.diagnose(&entries, Utc::now()).await?;
                     report.health_issues = report_health.issues.len();
                     let mut mutable = entries.clone();
-                    report.health_repairs_written =
-                        diagnostician.apply_repairs(&mut mutable, &report_health);
+                    diagnostician.apply_repairs(&mut mutable, &report_health)?;
                     {
                         let store = &self.store;
                         for updated in mutable {
@@ -1864,7 +1968,8 @@ impl SleeptimeExecutor {
                                 .iter()
                                 .any(|tag| tag.starts_with("health:"))
                             {
-                                let _ = store.write(updated).await;
+                                store.write(updated).await?;
+                                report.health_repairs_written += 1;
                             }
                         }
                     }
@@ -1873,12 +1978,14 @@ impl SleeptimeExecutor {
                 }
 
                 SleeptimeTask::ActiveConsistencyGuard => {
-                    let guardian = ActiveConsistencyGuardian::default();
+                    let guardian = ActiveConsistencyGuardian::new(
+                        crate::health::ConsistencyGuardianConfig::default(),
+                    )?;
                     let plan = guardian.plan(&entries, Utc::now());
                     report.consistency_guard_tasks = plan.tasks.len();
                     let mut mutable = entries.clone();
                     report.consistency_guard_repairs =
-                        guardian.apply(&mut mutable, &plan, Utc::now());
+                        guardian.apply(&mut mutable, &plan, Utc::now())?;
                     {
                         let store = &self.store;
                         for updated in mutable {
@@ -1888,7 +1995,7 @@ impl SleeptimeExecutor {
                                     || tag.starts_with("health:")
                             }) || updated.metadata.validity.is_some()
                             {
-                                let _ = store.write(updated).await;
+                                store.write(updated).await?;
                             }
                         }
                     }
@@ -1897,12 +2004,16 @@ impl SleeptimeExecutor {
                 }
 
                 SleeptimeTask::ActiveLearningLoop => {
-                    let active_learning = ActiveLearningLoop::default();
+                    let active_learning = ActiveLearningLoop::new(
+                        crate::quality::ActiveLearningPlanner::default(),
+                        HorizonAwareQualityScorer::default(),
+                        crate::health::ActiveLearningExecutionConfig::default(),
+                    )?;
                     let tasks = active_learning.plan(&entries, Utc::now());
                     report.active_learning_tasks = tasks.len();
                     let mut mutable = entries.clone();
                     report.active_learning_tasks_written =
-                        active_learning.apply_tasks(&mut mutable, &tasks);
+                        active_learning.apply_tasks(&mut mutable, &tasks)?;
                     {
                         let store = &self.store;
                         for updated in mutable {
@@ -1912,7 +2023,7 @@ impl SleeptimeExecutor {
                                 .iter()
                                 .any(|tag| tag.starts_with("active-learning:"))
                             {
-                                let _ = store.write(updated).await;
+                                store.write(updated).await?;
                             }
                         }
                     }
@@ -1921,13 +2032,14 @@ impl SleeptimeExecutor {
                 }
 
                 SleeptimeTask::EmbeddingDriftDetection => {
-                    let monitor = EmbeddingDriftMonitor::default();
+                    let monitor =
+                        EmbeddingDriftMonitor::new(crate::health::EmbeddingDriftConfig::default())?;
                     let drift = monitor.analyze(&entries, Utc::now());
                     report.embedding_drift_samples = drift.sample_size;
                     report.embedding_drift_score =
                         drift.psi.max(drift.centroid_shift).max(drift.norm_kl);
                     let mut mutable = entries.clone();
-                    report.embedding_drift_updates = monitor.apply(&mut mutable, &drift);
+                    report.embedding_drift_updates = monitor.apply(&mut mutable, &drift)?;
                     {
                         let store = &self.store;
                         for updated in mutable {
@@ -1937,7 +2049,7 @@ impl SleeptimeExecutor {
                                 .iter()
                                 .any(|tag| tag.starts_with("embedding-drift:"))
                             {
-                                let _ = store.write(updated).await;
+                                store.write(updated).await?;
                             }
                         }
                     }
@@ -1946,11 +2058,12 @@ impl SleeptimeExecutor {
                 }
 
                 SleeptimeTask::CuriosityExploration => {
-                    let explorer = CuriosityExplorer::default();
+                    let explorer =
+                        CuriosityExplorer::new(crate::health::CuriosityExplorerConfig::default())?;
                     let tasks = explorer.plan(&entries, Utc::now());
                     report.curiosity_tasks = tasks.len();
                     let mut mutable = entries.clone();
-                    report.curiosity_tasks_written = explorer.apply_tasks(&mut mutable, &tasks);
+                    report.curiosity_tasks_written = explorer.apply_tasks(&mut mutable, &tasks)?;
                     {
                         let store = &self.store;
                         for updated in mutable {
@@ -1960,7 +2073,7 @@ impl SleeptimeExecutor {
                                 .iter()
                                 .any(|tag| tag.starts_with("curiosity:"))
                             {
-                                let _ = store.write(updated).await;
+                                store.write(updated).await?;
                             }
                         }
                     }
@@ -1971,7 +2084,7 @@ impl SleeptimeExecutor {
         }
 
         if let Some(executor) = &self.lifecycle_executor {
-            let completed = executor.run_pending().await;
+            let completed = executor.run_pending().await?;
             report.lifecycle_succeeded += completed
                 .iter()
                 .filter(|j| {
@@ -2068,10 +2181,9 @@ pub enum Constraint {
     NoProfileConflict,
 }
 
-/// 一致性约束检查器 — Sleeptime 阶段运行。
+/// 一致性约束检查器 — Sleeptime 阶段通过严格结构化 LLM 批量裁决事实矛盾。
 pub struct ConsistencyChecker {
-    /// 词面距离阈值（1 - Jaccard < 此值 → 同主题且可能矛盾）。
-    contradiction_distance_threshold: f32,
+    llm: Arc<dyn LlmClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -2081,17 +2193,9 @@ pub struct ConstraintViolation {
     pub description: String,
 }
 
-impl Default for ConsistencyChecker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ConsistencyChecker {
-    pub fn new() -> Self {
-        Self {
-            contradiction_distance_threshold: 0.50,
-        }
+    pub fn new(llm: Arc<dyn LlmClient>) -> Self {
+        Self { llm }
     }
 
     /// 检查所有一致性约束。
@@ -2101,7 +2205,10 @@ impl ConsistencyChecker {
     /// - Fact 必须有证据
     /// - Fact vs Fact 语义矛盾（Jaccard + 否定词检测）
     /// - 被 invalidate 后代标记
-    pub fn check(&self, products: &[ConsolidationProduct]) -> Vec<ConstraintViolation> {
+    pub async fn check(
+        &self,
+        products: &[ConsolidationProduct],
+    ) -> Result<Vec<ConstraintViolation>> {
         let mut violations = Vec::new();
 
         for p in products {
@@ -2115,7 +2222,10 @@ impl ConsistencyChecker {
             }
 
             // Fact 必须有证据
-            if p.content_type == ContentType::Fact && p.evidence_uris.is_empty() {
+            if p.content_type == ContentType::Fact
+                && p.evidence_required
+                && p.evidence_uris.is_empty()
+            {
                 violations.push(ConstraintViolation {
                     uri: p.uri.clone(),
                     constraint: Constraint::FactRequiresEvidence,
@@ -2130,39 +2240,77 @@ impl ConsistencyChecker {
             .filter(|p| p.content_type == ContentType::Fact)
             .collect();
 
-        for i in 0..facts.len() {
-            for j in (i + 1)..facts.len() {
-                let a = &facts[i];
-                let b = &facts[j];
-
-                // Jaccard 相似度 + 否定词检测
-                let a_words: std::collections::HashSet<&str> =
-                    a.content.split_whitespace().collect();
-                let b_words: std::collections::HashSet<&str> =
-                    b.content.split_whitespace().collect();
-                let intersection = a_words.intersection(&b_words).count();
-                let union = a_words.union(&b_words).count();
-                let jaccard = if union > 0 {
-                    intersection as f32 / union as f32
-                } else {
-                    0.0
-                };
-
-                // 高重叠 + 语义对立 = 可能矛盾
-                let has_contradiction_marker =
-                    Self::detect_contradiction_marker(&a.content, &b.content);
-
-                let lexical_distance = 1.0 - jaccard;
-                if lexical_distance < self.contradiction_distance_threshold
-                    && has_contradiction_marker
+        if facts.len() > 1 {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Classification {
+                left: usize,
+                right: usize,
+                contradiction: bool,
+                confidence: f32,
+                rationale: String,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BatchClassification {
+                classifications: Vec<Classification>,
+            }
+            let claims = facts
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| serde_json::json!({"index": index, "claim": fact.content}))
+                .collect::<Vec<_>>();
+            let expected_pairs = facts.len() * (facts.len() - 1) / 2;
+            let prompt = format!(
+                "Classify every unordered pair of claims as logically contradictory or not. Judge meaning across languages; lexical similarity, cosine similarity, and mere topic overlap are not contradiction. Return exactly one classification for every pair. Claims: {}",
+                serde_json::to_string(&claims)?
+            );
+            let schema = JsonSchema::new(serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["classifications"],
+                "properties": {"classifications": {"type": "array", "minItems": expected_pairs, "maxItems": expected_pairs, "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["left", "right", "contradiction", "confidence", "rationale"],
+                    "properties": {
+                        "left": {"type": "integer", "minimum": 0}, "right": {"type": "integer", "minimum": 0},
+                        "contradiction": {"type": "boolean"}, "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "rationale": {"type": "string", "minLength": 1, "maxLength": 500}
+                    }
+                }}}
+            }));
+            let response = self
+                .llm
+                .complete_json(&prompt, &schema, &strict_llm_opts())
+                .await?;
+            let batch: BatchClassification = serde_json::from_str(&response)?;
+            if batch.classifications.len() != expected_pairs {
+                return Err(agent_context_db_core::ContextError::Llm(
+                    LlmError::Provider(format!(
+                        "contradiction classifier returned {} pairs; expected {expected_pairs}",
+                        batch.classifications.len()
+                    )),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for item in batch.classifications {
+                let confidence = validate_probability(item.confidence, "contradiction confidence")?;
+                if item.left >= item.right
+                    || item.right >= facts.len()
+                    || !seen.insert((item.left, item.right))
                 {
-                    violations.push(ConstraintViolation {
-                        uri: a.uri.clone(),
-                        constraint: Constraint::NoContradiction,
-                        description: format!(
-                            "possible contradiction between {} and {} (jaccard={:.2}, distance={:.2})",
-                            a.uri, b.uri, jaccard, lexical_distance
+                    return Err(agent_context_db_core::ContextError::Llm(
+                        LlmError::Provider(
+                            "contradiction classifier returned invalid or duplicate pair".into(),
                         ),
+                    ));
+                }
+                let rationale = validate_llm_content(&item.rationale, "contradiction rationale")?;
+                if item.contradiction {
+                    violations.push(ConstraintViolation {
+                        uri: facts[item.left].uri.clone(),
+                        constraint: Constraint::NoContradiction,
+                        description: format!("contradiction between {} and {} (confidence={confidence:.2}): {rationale}", facts[item.left].uri, facts[item.right].uri),
                     });
                 }
             }
@@ -2184,34 +2332,7 @@ impl ConsistencyChecker {
             }
         }
 
-        violations
-    }
-
-    /// 检测两个文本中是否存在语义矛盾标记（否定词 + 相同主题）。
-    fn detect_contradiction_marker(a: &str, b: &str) -> bool {
-        let negation_words = [
-            "not",
-            "no",
-            "never",
-            "impossible",
-            "cannot",
-            "can't",
-            "don't",
-            "doesn't",
-            "false",
-            "wrong",
-            "incorrect",
-            "不",
-            "没有",
-            "错误",
-            "无法",
-            "不能",
-            "不可",
-        ];
-        let a_has_negation = negation_words.iter().any(|n| a.contains(n));
-        let b_has_negation = negation_words.iter().any(|n| b.contains(n));
-        // 一个肯定一个否定 = 可能矛盾
-        a_has_negation != b_has_negation
+        Ok(violations)
     }
 
     /// 检查 Profile 冲突。
@@ -2292,7 +2413,7 @@ mod sleeptime_tests {
         async fn remove_edge(&self, _: &ContextUri, _: &ContextUri) -> Result<()> {
             Ok(())
         }
-        async fn neighbors(
+        async fn outgoing_neighbors(
             &self,
             _: &ContextUri,
             _: Option<GraphRelation>,
@@ -2360,6 +2481,7 @@ mod sleeptime_tests {
             graph,
             progress,
             signals,
+            Arc::new(NoopLlm),
             limit,
         )
         .unwrap();
@@ -2367,7 +2489,7 @@ mod sleeptime_tests {
         executor
     }
     fn engine() -> ConsolidationEngine {
-        ConsolidationEngine::new(Arc::new(NoopLlm))
+        ConsolidationEngine::new(ConsolidationConfig::default(), Arc::new(NoopLlm)).unwrap()
     }
 
     #[tokio::test]
@@ -2414,6 +2536,121 @@ mod sleeptime_tests {
             .unwrap();
         assert_eq!(second.cursor, Some(uri("uwu://tenant/agent/a/memories/02")));
         assert_eq!(second.completeness, 1.0);
+    }
+
+    struct WriteFailingStore {
+        inner: Arc<MemoryContextStore>,
+        writes: AtomicUsize,
+    }
+    #[async_trait]
+    impl ContentStore for WriteFailingStore {
+        async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload> {
+            self.inner.read(uri, level).await
+        }
+        async fn write(&self, _: ContextEntry) -> Result<MvccVersion> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(ContextError::Storage("injected write failure".into()))
+        }
+        async fn delete(&self, uri: &ContextUri) -> Result<()> {
+            self.inner.delete(uri).await
+        }
+        async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
+            self.inner.rename(from, to).await
+        }
+        async fn batch_write(&self, _: &[ContextEntry]) -> Result<Vec<MvccVersion>> {
+            Err(ContextError::Storage("injected write failure".into()))
+        }
+        async fn scan_by_prefix(
+            &self,
+            prefix: &str,
+            page: PageRequest,
+        ) -> Result<Page<ContextEntry>> {
+            self.inner.scan_by_prefix(prefix, page).await
+        }
+        async fn scan_by_type(
+            &self,
+            prefix: &str,
+            content_type: ContentType,
+            page: PageRequest,
+        ) -> Result<Page<ContextEntry>> {
+            self.inner.scan_by_type(prefix, content_type, page).await
+        }
+    }
+
+    async fn write_failing_executor(
+        mut source: ContextEntry,
+        task: SleeptimeTask,
+    ) -> (SleeptimeExecutor, Arc<WriteFailingStore>) {
+        source.updated_at = Utc::now() - chrono::Duration::days(365);
+        if matches!(task, SleeptimeTask::SpacedRepetitionReview) {
+            source.metadata.state_scope = Some(StateScope::Long);
+        }
+        let inner = Arc::new(MemoryContextStore::new());
+        inner.write(source).await.unwrap();
+        let store = Arc::new(WriteFailingStore {
+            inner,
+            writes: AtomicUsize::new(0),
+        });
+        let mut executor = executor(
+            store.clone(),
+            Arc::new(MemoryProgress::default()),
+            Arc::new(CountingSignals::default()),
+            Arc::new(CountingGraph {
+                calls: AtomicUsize::new(0),
+            }),
+            10,
+        );
+        executor.tasks = vec![task];
+        (executor, store)
+    }
+
+    #[tokio::test]
+    async fn quality_write_failure_is_propagated_without_completing_task() {
+        let mut source = entry("uwu://tenant/agent/a/memories/quality");
+        source.metadata.quality_score = Some(0.0);
+        let (executor, store) =
+            write_failing_executor(source, SleeptimeTask::QualityReassessment).await;
+
+        let error = executor
+            .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "storage: injected write failure");
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn review_write_failure_is_propagated_without_counting_written_review() {
+        let mut source = entry("uwu://tenant/agent/a/memories/review");
+        source.metadata.quality_score = Some(0.0);
+        let (executor, store) =
+            write_failing_executor(source, SleeptimeTask::SpacedRepetitionReview).await;
+
+        let error = executor
+            .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "storage: injected write failure");
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn health_family_write_failure_is_propagated() {
+        let mut source = entry("uwu://tenant/agent/a/fact/health");
+        source.metadata.content_type = Some(ContentType::Fact);
+        source.metadata.quality_score = Some(0.0);
+        let (executor, store) =
+            write_failing_executor(source, SleeptimeTask::KnowledgeHealthDiagnosis).await;
+
+        let error = executor
+            .run_once(&engine(), &uri("uwu://tenant/agent/a"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "storage: injected write failure");
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
     }
 
     struct FailingStore;
@@ -2509,9 +2746,9 @@ mod sleeptime_tests {
     struct CountingLifecycle(AtomicUsize);
     #[async_trait]
     impl LifecycleExecutorPort for CountingLifecycle {
-        async fn run_pending(&self) -> Vec<crate::lifecycle_execution::LifecycleJob> {
+        async fn run_pending(&self) -> Result<Vec<crate::lifecycle_execution::LifecycleJob>> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            vec![]
+            Ok(vec![])
         }
         async fn submit(
             &self,

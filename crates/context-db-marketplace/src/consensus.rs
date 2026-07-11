@@ -7,13 +7,54 @@ use crate::types::*;
 use agent_context_db_core::VectorIndex;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
+pub struct ConsensusConfig {
+    pub convergence_threshold: f32,
+    pub lexical_threshold_offset: f32,
+    pub established_threshold: usize,
+    pub vector_candidate_limit: usize,
+    pub signature_dimensions: usize,
+}
+
+impl Default for ConsensusConfig {
+    fn default() -> Self {
+        Self {
+            convergence_threshold: 0.9,
+            lexical_threshold_offset: 0.2,
+            established_threshold: 3,
+            vector_candidate_limit: 64,
+            signature_dimensions: 128,
+        }
+    }
+}
+
+impl ConsensusConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.convergence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.convergence_threshold)
+        {
+            return Err("convergence_threshold must be finite and in [0, 1]".into());
+        }
+        if !self.lexical_threshold_offset.is_finite()
+            || self.lexical_threshold_offset < 0.0
+            || self.lexical_threshold_offset > self.convergence_threshold
+        {
+            return Err("lexical_threshold_offset must be finite and between zero and convergence_threshold".into());
+        }
+        if self.established_threshold < 3 {
+            return Err("established_threshold must be at least 3".into());
+        }
+        if self.vector_candidate_limit == 0 || self.signature_dimensions == 0 {
+            return Err("consensus limits must be non-zero".into());
+        }
+        Ok(())
+    }
+}
+
 /// 共识追踪器 — 检测多源独立收敛。
 pub struct ConsensusTracker {
     vector_index: Arc<dyn VectorIndex>,
-    /// 收敛阈值（余弦相似度 > 此值 = 相同结论）。
-    convergence_threshold: f32,
-    /// 一致性阈值（达成此独立源数 → Established）。
-    established_threshold: usize,
+    config: ConsensusConfig,
 }
 
 /// 收敛报告。
@@ -37,12 +78,15 @@ pub enum EstablishmentStatus {
 }
 
 impl ConsensusTracker {
-    pub fn new(vector_index: Arc<dyn VectorIndex>) -> Self {
-        Self {
+    pub fn new(
+        vector_index: Arc<dyn VectorIndex>,
+        config: ConsensusConfig,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
             vector_index,
-            convergence_threshold: 0.9,
-            established_threshold: 3,
-        }
+            config,
+        })
     }
 
     /// 新条目写入时：检查是否已有独立 Agent 达成相同结论。
@@ -70,7 +114,7 @@ impl ConsensusTracker {
             }
 
             let sim = jaccard_similarity(&new_entry.principle, &existing_entry.principle);
-            if sim >= (self.convergence_threshold - 0.2) {
+            if sim >= (self.config.convergence_threshold - self.config.lexical_threshold_offset) {
                 independent_sources.push((
                     existing_entry.publisher.clone(),
                     existing_entry.id,
@@ -80,7 +124,7 @@ impl ConsensusTracker {
             }
         }
 
-        let status = if corroboration >= self.established_threshold {
+        let status = if corroboration >= self.config.established_threshold {
             EstablishmentStatus::Established
         } else if corroboration >= 2 {
             EstablishmentStatus::Corroborated
@@ -107,8 +151,8 @@ impl ConsensusTracker {
             .vector_index
             .search(
                 "market",
-                text_signature_vector(&new_entry.principle),
-                64,
+                text_signature_vector(&new_entry.principle, self.config.signature_dimensions),
+                self.config.vector_candidate_limit,
                 Some(serde_json::json!({ "domain": new_entry.domain })),
             )
             .await
@@ -149,8 +193,8 @@ impl ConsensusTracker {
     }
 }
 
-fn text_signature_vector(text: &str) -> Vec<f32> {
-    let mut vector = vec![0.0_f32; 128];
+fn text_signature_vector(text: &str, dimensions: usize) -> Vec<f32> {
+    let mut vector = vec![0.0_f32; dimensions];
     for token in text.split_whitespace() {
         let mut acc = 0xcbf29ce484222325_u64;
         for byte in token.as_bytes() {

@@ -134,7 +134,13 @@ impl ReputationEngine {
             self.register(publisher.clone());
         }
         let mut kpis = self.kpis.write();
-        let kpi = kpis.get_mut(&publisher).expect("publisher was registered");
+        let kpi = kpis
+            .entry(publisher.clone())
+            .or_insert_with(|| ReputationKpi {
+                agent: publisher.clone(),
+                last_active: now,
+                ..Default::default()
+            });
         kpi.last_active = now;
         match payload.outcome {
             AdoptionOutcome::Adopted { .. } => {

@@ -751,16 +751,25 @@ pub enum IntentTraceEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntentTraceDiagnostic {
+    Accepted,
+    InvalidTopic(String),
+    SerializationFailed(String),
+    PublishFailed(String),
+}
+
 pub trait IntentTraceSink: Send + Sync {
-    fn emit(&self, topic: &'static str, event: &IntentTraceEvent);
+    fn emit(&self, topic: &'static str, event: &IntentTraceEvent) -> IntentTraceDiagnostic;
 }
 
 #[derive(Debug, Default)]
 pub struct TracingIntentTraceSink;
 
 impl IntentTraceSink for TracingIntentTraceSink {
-    fn emit(&self, topic: &'static str, event: &IntentTraceEvent) {
+    fn emit(&self, topic: &'static str, event: &IntentTraceEvent) -> IntentTraceDiagnostic {
         tracing::debug!(target: "context_db::intent", topic, ?event);
+        IntentTraceDiagnostic::Accepted
     }
 }
 
@@ -780,20 +789,25 @@ impl EventMeshIntentTraceSink {
 }
 
 impl IntentTraceSink for EventMeshIntentTraceSink {
-    fn emit(&self, topic: &'static str, event: &IntentTraceEvent) {
-        let Ok(topic_id) = Topic::new(topic) else {
-            return;
+    fn emit(&self, topic: &'static str, event: &IntentTraceEvent) -> IntentTraceDiagnostic {
+        let topic_id = match Topic::new(topic) {
+            Ok(topic_id) => topic_id,
+            Err(error) => return IntentTraceDiagnostic::InvalidTopic(error.to_string()),
         };
-        let Ok(payload) = serde_json::to_value(event) else {
-            return;
+        let payload = match serde_json::to_value(event) {
+            Ok(payload) => payload,
+            Err(error) => return IntentTraceDiagnostic::SerializationFailed(error.to_string()),
         };
         let mut env = Envelope::new(&topic_id, payload);
         env.type_id = Some(EventTypeId::new("intent", intent_event_type_name(topic)));
         env.source = Some(self.source.clone());
         let mesh = self.mesh.clone();
         tokio::spawn(async move {
-            let _ = mesh.publish(env).await;
+            if let Err(error) = mesh.publish(env).await {
+                tracing::error!(%error, "intent trace EventMesh publish failed");
+            }
         });
+        IntentTraceDiagnostic::Accepted
     }
 }
 

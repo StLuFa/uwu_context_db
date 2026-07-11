@@ -61,7 +61,11 @@ fn keyset_page<T>(items: Vec<T>, page: &PageRequest, key: impl Fn(&T) -> String)
     if has_more {
         selected.pop();
     }
-    let next_cursor = has_more.then(|| key(selected.last().expect("a full page is non-empty")));
+    let next_cursor = if has_more {
+        selected.last().map(&key)
+    } else {
+        None
+    };
     Page::new(selected, next_cursor)
 }
 
@@ -88,7 +92,7 @@ impl GraphStore for MemoryContextStore {
         Ok(())
     }
 
-    async fn neighbors(
+    async fn outgoing_neighbors(
         &self,
         uri: &ContextUri,
         kind: Option<GraphRelation>,
@@ -98,8 +102,27 @@ impl GraphStore for MemoryContextStore {
             .get(&uri.to_string())
             .into_iter()
             .flat_map(|out| out.iter())
-            .filter(|(_, relation)| kind.map(|k| k == *relation).unwrap_or(true))
+            .filter(|(_, relation)| kind.is_none_or(|k| k == *relation))
             .filter_map(|(target, _)| ContextUri::parse(target.clone()).ok())
+            .collect())
+    }
+
+    async fn incoming_neighbors(
+        &self,
+        uri: &ContextUri,
+        kind: Option<GraphRelation>,
+    ) -> Result<Vec<ContextUri>> {
+        let target = uri.to_string();
+        let edges = self.graph_edges.lock();
+        Ok(edges
+            .iter()
+            .flat_map(|(source, out)| {
+                out.iter().filter_map(|(candidate, relation)| {
+                    (candidate == &target && kind.is_none_or(|k| k == *relation))
+                        .then(|| ContextUri::parse(source.clone()).ok())
+                        .flatten()
+                })
+            })
             .collect())
     }
 
@@ -155,7 +178,7 @@ impl GraphStore for MemoryContextStore {
 #[async_trait]
 impl ContentRepo for MemoryContextStore {
     async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
-        let mut entry = sanitize_entry_for_write(&entry);
+        let mut entry = sanitize_entry_for_write(&entry)?;
         let mut map = self.entries.lock();
         let list = map.entry(entry.uri.to_string().clone()).or_default();
         let next = MvccVersion(list.len() as u64 + 1);
@@ -189,7 +212,9 @@ impl FsOps for MemoryContextStore {
         for (uri, versions) in map.iter() {
             if let Some(rest) = uri.strip_prefix(&prefix) {
                 let is_dir = rest.contains('/');
-                let latest = versions.last().unwrap();
+                let Some(latest) = versions.last() else {
+                    continue;
+                };
                 let Ok(u) = ContextUri::parse(uri.clone()) else {
                     continue;
                 };

@@ -68,10 +68,10 @@ pub struct RetrieverCompiler {
 
 impl RetrieverCompiler {
     pub fn new(planner: Arc<dyn QueryPlanner>) -> Self {
-        let stats = Arc::new(StatisticsCollector::new());
+        let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
         Self {
             planner,
-            optimizer: CboOptimizer::new(stats),
+            optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
         }
     }
 
@@ -79,7 +79,7 @@ impl RetrieverCompiler {
     pub fn with_stats(planner: Arc<dyn QueryPlanner>, stats: Arc<StatisticsCollector>) -> Self {
         Self {
             planner,
-            optimizer: CboOptimizer::new(stats),
+            optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
         }
     }
 
@@ -161,7 +161,7 @@ impl PlanExecutor {
             model: "score".into(),
         });
 
-        let (hits, tokens_used) = load_within_budget(reranked, self.budget_tokens);
+        let (hits, tokens_used) = load_within_budget(reranked, self.budget_tokens)?;
 
         Ok(RetrievalResult {
             hits,
@@ -358,9 +358,12 @@ pub fn query_to_logical(query: &Query) -> LogicalPlan {
 // 工具函数
 // ===========================================================================
 
-fn load_within_budget(hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
-    let plan = load_hits_within_budget(hits, budget);
-    (plan.hits, plan.tokens_used)
+fn load_within_budget(
+    hits: Vec<RetrievalHit>,
+    budget: usize,
+) -> Result<(Vec<RetrievalHit>, usize)> {
+    let plan = load_hits_within_budget(hits, budget, crate::TokenBudgetConfig::default())?;
+    Ok((plan.hits, plan.tokens_used))
 }
 
 fn scan_budget(predicate: &Predicate, budget: usize) -> usize {

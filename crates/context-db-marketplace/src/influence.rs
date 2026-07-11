@@ -20,26 +20,88 @@ pub struct InfluenceScore {
     pub betweenness: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageRankConfig {
+    pub damping_factor: f32,
+    pub convergence_tolerance: f32,
+    pub max_iterations: usize,
+    pub max_nodes: usize,
+    pub bridge_saturation_citations: usize,
+    pub risky_bridge_cutoff: f32,
+}
+
+impl Default for PageRankConfig {
+    fn default() -> Self {
+        Self {
+            damping_factor: 0.85,
+            convergence_tolerance: 1e-6,
+            max_iterations: 64,
+            max_nodes: 10_000,
+            bridge_saturation_citations: 5,
+            risky_bridge_cutoff: 0.5,
+        }
+    }
+}
+
+impl PageRankConfig {
+    pub fn new(
+        damping_factor: f32,
+        convergence_tolerance: f32,
+        max_iterations: usize,
+        max_nodes: usize,
+        bridge_saturation_citations: usize,
+        risky_bridge_cutoff: f32,
+    ) -> Result<Self, String> {
+        let config = Self {
+            damping_factor,
+            convergence_tolerance,
+            max_iterations,
+            max_nodes,
+            bridge_saturation_citations,
+            risky_bridge_cutoff,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.damping_factor.is_finite() || !(0.0..1.0).contains(&self.damping_factor) {
+            return Err("damping_factor must be finite and in (0, 1)".into());
+        }
+        if !self.convergence_tolerance.is_finite() || self.convergence_tolerance <= 0.0 {
+            return Err("convergence_tolerance must be finite and positive".into());
+        }
+        if self.max_iterations == 0 || self.max_nodes == 0 {
+            return Err("PageRank bounds must be non-zero".into());
+        }
+        if self.bridge_saturation_citations == 0 {
+            return Err("bridge_saturation_citations must be non-zero".into());
+        }
+        if !self.risky_bridge_cutoff.is_finite() || !(0.0..=1.0).contains(&self.risky_bridge_cutoff)
+        {
+            return Err("risky_bridge_cutoff must be finite and in [0, 1]".into());
+        }
+        Ok(())
+    }
+}
+
 /// 影响力分析器。
 pub struct InfluenceAnalyzer {
+    config: PageRankConfig,
     /// 引用图：entry -> 被哪些 entry 引用。
     citations: parking_lot::RwLock<HashMap<MarketId, Vec<MarketId>>>,
     /// 采纳图：entry -> 被哪些 Agent 采纳。
     adoptions: parking_lot::RwLock<HashMap<MarketId, Vec<AgentId>>>,
 }
 
-impl Default for InfluenceAnalyzer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl InfluenceAnalyzer {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(config: PageRankConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
+            config,
             citations: parking_lot::RwLock::new(HashMap::new()),
             adoptions: parking_lot::RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     /// 记录一次引用（entry_a 引用 entry_b）。
@@ -81,6 +143,7 @@ impl InfluenceAnalyzer {
             push_unique_market_id(&mut all_entries, *entry);
         }
         all_entries.sort_by_key(|a| a.0);
+        all_entries.truncate(self.config.max_nodes);
 
         if all_entries.is_empty() {
             return Vec::new();
@@ -88,13 +151,13 @@ impl InfluenceAnalyzer {
 
         let n = all_entries.len();
         let n_f = n as f32;
-        let damping = 0.85;
+        let damping = self.config.damping_factor;
         let mut ranks: HashMap<MarketId, f32> = all_entries
             .iter()
             .map(|entry| (*entry, 1.0 / n_f))
             .collect();
 
-        for _ in 0..64 {
+        for _ in 0..self.config.max_iterations {
             let dangling_mass = all_entries
                 .iter()
                 .filter(|entry| outgoing.get(entry).is_none_or(Vec::is_empty))
@@ -128,7 +191,7 @@ impl InfluenceAnalyzer {
                 })
                 .sum::<f32>();
             ranks = next;
-            if delta < 1e-6 {
+            if delta < self.config.convergence_tolerance {
                 break;
             }
         }
@@ -143,8 +206,9 @@ impl InfluenceAnalyzer {
             .map(|entry| {
                 let adoption_count = adoptions.get(entry).map(Vec::len).unwrap_or(0);
                 let citation_count = citations.get(entry).map(Vec::len).unwrap_or(0);
-                let betweenness =
-                    (citation_count as f32 / (citation_count + 5) as f32).clamp(0.0, 1.0);
+                let betweenness = (citation_count as f32
+                    / (citation_count + self.config.bridge_saturation_citations) as f32)
+                    .clamp(0.0, 1.0);
                 InfluenceScore {
                     entry_id: *entry,
                     pagerank: (ranks.get(entry).copied().unwrap_or(0.0) / max_rank).clamp(0.0, 1.0),
@@ -175,7 +239,10 @@ impl InfluenceAnalyzer {
     pub fn find_risky_bridges(&self, quality_threshold: f32) -> Vec<InfluenceScore> {
         self.analyze()
             .into_iter()
-            .filter(|score| score.betweenness > 0.5 && score.pagerank < quality_threshold)
+            .filter(|score| {
+                score.betweenness > self.config.risky_bridge_cutoff
+                    && score.pagerank < quality_threshold
+            })
             .collect()
     }
 }

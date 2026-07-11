@@ -153,32 +153,26 @@ Respond with ONLY the overview text.
         let mut child_abstracts: Vec<(ContextUri, String)> = Vec::new();
 
         for entry in &entries {
-            match self.fs.read(&entry.uri, ContentLevel::L0).await {
-                Ok(payload) => {
-                    let abs = payload.sparse_text().to_string();
-                    if !abs.is_empty() {
-                        child_abstracts.push((entry.uri.clone(), abs));
-                    }
-                }
-                Err(_) => {
-                    // 目录：递归聚合
-                    if entry.is_dir {
-                        // 递归聚合子目录
-                        match Box::pin(self.aggregate_upward(&entry.uri)).await {
-                            Ok(overview) => {
-                                child_abstracts.push((entry.uri.clone(), overview));
-                            }
-                            Err(_) => {
-                                // 子目录聚合失败，跳过
-                            }
-                        }
-                    }
-                }
+            if entry.is_dir {
+                let overview = Box::pin(self.aggregate_upward(&entry.uri)).await?;
+                child_abstracts.push((entry.uri.clone(), overview));
+                continue;
             }
+            let payload = self.fs.read(&entry.uri, ContentLevel::L0).await?;
+            let abs = payload.sparse_text().trim();
+            if abs.is_empty() {
+                return Err(agent_context_db_core::ContextError::Storage(format!(
+                    "child abstract is empty: {}",
+                    entry.uri
+                )));
+            }
+            child_abstracts.push((entry.uri.clone(), abs.to_string()));
         }
 
         if child_abstracts.is_empty() {
-            return Ok(format!("(empty directory: {root})"));
+            return Err(agent_context_db_core::ContextError::Storage(format!(
+                "cannot aggregate empty directory: {root}"
+            )));
         }
 
         // 构建 LLM 合成提示
@@ -346,38 +340,26 @@ fn strongest_text(payload: &ContentPayload) -> String {
 
 /// 检测字节内容的基本类型提示。
 fn detect_content_type(bytes: &[u8]) -> &'static str {
-    if bytes.len() >= 4 {
-        // PNG magic
-        if &bytes[..4] == b"\x89PNG" {
-            return "PNG image";
-        }
-        // JPEG magic
-        if &bytes[..2] == b"\xff\xd8" {
-            return "JPEG image";
-        }
-        // GIF magic
-        if &bytes[..3] == b"GIF" {
-            return "GIF image";
-        }
-        // WebP
-        if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-            return "WebP image";
-        }
-        // PDF
-        if &bytes[..4] == b"%PDF" {
-            return "PDF document";
-        }
-        // WAV audio
-        if &bytes[..4] == b"RIFF" && bytes.len() >= 12 && &bytes[8..12] == b"WAVE" {
-            return "WAV audio";
-        }
-        // MP4 video
-        if bytes.len() >= 12 {
-            // ftyp box
-            if &bytes[4..8] == b"ftyp" {
-                return "MP4 video";
-            }
-        }
+    if bytes.starts_with(b"\x89PNG") {
+        return "PNG image";
+    }
+    if bytes.starts_with(b"\xff\xd8") {
+        return "JPEG image";
+    }
+    if bytes.starts_with(b"GIF") {
+        return "GIF image";
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return "WebP image";
+    }
+    if bytes.starts_with(b"%PDF") {
+        return "PDF document";
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        return "WAV audio";
+    }
+    if bytes.get(4..8) == Some(b"ftyp") {
+        return "MP4 video";
     }
     // 尝试 UTF-8 检测
     if std::str::from_utf8(bytes).is_ok() {

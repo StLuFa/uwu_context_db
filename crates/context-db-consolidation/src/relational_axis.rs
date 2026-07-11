@@ -59,7 +59,7 @@ impl RelationalAxis {
             RelKind::Supersedes => GraphRelation::Supersedes,
         });
         for uri in uris {
-            if let Ok(neighbors) = graph.neighbors(uri, gk).await
+            if let Ok(neighbors) = graph.outgoing_neighbors(uri, gk).await
                 && !neighbors.is_empty()
             {
                 result.insert(uri.to_string(), neighbors);

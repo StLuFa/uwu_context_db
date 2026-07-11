@@ -55,7 +55,7 @@ impl ContextRetriever {
         planner: Arc<dyn QueryPlanner>,
         reranker: Arc<dyn Reranker>,
     ) -> Self {
-        let stats = Arc::new(StatisticsCollector::new());
+        let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
         Self {
             fs,
             content: None,
@@ -68,7 +68,7 @@ impl ContextRetriever {
             reranker,
             retrieval_learner: None,
             intent_analyzer: None,
-            optimizer: CboOptimizer::new(stats),
+            optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
             plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -98,23 +98,24 @@ impl ContextRetriever {
     }
 
     /// 若配置了图与联想扩展开关，则对已有命中做联想扩展并合并到结果尾部。
-    async fn maybe_expand_associative(&self, hits: Vec<RetrievalHit>) -> Vec<RetrievalHit> {
+    async fn maybe_expand_associative(&self, hits: Vec<RetrievalHit>) -> Result<Vec<RetrievalHit>> {
         if !self.associative_enabled {
-            return hits;
+            return Ok(hits);
         }
         let graph = match &self.graph {
-            Some(g) => g.clone(),
-            None => return hits,
+            Some(graph) => graph.clone(),
+            None => return Ok(hits),
         };
-        let expander = crate::AssociativeExpander::new(self.fs.clone(), graph);
-        match expander.expand(&hits).await {
-            Ok(extra) => {
-                let mut merged = hits;
-                merged.extend(extra);
-                merged
-            }
-            Err(_) => hits,
-        }
+        let expander = crate::AssociativeExpander::new(
+            self.fs.clone(),
+            graph,
+            crate::associative::AssociativeConfig::default(),
+        )
+        .map_err(|error| ContextError::Unsupported(error.to_string()))?;
+        let extra = expander.expand(&hits).await?;
+        let mut merged = hits;
+        merged.extend(extra);
+        Ok(merged)
     }
 
     /// G.1: Builder 入口。
@@ -133,7 +134,9 @@ impl ContextRetriever {
         let graph = self.graph.clone().ok_or_else(|| {
             ContextError::Unsupported("GraphRAG retrieval requires a GraphStore".into())
         })?;
-        let mut engine = crate::GraphRagEngine::new(self.fs.clone(), graph);
+        let mut engine =
+            crate::GraphRagEngine::new(self.fs.clone(), graph, crate::GraphRagConfig::default())
+                .map_err(|error| ContextError::Unsupported(error.to_string()))?;
         if let Some(llm) = &self.graph_rag_llm {
             engine = engine.with_llm(llm.clone());
         }
@@ -248,11 +251,11 @@ impl ContextRetriever {
                 "expand.associative",
                 input = expand_input
             ))
-            .await;
+            .await?;
 
         // 5. Budget loading
         let (hits, tokens_used) = tracing::info_span!("budget.load", budget)
-            .in_scope(|| load_within_budget(expanded, budget));
+            .in_scope(|| load_within_budget(expanded, budget))?;
 
         tracing::info!(hits = hits.len(), tokens_used, "retrieve complete");
         Ok(RetrievalResult {
@@ -325,9 +328,9 @@ impl ContextRetriever {
                 "expand.associative",
                 input = expand_input
             ))
-            .await;
+            .await?;
         let (hits, tokens_used) = tracing::info_span!("budget.load", budget)
-            .in_scope(|| load_within_budget(expanded, budget));
+            .in_scope(|| load_within_budget(expanded, budget))?;
 
         tracing::info!(hits = hits.len(), tokens_used, "retrieve_query complete");
         Ok(RetrievalResult {
@@ -357,9 +360,12 @@ fn plan_cache_key(kind: &str, payload: &[u8]) -> Vec<u8> {
 // Budget loading
 // ===========================================================================
 
-fn load_within_budget(hits: Vec<RetrievalHit>, budget: usize) -> (Vec<RetrievalHit>, usize) {
-    let plan = load_hits_within_budget(hits, budget);
-    (plan.hits, plan.tokens_used)
+fn load_within_budget(
+    hits: Vec<RetrievalHit>,
+    budget: usize,
+) -> Result<(Vec<RetrievalHit>, usize)> {
+    let plan = load_hits_within_budget(hits, budget, crate::TokenBudgetConfig::default())?;
+    Ok((plan.hits, plan.tokens_used))
 }
 
 // ===========================================================================
@@ -417,8 +423,8 @@ impl QueryPlanner for RuleBasedPlanner {
     }
 
     async fn plan(&self, logical: &LogicalPlan) -> Result<PhysicalPlan> {
-        let stats = Arc::new(StatisticsCollector::new());
-        let optimizer = CboOptimizer::new(stats);
+        let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
+        let optimizer = CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap();
         Ok(optimizer.optimize(logical))
     }
 }

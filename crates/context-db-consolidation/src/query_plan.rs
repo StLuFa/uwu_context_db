@@ -125,32 +125,32 @@ impl QueryPlan {
     pub fn from_request(req: &RetrievalRequest) -> Self {
         let lifecycle = req.lifecycle.unwrap_or(Lifecycle::ValidOnly);
         let limit = if req.limit == 0 { 20 } else { req.limit };
-        let has_text = req.query_embedding.is_some();
-        let has_relation = !req.expand_relations.is_empty();
-        let has_type = req.content_type.is_some();
-
-        match (has_text, has_relation, has_type) {
+        match (
+            req.query_embedding.as_ref(),
+            req.expand_relations.is_empty(),
+            req.content_type,
+        ) {
             // 快路径 1：纯类型过滤
-            (false, false, true) => QueryPlan::TypeScan {
-                content_type: req.content_type.unwrap(),
+            (None, true, Some(content_type)) => QueryPlan::TypeScan {
+                content_type,
                 scope: req.scope.clone(),
                 lifecycle,
                 limit,
             },
 
             // 快路径 2：类型 + 语义，无关系扩展
-            (true, false, true) => QueryPlan::SemanticWithType {
-                query_embedding: req.query_embedding.clone().unwrap(),
-                content_type: req.content_type.unwrap(),
+            (Some(query_embedding), true, Some(content_type)) => QueryPlan::SemanticWithType {
+                query_embedding: query_embedding.clone(),
+                content_type,
                 scope: req.scope.clone(),
                 lifecycle,
                 limit,
             },
 
             // 慢路径：任何带关系扩展的（或无类型约束的语义搜索）
-            _ => QueryPlan::FullTriaxis {
-                query_embedding: req.query_embedding.clone().unwrap_or_default(),
-                content_type: req.content_type,
+            (query_embedding, _, content_type) => QueryPlan::FullTriaxis {
+                query_embedding: query_embedding.cloned().unwrap_or_default(),
+                content_type,
                 scope: req.scope.clone(),
                 lifecycle,
                 expand_relations: req.expand_relations.clone(),
@@ -165,7 +165,12 @@ impl QueryPlan {
         match self {
             QueryPlan::TypeScan { limit, .. } => *limit as f32 * 0.001,
             QueryPlan::SemanticWithType { limit, .. } => *limit as f32 * 0.01,
-            QueryPlan::FullTriaxis { limit, max_hops, expand_relations, .. } => {
+            QueryPlan::FullTriaxis {
+                limit,
+                max_hops,
+                expand_relations,
+                ..
+            } => {
                 *limit as f32 * 0.01
                     + (expand_relations.len() as f32) * 2_f32.powi(*max_hops as i32) * 10.0
             }
@@ -187,7 +192,11 @@ pub struct QueryExecutor {
 
 impl QueryExecutor {
     pub fn new(fs: Arc<dyn FsOps>) -> Self {
-        Self { fs, vector_index: None, graph: None }
+        Self {
+            fs,
+            vector_index: None,
+            graph: None,
+        }
     }
 
     pub fn with_vector_index(mut self, idx: Arc<dyn VectorIndex>) -> Self {
@@ -203,12 +212,28 @@ impl QueryExecutor {
     /// 执行查询计划，返回命中列表。
     pub async fn execute(&self, plan: QueryPlan) -> Result<Vec<RetrievalHit>> {
         match plan {
-            QueryPlan::TypeScan { content_type, scope, lifecycle, limit } => {
-                self.execute_type_scan(content_type, scope, lifecycle, limit).await
+            QueryPlan::TypeScan {
+                content_type,
+                scope,
+                lifecycle,
+                limit,
+            } => {
+                self.execute_type_scan(content_type, scope, lifecycle, limit)
+                    .await
             }
-            QueryPlan::SemanticWithType { query_embedding, content_type, scope, lifecycle, limit } => {
+            QueryPlan::SemanticWithType {
+                query_embedding,
+                content_type,
+                scope,
+                lifecycle,
+                limit,
+            } => {
                 self.execute_semantic_with_type(
-                    &query_embedding, content_type, scope, lifecycle, limit,
+                    &query_embedding,
+                    content_type,
+                    scope,
+                    lifecycle,
+                    limit,
                 )
                 .await
             }
@@ -281,11 +306,15 @@ impl QueryExecutor {
             Some(idx) => idx,
             None => {
                 // 降级到类型扫描
-                return self.execute_type_scan(content_type, scope, lifecycle, limit).await;
+                return self
+                    .execute_type_scan(content_type, scope, lifecycle, limit)
+                    .await;
             }
         };
 
-        let raw_hits = index.search("default", embedding.to_vec(), limit * 2, None).await?;
+        let raw_hits = index
+            .search("default", embedding.to_vec(), limit * 2, None)
+            .await?;
 
         let type_seg = content_type.as_path_segment();
         let hits = raw_hits
@@ -295,7 +324,9 @@ impl QueryExecutor {
                 h.uri.as_str().contains(&format!("/memory/{type_seg}/"))
             })
             .filter_map(|h| {
-                if !lifecycle_filter_by_uri(&h.uri, lifecycle) { return None; }
+                if !lifecycle_filter_by_uri(&h.uri, lifecycle) {
+                    return None;
+                }
                 Some(RetrievalHit {
                     uri: h.uri,
                     relevance: h.score,
@@ -326,18 +357,24 @@ impl QueryExecutor {
         // 阶段 1：向量召回（或类型扫描）
         let mut hits: Vec<RetrievalHit> = if !embedding.is_empty() {
             if let Some(index) = &self.vector_index {
-                let raw = index.search("default", embedding.to_vec(), limit * 2, None).await?;
+                let raw = index
+                    .search("default", embedding.to_vec(), limit * 2, None)
+                    .await?;
                 // 可选类型过滤
                 raw.into_iter()
                     .filter(|h| {
                         if let Some(ct) = content_type {
-                            h.uri.as_str().contains(&format!("/memory/{}/", ct.as_path_segment()))
+                            h.uri
+                                .as_str()
+                                .contains(&format!("/memory/{}/", ct.as_path_segment()))
                         } else {
                             true
                         }
                     })
                     .filter_map(|h| {
-                        if !lifecycle_filter_by_uri(&h.uri, lifecycle) { return None; }
+                        if !lifecycle_filter_by_uri(&h.uri, lifecycle) {
+                            return None;
+                        }
                         Some(RetrievalHit {
                             uri: h.uri,
                             relevance: h.score,
@@ -348,12 +385,14 @@ impl QueryExecutor {
                     .take(limit)
                     .collect()
             } else if let Some(ct) = content_type {
-                self.execute_type_scan(ct, scope.clone(), lifecycle, limit).await?
+                self.execute_type_scan(ct, scope.clone(), lifecycle, limit)
+                    .await?
             } else {
                 vec![]
             }
         } else if let Some(ct) = content_type {
-            self.execute_type_scan(ct, scope.clone(), lifecycle, limit).await?
+            self.execute_type_scan(ct, scope.clone(), lifecycle, limit)
+                .await?
         } else {
             vec![]
         };
@@ -365,28 +404,33 @@ impl QueryExecutor {
                 let graph_relations: Vec<agent_context_db_core::GraphRelation> =
                     expand_relations.iter().map(relkind_to_graph).collect();
 
-                if let Ok(edges) = graph.batch_traverse(&seed_uris, &graph_relations, max_hops).await {
-                    let mut extra: Vec<RetrievalHit> = edges
-                        .into_iter()
-                        .map(|(from, to, kind)| RetrievalHit {
-                            // 关系命中的相关性来自种子节点
-                            relevance: hits
-                                .iter()
-                                .find(|h| h.uri == from)
-                                .map(|h| h.relevance * 0.7)
-                                .unwrap_or(0.4),
-                            uri: to,
-                            abstract_: format!("{:?}", kind),
-                            source: "relational",
-                        })
-                        .collect();
-                    hits.append(&mut extra);
-                }
+                let edges = graph
+                    .batch_traverse(&seed_uris, &graph_relations, max_hops)
+                    .await?;
+                let mut extra: Vec<RetrievalHit> = edges
+                    .into_iter()
+                    .map(|(from, to, kind)| RetrievalHit {
+                        // 关系命中的相关性来自种子节点
+                        relevance: hits
+                            .iter()
+                            .find(|h| h.uri == from)
+                            .map(|h| h.relevance * 0.7)
+                            .unwrap_or(0.4),
+                        uri: to,
+                        abstract_: format!("{:?}", kind),
+                        source: "relational",
+                    })
+                    .collect();
+                hits.append(&mut extra);
             }
         }
 
         // 阶段 3：去重 + 按相关性排序 + 截断
-        hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.dedup_by(|a, b| a.uri == b.uri);
         hits.truncate(limit);
 
@@ -398,7 +442,11 @@ impl QueryExecutor {
     // -----------------------------------------------------------------------
 
     /// 构建类型前缀 URI。
-    fn build_uri_prefix(&self, content_type: Option<ContentType>, scope: &Option<QueryScope>) -> String {
+    fn build_uri_prefix(
+        &self,
+        content_type: Option<ContentType>,
+        scope: &Option<QueryScope>,
+    ) -> String {
         let agent_part = match scope {
             Some(QueryScope::Agent(a)) => a.clone(),
             Some(QueryScope::Tenant(t)) => format!("{t}/default"),

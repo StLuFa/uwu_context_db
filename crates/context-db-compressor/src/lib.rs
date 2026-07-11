@@ -6,7 +6,7 @@
 
 pub mod queue;
 
-pub use queue::TokioSemanticQueue;
+pub use queue::{TokioSemanticQueue, WorkerExit, WorkerResult};
 
 use agent_context_db_core::{ContextUri, Result};
 use agent_context_db_parse::MemoryCandidate;

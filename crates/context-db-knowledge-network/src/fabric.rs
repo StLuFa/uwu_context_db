@@ -243,11 +243,17 @@ impl FederatedKnowledgeFabric {
         };
         // Persist all fallible result state before committing the non-refundable charge.
         for (peer, state) in self.route_learning.snapshot() {
-            self.persistence.record_route_state(peer, state).await?;
+            if let Err(primary) = self.persistence.record_route_state(peer, state).await {
+                return Err(reservation.refund_after_error(primary).await);
+            }
         }
-        self.persistence
-            .record_budget_receipt(reservation.receipt().clone())
-            .await?;
+        if let Err(primary) = self
+            .persistence
+            .record_budget_receipt(reservation.receipt()?.clone())
+            .await
+        {
+            return Err(reservation.refund_after_error(primary).await);
+        }
         let receipt = reservation.commit().await?;
         Ok(ProgressiveMeshResult {
             phase: MeshResultPhase::PartialFast,

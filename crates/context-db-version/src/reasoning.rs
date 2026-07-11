@@ -65,14 +65,55 @@ pub struct DiffImpact {
     pub notify_required: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReasoningConfig {
+    pub diff_max_tokens: usize,
+    pub diff_temperature: f32,
+    pub timeline_log_limit: usize,
+    pub periodicity_log_limit: usize,
+}
+
+impl ReasoningConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.diff_max_tokens == 0
+            || self.diff_max_tokens > u32::MAX as usize
+            || self.timeline_log_limit == 0
+            || self.periodicity_log_limit == 0
+        {
+            return Err(VersionError::InvalidConfig(
+                "reasoning token and log limits must be greater than zero".into(),
+            ));
+        }
+        if !self.diff_temperature.is_finite() || !(0.0..=1.0).contains(&self.diff_temperature) {
+            return Err(VersionError::InvalidConfig(
+                "diff_temperature must be finite and in 0..=1".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            diff_max_tokens: 1024,
+            diff_temperature: 0.1,
+            timeline_log_limit: 50,
+            periodicity_log_limit: 100,
+        }
+    }
+}
+
 /// 版本差异推理器 —— 将 TreeDiff 提升为语义级理解。
 pub struct DiffReasoner {
     llm: Arc<dyn LlmClient>,
+    config: ReasoningConfig,
 }
 
 impl DiffReasoner {
-    pub fn new(llm: Arc<dyn LlmClient>) -> Self {
-        Self { llm }
+    pub fn new(llm: Arc<dyn LlmClient>, config: ReasoningConfig) -> crate::Result<Self> {
+        config.validate()?;
+        Ok(Self { llm, config })
     }
 
     /// 对两个 commit 间的变更做语义推理。
@@ -109,8 +150,8 @@ Return a JSON object with:
         );
 
         let opts = LlmOpts {
-            max_tokens: Some(1024),
-            temperature: Some(0.1),
+            max_tokens: Some(self.config.diff_max_tokens as u32),
+            temperature: Some(self.config.diff_temperature),
             ..Default::default()
         };
 
@@ -225,11 +266,13 @@ pub enum TemporalPattern {
 /// 时态推理器 —— 利用 M2 时间旅行做时序分析。
 pub struct TemporalReasoner<V: VersionStore> {
     store: Arc<V>,
+    config: ReasoningConfig,
 }
 
 impl<V: VersionStore> TemporalReasoner<V> {
-    pub fn new(store: Arc<V>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<V>, config: ReasoningConfig) -> crate::Result<Self> {
+        config.validate()?;
+        Ok(Self { store, config })
     }
 
     /// 生成条目在时间窗口内的演变时间线。
@@ -244,7 +287,7 @@ impl<V: VersionStore> TemporalReasoner<V> {
             .log(
                 scope,
                 &LogOpts {
-                    max_count: Some(50),
+                    max_count: Some(self.config.timeline_log_limit),
                     ..Default::default()
                 },
             )
@@ -305,7 +348,7 @@ impl<V: VersionStore> TemporalReasoner<V> {
             .log(
                 scope,
                 &LogOpts {
-                    max_count: Some(100),
+                    max_count: Some(self.config.periodicity_log_limit),
                     ..Default::default()
                 },
             )
@@ -630,7 +673,11 @@ mod tests {
                 HashMap::from([(uri.to_string(), text_payload("after"))]),
             ),
         ]);
-        let reasoner = TemporalReasoner::new(Arc::new(TemporalTestStore { commits, snapshots }));
+        let reasoner = TemporalReasoner::new(
+            Arc::new(TemporalTestStore { commits, snapshots }),
+            ReasoningConfig::default(),
+        )
+        .unwrap();
 
         let periodic = reasoner.detect_periodicity(&scope, 2).await.unwrap();
         assert_eq!(periodic, vec![(uri.clone(), 2)]);

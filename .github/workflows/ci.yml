@@ -28,7 +28,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace --all-targets
+      # Compile benches without executing Criterion's long-running benchmark harness.
+      - run: cargo check --locked --workspace --all-targets
+      - run: cargo test --locked --workspace --lib --tests --bins --examples
 
   backend-matrix:
     name: ${{ matrix.backend }} backend

@@ -1,5 +1,6 @@
 //! 投票演化 — Insight 持续投票，低分自动淘汰。
 
+use crate::config::VotingConfig;
 use crate::reflection::SemanticGradient;
 use agent_context_db_core::{ContentType, ContextUri};
 use chrono::{DateTime, Utc};
@@ -63,13 +64,16 @@ impl EvolvableInsight {
     }
 
     /// 从 Reflexion 语义梯度生成可演化 insight。
-    pub fn from_gradient(index: usize, gradient: &SemanticGradient) -> Self {
-        let uri = gradient.source_uri.clone().unwrap_or_else(|| {
-            ContextUri::parse(format!(
+    pub fn from_gradient(
+        index: usize,
+        gradient: &SemanticGradient,
+    ) -> agent_context_db_core::Result<Self> {
+        let uri = match &gradient.source_uri {
+            Some(uri) => uri.clone(),
+            None => ContextUri::parse(format!(
                 "uwu://t/agent/a/memories/reflection/generated-{index}"
-            ))
-            .expect("generated reflection URI must parse")
-        });
+            ))?,
+        };
         let mut insight = Self::new(
             uri,
             format!(
@@ -80,13 +84,13 @@ impl EvolvableInsight {
         );
         insight.evidence = gradient.epistemic_tags.clone();
         insight.votes.upvotes.push(Vote {
-            voter_uri: ContextUri::parse("uwu://t/agent/cdt/reflexion").unwrap(),
+            voter_uri: ContextUri::parse("uwu://t/agent/cdt/reflexion")?,
             weight: gradient.priority.clamp(0.0, 1.0),
             timestamp: Utc::now(),
             evidence: Some("generated from semantic gradient".into()),
         });
         insight.recompute_score();
-        insight
+        Ok(insight)
     }
 
     /// 加权净分 = Σ(upvote.weight) - Σ(downvote.weight)。
@@ -102,7 +106,7 @@ impl EvolvableInsight {
     }
 
     pub fn similarity_key(&self) -> String {
-        normalize_key(&self.content)
+        normalize_key(&self.content, 8)
     }
 }
 
@@ -110,26 +114,17 @@ impl EvolvableInsight {
 pub struct InsightEvolutionEngine {
     deprecate_threshold: f32,
     merge_threshold: f32,
-}
-
-impl Default for InsightEvolutionEngine {
-    fn default() -> Self {
-        Self::new()
-    }
+    similarity_prefix_tokens: usize,
 }
 
 impl InsightEvolutionEngine {
-    pub fn new() -> Self {
-        Self {
-            deprecate_threshold: 0.0,
-            merge_threshold: 0.72,
-        }
-    }
-
-    pub fn with_thresholds(mut self, deprecate_threshold: f32, merge_threshold: f32) -> Self {
-        self.deprecate_threshold = deprecate_threshold;
-        self.merge_threshold = merge_threshold.clamp(0.0, 1.0);
-        self
+    pub fn new(config: VotingConfig) -> agent_context_db_core::Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            deprecate_threshold: config.deprecate_threshold,
+            merge_threshold: config.merge_threshold,
+            similarity_prefix_tokens: config.similarity_prefix_tokens,
+        })
     }
 
     pub fn vote(&self, insight: &mut EvolvableInsight, op: VoteOp) {
@@ -157,19 +152,31 @@ impl InsightEvolutionEngine {
         &self,
         insights: &mut Vec<EvolvableInsight>,
         gradients: &[SemanticGradient],
-    ) -> EvolutionReport {
+    ) -> agent_context_db_core::Result<EvolutionReport> {
         let before = insights.len();
         let mut report = EvolutionReport::default();
         let mut index: HashMap<String, usize> = insights
             .iter()
             .enumerate()
-            .map(|(idx, insight)| (insight.similarity_key(), idx))
+            .map(|(idx, insight)| {
+                (
+                    normalize_key(&insight.content, self.similarity_prefix_tokens),
+                    idx,
+                )
+            })
             .collect();
 
         for (i, gradient) in gradients.iter().enumerate() {
-            let candidate = EvolvableInsight::from_gradient(i, gradient);
+            let candidate = EvolvableInsight::from_gradient(i, gradient)?;
             if let Some(existing_idx) = find_similar(insights, &candidate, self.merge_threshold)
-                .or_else(|| index.get(&candidate.similarity_key()).copied())
+                .or_else(|| {
+                    index
+                        .get(&normalize_key(
+                            &candidate.content,
+                            self.similarity_prefix_tokens,
+                        ))
+                        .copied()
+                })
             {
                 let existing = &mut insights[existing_idx];
                 existing.content = merge_content(&existing.content, &candidate.content);
@@ -183,7 +190,10 @@ impl InsightEvolutionEngine {
                 existing.recompute_score();
                 report.merged += 1;
             } else {
-                index.insert(candidate.similarity_key(), insights.len());
+                index.insert(
+                    normalize_key(&candidate.content, self.similarity_prefix_tokens),
+                    insights.len(),
+                );
                 insights.push(candidate);
                 report.added += 1;
             }
@@ -196,7 +206,7 @@ impl InsightEvolutionEngine {
         if before == 0 && report.added == 0 {
             report.surviving = 0;
         }
-        report
+        Ok(report)
     }
 
     pub fn cleanup(insights: &mut Vec<EvolvableInsight>) -> usize {
@@ -206,10 +216,10 @@ impl InsightEvolutionEngine {
     }
 }
 
-fn normalize_key(content: &str) -> String {
+fn normalize_key(content: &str, prefix_tokens: usize) -> String {
     content
         .split_whitespace()
-        .take(8)
+        .take(prefix_tokens)
         .map(|s| {
             s.trim_matches(|c: char| !c.is_alphanumeric())
                 .to_ascii_lowercase()
@@ -287,22 +297,29 @@ mod tests {
 
     #[test]
     fn gradient_creates_voted_insight() {
-        let insight = EvolvableInsight::from_gradient(0, &gradient("timeout", "retry", 0.8));
+        let insight =
+            EvolvableInsight::from_gradient(0, &gradient("timeout", "retry", 0.8)).unwrap();
         assert!(insight.votes.net_score > 0.0);
         assert!(insight.content.contains("ACTION"));
     }
 
     #[test]
     fn evolution_merges_similar_gradients_and_keeps_positive_votes() {
-        let engine = InsightEvolutionEngine::new().with_thresholds(0.0, 0.2);
+        let engine = InsightEvolutionEngine::new(VotingConfig {
+            merge_threshold: 0.2,
+            ..VotingConfig::default()
+        })
+        .unwrap();
         let mut insights = Vec::new();
-        let report = engine.evolve_from_gradients(
-            &mut insights,
-            &[
-                gradient("timeout during deploy", "add retry", 0.8),
-                gradient("timeout during deploy", "add backoff", 0.7),
-            ],
-        );
+        let report = engine
+            .evolve_from_gradients(
+                &mut insights,
+                &[
+                    gradient("timeout during deploy", "retry", 0.8),
+                    gradient("timeout during deploy", "backoff", 0.7),
+                ],
+            )
+            .unwrap();
         assert_eq!(report.added, 1);
         assert_eq!(report.merged, 1);
         assert_eq!(insights.len(), 1);

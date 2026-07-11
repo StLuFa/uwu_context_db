@@ -2,8 +2,12 @@
 //!
 //! 薄适配层，只做类型映射，不引入业务逻辑。
 
-use agent_context_db_core::{ContextError, ContextUri, IndexHit, IndexPoint, Result, VectorIndex};
+use agent_context_db_core::{
+    ContextError, ContextUri, IndexHit, IndexPoint, IndexVector, Result, VectorIndex,
+};
 use async_trait::async_trait;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 
 /// 将 uwu_database::VectorStore 适配为 context-db 的 VectorIndex。
 ///
@@ -12,11 +16,17 @@ use async_trait::async_trait;
 /// - `IndexHit.payload` ↔ `Match.metadata`
 pub struct UwuVectorIndex {
     inner: std::sync::Arc<dyn uwu_database::VectorStore>,
+    // uwu_database's current port cannot retrieve records by id. Keep a write-through
+    // record map so this adapter still provides the stronger VectorIndex contract in one lookup.
+    records: RwLock<HashMap<(String, String), IndexVector>>,
 }
 
 impl UwuVectorIndex {
     pub fn new(vs: std::sync::Arc<dyn uwu_database::VectorStore>) -> Self {
-        Self { inner: vs }
+        Self {
+            inner: vs,
+            records: RwLock::new(HashMap::new()),
+        }
     }
 }
 
@@ -49,6 +59,20 @@ impl VectorIndex for UwuVectorIndex {
         if let Some(version) = point.embedding_version {
             metadata.insert("embedding_version".into(), version.into());
         }
+        let indexed = IndexVector {
+            uri: point.uri.clone(),
+            vector: point.vector.clone(),
+            embedding_model_id: metadata
+                .get("embedding_model_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            embedding_dim: Some(point.vector.len()),
+            embedding_version: metadata
+                .get("embedding_version")
+                .and_then(serde_json::Value::as_u64),
+            payload: serde_json::to_value(&metadata)
+                .map_err(|e| ContextError::Storage(format!("serialize vector payload: {e}")))?,
+        };
         let record = uwu_database::Record {
             id: point.uri.to_string(),
             vector: point.vector,
@@ -57,7 +81,11 @@ impl VectorIndex for UwuVectorIndex {
         self.inner
             .upsert(collection, &[record])
             .await
-            .map_err(|e| ContextError::Storage(format!("vector upsert: {e}")))
+            .map_err(|e| ContextError::Storage(format!("vector upsert: {e}")))?;
+        self.records
+            .write()
+            .insert((collection.to_owned(), point.uri.to_string()), indexed);
+        Ok(())
     }
 
     async fn search(
@@ -114,11 +142,27 @@ impl VectorIndex for UwuVectorIndex {
             .collect()
     }
 
+    async fn get_many(&self, collection: &str, uris: &[ContextUri]) -> Result<Vec<IndexVector>> {
+        let records = self.records.read();
+        Ok(uris
+            .iter()
+            .filter_map(|uri| {
+                records
+                    .get(&(collection.to_owned(), uri.to_string()))
+                    .cloned()
+            })
+            .collect())
+    }
+
     async fn delete(&self, collection: &str, uri: &ContextUri) -> Result<()> {
         self.inner
             .delete(collection, &[uri.to_string()])
             .await
-            .map_err(|e| ContextError::Storage(format!("vector delete: {e}")))
+            .map_err(|e| ContextError::Storage(format!("vector delete: {e}")))?;
+        self.records
+            .write()
+            .remove(&(collection.to_owned(), uri.to_string()));
+        Ok(())
     }
 }
 

@@ -188,7 +188,8 @@ impl PromptOptimizingLlmClient {
 #[async_trait]
 impl LlmClient for PromptOptimizingLlmClient {
     async fn complete(&self, prompt: &str, opts: &LlmOpts) -> Result<String, LlmError> {
-        let optimized = optimize_prompt(prompt, &opts.prompt);
+        let optimized = optimize_prompt(prompt, &opts.prompt)
+            .map_err(|error| LlmError::Provider(error.to_string()))?;
         self.inner.complete(&optimized.text, opts).await
     }
 
@@ -206,7 +207,8 @@ impl LlmClient for PromptOptimizingLlmClient {
         schema: &JsonSchema,
         opts: &LlmOpts,
     ) -> Result<String, LlmError> {
-        let optimized = optimize_prompt(prompt, &opts.prompt);
+        let optimized = optimize_prompt(prompt, &opts.prompt)
+            .map_err(|error| LlmError::Provider(error.to_string()))?;
         self.inner
             .complete_json(&optimized.text, schema, opts)
             .await
@@ -217,7 +219,8 @@ impl LlmClient for PromptOptimizingLlmClient {
         prompt: &str,
         opts: &LlmOpts,
     ) -> Result<Box<dyn LlmStream + Send>, LlmError> {
-        let optimized = optimize_prompt(prompt, &opts.prompt);
+        let optimized = optimize_prompt(prompt, &opts.prompt)
+            .map_err(|error| LlmError::Provider(error.to_string()))?;
         self.inner.stream_complete(&optimized.text, opts).await
     }
 
@@ -228,8 +231,12 @@ impl LlmClient for PromptOptimizingLlmClient {
     ) -> Result<Vec<String>, LlmError> {
         let optimized = prompts
             .iter()
-            .map(|prompt| optimize_prompt(prompt, &opts.prompt).text)
-            .collect::<Vec<_>>();
+            .map(|prompt| {
+                optimize_prompt(prompt, &opts.prompt)
+                    .map(|optimized| optimized.text)
+                    .map_err(|error| LlmError::Provider(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.inner.batch_complete(&optimized, opts).await
     }
 
@@ -269,12 +276,13 @@ impl CascadeLlmClient {
         Arc::new(self)
     }
 
-    fn routed_opts(&self, prompt: &str, opts: &LlmOpts) -> LlmOpts {
+    fn routed_opts(&self, prompt: &str, opts: &LlmOpts) -> Result<LlmOpts, LlmError> {
         let mut routed = opts.clone();
         if routed.model.is_some() {
-            return routed;
+            return Ok(routed);
         }
-        let prompt_tokens = crate::tokenizer::count_tokens(prompt);
+        let prompt_tokens = crate::tokenizer::count_tokens(prompt)
+            .map_err(|error| LlmError::Provider(error.to_string()))?;
         let high_value = matches!(
             routed.task,
             LlmTaskKind::Arbitration | LlmTaskKind::Merge | LlmTaskKind::Synthesis
@@ -290,7 +298,7 @@ impl CascadeLlmClient {
                 .clone()
                 .or(self.config.strong_model.clone())
         };
-        routed
+        Ok(routed)
     }
 
     async fn complete_with_upgrade(
@@ -299,7 +307,7 @@ impl CascadeLlmClient {
         opts: &LlmOpts,
         json_schema: Option<&JsonSchema>,
     ) -> Result<String, LlmError> {
-        let routed = self.routed_opts(prompt, opts);
+        let routed = self.routed_opts(prompt, opts)?;
         let first = match json_schema {
             Some(schema) => self.inner.complete_json(prompt, schema, &routed).await,
             None => self.inner.complete(prompt, &routed).await,
@@ -374,6 +382,22 @@ impl Default for CachingLlmClientConfig {
     }
 }
 
+impl CachingLlmClientConfig {
+    pub fn validate(&self) -> Result<(), LlmError> {
+        if self.completion_capacity == 0 || self.embedding_capacity == 0 {
+            return Err(LlmError::Provider(
+                "cache capacities must be greater than zero".into(),
+            ));
+        }
+        if self.completion_ttl.is_zero() || self.embedding_ttl.is_zero() {
+            return Err(LlmError::Provider(
+                "cache TTLs must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Transparent LLM cache for repeated completions and embeddings.
 ///
 /// The cache key includes provider options and schema content, so callers with
@@ -385,22 +409,26 @@ pub struct CachingLlmClient {
 }
 
 impl CachingLlmClient {
-    pub fn new(inner: Arc<dyn LlmClient>) -> Self {
+    pub fn new(inner: Arc<dyn LlmClient>) -> Result<Self, LlmError> {
         Self::with_config(inner, CachingLlmClientConfig::default())
     }
 
-    pub fn with_config(inner: Arc<dyn LlmClient>, config: CachingLlmClientConfig) -> Self {
-        Self {
+    pub fn with_config(
+        inner: Arc<dyn LlmClient>,
+        config: CachingLlmClientConfig,
+    ) -> Result<Self, LlmError> {
+        config.validate()?;
+        Ok(Self {
             inner,
             completions: Cache::builder()
-                .max_capacity(config.completion_capacity.max(1))
+                .max_capacity(config.completion_capacity)
                 .time_to_live(config.completion_ttl)
                 .build(),
             embeddings: Cache::builder()
-                .max_capacity(config.embedding_capacity.max(1))
+                .max_capacity(config.embedding_capacity)
                 .time_to_live(config.embedding_ttl)
                 .build(),
-        }
+        })
     }
 
     pub fn into_arc(self) -> Arc<dyn LlmClient> {
@@ -576,7 +604,7 @@ mod tests {
             completes: AtomicUsize::new(0),
             embeds: AtomicUsize::new(0),
         });
-        let cached = CachingLlmClient::new(inner.clone());
+        let cached = CachingLlmClient::new(inner.clone()).unwrap();
         let opts = LlmOpts::default();
 
         assert_eq!(cached.complete("same", &opts).await.unwrap(), "answer:same");
@@ -595,7 +623,7 @@ mod tests {
             completes: AtomicUsize::new(0),
             embeds: AtomicUsize::new(0),
         });
-        let cached = CachingLlmClient::new(inner.clone());
+        let cached = CachingLlmClient::new(inner.clone()).unwrap();
         let texts = vec!["alpha".to_string(), "beta".to_string(), "alpha".to_string()];
 
         let first = cached.embed_batch(&texts).await.unwrap();

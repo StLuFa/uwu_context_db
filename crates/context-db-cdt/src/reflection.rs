@@ -3,6 +3,7 @@
 //! 理论根基：反思的语义梯度 —— 不只是记录"失败了"，
 //! 而是用 LLM 分析"为什么失败"、"应该怎么做"、"涉及哪些认识论类型"。
 
+use crate::config::ReflectionConfig;
 use crate::voting::{EvolutionReport, EvolvableInsight, InsightEvolutionEngine};
 use agent_context_db_core::{
     ConsolidationMeta, ConsolidationStatus, ContentPayload, ContentType, ContextEntry, ContextUri,
@@ -85,6 +86,7 @@ pub struct ReflexionEvolutionResult {
 /// LLM 驱动的反思生成器。
 pub struct ReflectionGenerator {
     llm: Arc<dyn LlmClient>,
+    config: ReflectionConfig,
 }
 
 /// LLM 返回的 JSON 解析结构。
@@ -101,9 +103,9 @@ impl SemanticGradient {
         &self,
         config: &ReflectionWritebackConfig,
         index: usize,
-    ) -> Vec<ContextEntry> {
+    ) -> agent_context_db_core::Result<Vec<ContextEntry>> {
         if self.priority < config.min_priority {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let hash = blake3::hash(
             format!(
@@ -111,19 +113,16 @@ impl SemanticGradient {
                 self.reflection_text, self.action_improvement, index
             )
             .as_bytes(),
-        )
-        .to_hex();
-        let short = &hash[..8];
+        );
+        let short = hash.to_hex().chars().take(8).collect::<String>();
         let error_uri = ContextUri::parse(format!(
             "uwu://{}/memory/error/reflection/{:02}-{}",
             config.agent_scope, index, short
-        ))
-        .expect("reflection error URI must be valid");
+        ))?;
         let heuristic_uri = ContextUri::parse(format!(
             "uwu://{}/memory/heuristic/reflection/{:02}-{}",
             config.agent_scope, index, short
-        ))
-        .expect("reflection heuristic URI must be valid");
+        ))?;
 
         let mut error_entry = ContextEntry::new_text(
             error_uri,
@@ -169,13 +168,15 @@ impl SemanticGradient {
         heuristic_entry.metadata.consolidation =
             Some(reflection_meta(self, Some(error_entry.uri.clone())));
 
-        vec![error_entry, heuristic_entry]
+        Ok(vec![error_entry, heuristic_entry])
     }
 
-    pub fn recall_hint(&self, agent_scope: &str) -> ReflectionRecallHint {
-        let scope = ContextUri::parse(format!("uwu://{agent_scope}/memory/error/reflection"))
-            .expect("reflection recall scope must be valid");
-        ReflectionRecallHint {
+    pub fn recall_hint(
+        &self,
+        agent_scope: &str,
+    ) -> agent_context_db_core::Result<ReflectionRecallHint> {
+        let scope = ContextUri::parse(format!("uwu://{agent_scope}/memory/error/reflection"))?;
+        Ok(ReflectionRecallHint {
             pattern: FindPattern {
                 scope: Some(scope),
                 name_glob: Some(format!(
@@ -187,7 +188,7 @@ impl SemanticGradient {
             },
             query_text: format!("{} {}", self.reflection_text, self.action_improvement),
             min_priority: self.priority,
-        }
+        })
     }
 
     fn prefixed_tags(&self, prefix: &str) -> Vec<String> {
@@ -379,8 +380,12 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 impl ReflectionGenerator {
-    pub fn new(llm: Arc<dyn LlmClient>) -> Self {
-        Self { llm }
+    pub fn new(
+        llm: Arc<dyn LlmClient>,
+        config: ReflectionConfig,
+    ) -> agent_context_db_core::Result<Self> {
+        config.validate()?;
+        Ok(Self { llm, config })
     }
 
     /// 分析失败轨迹，生成语义梯度。
@@ -422,8 +427,8 @@ Output a JSON object with:
         );
 
         let opts = LlmOpts {
-            max_tokens: Some(512),
-            temperature: Some(0.1),
+            max_tokens: Some(self.config.max_tokens),
+            temperature: Some(self.config.temperature),
             ..Default::default()
         };
 
@@ -524,16 +529,16 @@ Output a JSON object with:
         failures: &[FailureTrace],
         existing: &mut Vec<EvolvableInsight>,
         evolution: &InsightEvolutionEngine,
-    ) -> ReflexionEvolutionResult {
+    ) -> agent_context_db_core::Result<ReflexionEvolutionResult> {
         let gradients = self.reflect_failures(failures).await;
-        let report = evolution.evolve_from_gradients(existing, &gradients);
+        let report = evolution.evolve_from_gradients(existing, &gradients)?;
         let training_guidance = Self::to_training_guidance(&gradients);
-        ReflexionEvolutionResult {
+        Ok(ReflexionEvolutionResult {
             gradients,
             insights: existing.clone(),
             report,
             training_guidance,
-        }
+        })
     }
 
     /// 将反思结果编码为改进后的训练轨迹（用于下轮 CDT）。
@@ -626,7 +631,8 @@ mod tests {
 
     #[tokio::test]
     async fn evolve_failures_creates_insights_and_guidance() {
-        let generator = ReflectionGenerator::new(Arc::new(FailingLlm));
+        let generator =
+            ReflectionGenerator::new(Arc::new(FailingLlm), ReflectionConfig::default()).unwrap();
         let failures = vec![FailureTrace {
             task_description: "deploy app".into(),
             failed_step: "kubectl apply".into(),
@@ -635,10 +641,12 @@ mod tests {
             trace: vec!["build".into(), "apply".into()],
         }];
         let mut insights = Vec::new();
-        let evolution = InsightEvolutionEngine::new();
+        let evolution =
+            InsightEvolutionEngine::new(crate::config::VotingConfig::default()).unwrap();
         let result = generator
             .evolve_failures(&failures, &mut insights, &evolution)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(result.gradients.len(), 1);
         assert_eq!(result.report.added, 1);
         assert_eq!(result.insights.len(), 1);

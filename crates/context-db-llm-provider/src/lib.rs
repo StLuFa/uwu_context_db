@@ -124,7 +124,9 @@ pub fn from_llm_config(config: &LlmConfig) -> Result<Arc<dyn LlmClient>, LlmErro
     };
     let optimized = PromptOptimizingLlmClient::new(inner).into_arc();
     let routed = CascadeLlmClient::new(optimized, route_config).into_arc();
-    Ok(CachingLlmClient::new(routed).into_arc())
+    Ok(CachingLlmClient::new(routed)
+        .map_err(|error| LlmError::Provider(error.to_string()))?
+        .into_arc())
 }
 
 fn cascade_config_from_provider(config: &LlmProviderConfig) -> CascadeLlmConfig {
@@ -335,7 +337,7 @@ impl LlmClient for AnthropicLlmClient {
             "model": model(&self.config.model, opts),
             "max_tokens": opts.max_tokens.unwrap_or(1024),
             "temperature": opts.temperature.unwrap_or(0.2),
-            "messages": anthropic_messages(prompt, opts),
+            "messages": anthropic_messages(prompt, opts)?,
         });
         let value = self.post_messages(body).await?;
         extract_anthropic_text(&value)
@@ -359,7 +361,7 @@ impl LlmClient for AnthropicLlmClient {
             "model": model(&self.config.model, opts),
             "max_tokens": opts.max_tokens.unwrap_or(1024),
             "temperature": opts.temperature.unwrap_or(0.2),
-            "messages": anthropic_messages(prompt, opts),
+            "messages": anthropic_messages(prompt, opts)?,
             "tools": [{
                 "name": "emit_json",
                 "description": "Return the requested result as JSON.",
@@ -399,7 +401,7 @@ impl OpenAiCompatibleClient {
     }
 
     async fn complete(&self, prompt: &str, opts: &LlmOpts) -> Result<String, LlmError> {
-        let body = self.chat_body(prompt, opts, None);
+        let body = self.chat_body(prompt, opts, None)?;
         let value = self.post_chat(body).await?;
         extract_openai_text(&value)
     }
@@ -418,7 +420,7 @@ impl OpenAiCompatibleClient {
                 "strict": false,
             }
         });
-        let body = self.chat_body(prompt, opts, Some(response_format));
+        let body = self.chat_body(prompt, opts, Some(response_format))?;
         let value = self.post_chat(body).await?;
         extract_openai_text(&value)
     }
@@ -441,10 +443,15 @@ impl OpenAiCompatibleClient {
         extract_embeddings(&value, model, texts.len())
     }
 
-    fn chat_body(&self, prompt: &str, opts: &LlmOpts, response_format: Option<Value>) -> Value {
+    fn chat_body(
+        &self,
+        prompt: &str,
+        opts: &LlmOpts,
+        response_format: Option<Value>,
+    ) -> Result<Value, LlmError> {
         let mut body = json!({
             "model": model(&self.config.model, opts),
-            "messages": openai_messages(prompt, opts),
+            "messages": openai_messages(prompt, opts)?,
         });
         if let Some(max_tokens) = opts.max_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -455,7 +462,7 @@ impl OpenAiCompatibleClient {
         if let Some(response_format) = response_format {
             body["response_format"] = response_format;
         }
-        body
+        Ok(body)
     }
 
     async fn post_chat(&self, body: Value) -> Result<Value, LlmError> {
@@ -486,9 +493,9 @@ impl OpenAiCompatibleClient {
     }
 }
 
-fn openai_messages(prompt: &str, opts: &LlmOpts) -> Value {
-    let (prefix, body) = split_cacheable_prompt(prompt, opts);
-    if let Some(prefix) = prefix {
+fn openai_messages(prompt: &str, opts: &LlmOpts) -> Result<Value, LlmError> {
+    let (prefix, body) = split_cacheable_prompt(prompt, opts)?;
+    Ok(if let Some(prefix) = prefix {
         json!([
             {
                 "role": "system",
@@ -499,12 +506,12 @@ fn openai_messages(prompt: &str, opts: &LlmOpts) -> Value {
         ])
     } else {
         json!([{ "role": "user", "content": prompt }])
-    }
+    })
 }
 
-fn anthropic_messages(prompt: &str, opts: &LlmOpts) -> Value {
-    let (prefix, body) = split_cacheable_prompt(prompt, opts);
-    if let Some(prefix) = prefix {
+fn anthropic_messages(prompt: &str, opts: &LlmOpts) -> Result<Value, LlmError> {
+    let (prefix, body) = split_cacheable_prompt(prompt, opts)?;
+    Ok(if let Some(prefix) = prefix {
         json!([{
             "role": "user",
             "content": [
@@ -518,16 +525,21 @@ fn anthropic_messages(prompt: &str, opts: &LlmOpts) -> Value {
         }])
     } else {
         json!([{ "role": "user", "content": prompt }])
-    }
+    })
 }
 
-fn split_cacheable_prompt(prompt: &str, opts: &LlmOpts) -> (Option<String>, String) {
+fn split_cacheable_prompt(
+    prompt: &str,
+    opts: &LlmOpts,
+) -> Result<(Option<String>, String), LlmError> {
     if opts.prompt.cache_mode == PromptCacheMode::Off {
-        return (None, prompt.to_string());
+        return Ok((None, prompt.to_string()));
     }
     let min_tokens = opts.prompt.cache_prefix_tokens;
-    if min_tokens == 0 || agent_context_db_core::count_tokens(prompt) < min_tokens {
-        return (None, prompt.to_string());
+    let prompt_tokens = agent_context_db_core::count_tokens(prompt)
+        .map_err(|error| LlmError::Provider(error.to_string()))?;
+    if min_tokens == 0 || prompt_tokens < min_tokens {
+        return Ok((None, prompt.to_string()));
     }
 
     let split_at = prompt
@@ -535,10 +547,12 @@ fn split_cacheable_prompt(prompt: &str, opts: &LlmOpts) -> (Option<String>, Stri
         .filter(|idx| *idx > 0)
         .unwrap_or_else(|| prompt.len().min(2048));
     let (prefix, rest) = prompt.split_at(split_at);
-    if agent_context_db_core::count_tokens(prefix) < min_tokens / 2 {
-        return (None, prompt.to_string());
+    let prefix_tokens = agent_context_db_core::count_tokens(prefix)
+        .map_err(|error| LlmError::Provider(error.to_string()))?;
+    if prefix_tokens < min_tokens / 2 {
+        return Ok((None, prompt.to_string()));
     }
-    (Some(prefix.to_string()), rest.trim_start().to_string())
+    Ok((Some(prefix.to_string()), rest.trim_start().to_string()))
 }
 
 fn model(default_model: &str, opts: &LlmOpts) -> String {
@@ -822,7 +836,7 @@ mod tests {
             ..Default::default()
         };
         let prompt = format!("{}\n\nuser evidence", "stable instruction ".repeat(400));
-        let messages = openai_messages(&prompt, &opts);
+        let messages = openai_messages(&prompt, &opts).unwrap();
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["cache_control"]["type"], "ephemeral");
     }
@@ -834,7 +848,7 @@ mod tests {
             ..Default::default()
         };
         let prompt = format!("{}\n\nbody", "stable instruction ".repeat(400));
-        let messages = anthropic_messages(&prompt, &opts);
+        let messages = anthropic_messages(&prompt, &opts).unwrap();
         assert_eq!(
             messages[0]["content"][0]["cache_control"]["type"],
             "ephemeral"

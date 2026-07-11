@@ -3,7 +3,7 @@
 //! 语义路径不由手写，而是向量聚类自动生成。
 //! Sleeptime 阶段对同类型晶体做增量聚类，类簇生成路径段。
 
-use agent_context_db_core::{ContentType, ContextUri, VectorIndex};
+use agent_context_db_core::{ContentType, ContextError, ContextUri, Result, VectorIndex};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -54,8 +54,10 @@ impl SemanticAxis {
                         best_idx = i;
                     }
                 }
-                if best_dist < self.cluster_threshold && !type_clusters.is_empty() {
-                    return type_clusters[best_idx].label.clone();
+                if best_dist < self.cluster_threshold
+                    && let Some(cluster) = type_clusters.get(best_idx)
+                {
+                    return cluster.label.clone();
                 }
             }
         }
@@ -71,9 +73,9 @@ impl SemanticAxis {
     /// Sleeptime 阶段：使用向量索引近邻刷新类簇成员并重建语义路径。
     ///
     /// 每个已有类簇以当前质心查询同类型 top-k，按命中分数稳定排序、去重并更新成员。
-    /// 由于 `VectorIndex` 只返回命中 URI/score，不暴露原始向量，质心只做质量归一化；
-    /// 新类簇仍由上游 `add_cluster` 在有新标签或新质心时显式创建。
-    pub async fn recluster(&self, content_type: ContentType) -> usize {
+    /// 命中 URI 通过一次批量读取取得真实向量，质心是成员向量的归一化算术平均。
+    /// 任一后端、URI、元数据或向量校验错误都会返回给调用方，绝不静默使用伪向量。
+    pub async fn recluster(&self, content_type: ContentType) -> Result<usize> {
         // 第一阶段只复制查询所需快照，不让同步锁跨越 await。
         let cluster_snapshot = self
             .clusters
@@ -85,6 +87,12 @@ impl SemanticAxis {
         let mut updates = Vec::with_capacity(existing_count);
 
         for (index, cluster) in cluster_snapshot.into_iter().enumerate() {
+            validate_vector(
+                &cluster.centroid,
+                cluster.centroid.len(),
+                "cluster centroid",
+            )?;
+            let expected_dim = cluster.centroid.len();
             let hits = self
                 .index
                 .search(
@@ -95,40 +103,71 @@ impl SemanticAxis {
                         "content_type": content_type.as_path_segment()
                     })),
                 )
-                .await
-                .unwrap_or_default();
-            updates.push((index, hits));
+                .await?;
+            let mut ranked = hits
+                .into_iter()
+                .filter(|hit| hit.score >= self.cluster_threshold)
+                .collect::<Vec<_>>();
+            ranked.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.uri.as_str().cmp(b.uri.as_str()))
+            });
+            ranked.dedup_by(|a, b| a.uri == b.uri);
+            let uris = ranked.iter().map(|hit| hit.uri.clone()).collect::<Vec<_>>();
+            let vectors = self.index.get_many("context", &uris).await?;
+            if vectors.len() != uris.len() {
+                return Err(ContextError::Storage(format!(
+                    "batch vector retrieval returned {} of {} requested members",
+                    vectors.len(),
+                    uris.len()
+                )));
+            }
+            let by_uri = vectors
+                .into_iter()
+                .map(|record| (record.uri.clone(), record))
+                .collect::<HashMap<_, _>>();
+            let mut sum = vec![0.0_f64; expected_dim];
+            for uri in &uris {
+                let record = by_uri.get(uri).ok_or_else(|| {
+                    ContextError::Storage(format!("batch vector retrieval omitted {uri}"))
+                })?;
+                if record.embedding_dim != Some(expected_dim) {
+                    return Err(ContextError::Storage(format!(
+                        "vector {uri} has missing/mismatched embedding_dim metadata {:?}, expected {expected_dim}",
+                        record.embedding_dim
+                    )));
+                }
+                validate_vector(&record.vector, expected_dim, uri.as_str())?;
+                for (total, value) in sum.iter_mut().zip(&record.vector) {
+                    *total += *value as f64;
+                }
+            }
+            let centroid = if uris.is_empty() {
+                None
+            } else {
+                let count = uris.len() as f64;
+                let mut centroid = sum
+                    .into_iter()
+                    .map(|v| (v / count) as f32)
+                    .collect::<Vec<_>>();
+                normalize_unit(&mut centroid)?;
+                Some(centroid)
+            };
+            updates.push((index, uris, centroid));
         }
 
         // 第二阶段重新加锁并应用结果；并发新增类簇会被保留。
         let mut clusters = self.clusters.write();
         let type_clusters = clusters.entry(content_type).or_default();
-        for (index, hits) in updates {
+        for (index, uris, centroid) in updates {
             let Some(cluster) = type_clusters.get_mut(index) else {
                 continue;
             };
-            if !hits.is_empty() {
-                let mut ranked = hits
-                    .into_iter()
-                    .filter(|hit| hit.score >= self.cluster_threshold)
-                    .map(|hit| (hit.uri.to_string(), hit.score.clamp(0.0, 1.0)))
-                    .collect::<Vec<_>>();
-                ranked.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.0.cmp(&b.0))
-                });
-                ranked.dedup_by(|a, b| a.0 == b.0);
-                if !ranked.is_empty() {
-                    let score_mass = ranked.iter().map(|(_, score)| *score).sum::<f32>();
-                    cluster.members = ranked.into_iter().map(|(uri, _)| uri).collect();
-                    normalize_centroid(
-                        &mut cluster.centroid,
-                        score_mass / cluster.members.len() as f32,
-                    );
-                }
-            } else if cluster.members.len() > 1 {
-                normalize_centroid(&mut cluster.centroid, 0.5);
+            if let Some(centroid) = centroid {
+                cluster.members = uris.into_iter().map(|uri| uri.to_string()).collect();
+                cluster.centroid = centroid;
             }
         }
 
@@ -140,7 +179,7 @@ impl SemanticAxis {
         drop(clusters);
         *self.cluster_paths.write() = rebuilt_paths;
 
-        existing_count
+        Ok(existing_count)
     }
 
     /// 手动添加类簇（用于 LLM 生成的语义标签）。
@@ -170,19 +209,40 @@ impl SemanticAxis {
     }
 }
 
-fn normalize_centroid(centroid: &mut [f32], confidence: f32) {
-    let norm = centroid
+fn validate_vector(vector: &[f32], expected_dim: usize, subject: &str) -> Result<()> {
+    if vector.len() != expected_dim || expected_dim == 0 {
+        return Err(ContextError::Storage(format!(
+            "vector {subject} dimension {} does not match expected {expected_dim}",
+            vector.len()
+        )));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(ContextError::Storage(format!(
+            "vector {subject} is not finite"
+        )));
+    }
+    if !vector.iter().any(|value| *value != 0.0) {
+        return Err(ContextError::Storage(format!("vector {subject} is zero")));
+    }
+    Ok(())
+}
+
+fn normalize_unit(vector: &mut [f32]) -> Result<()> {
+    validate_vector(vector, vector.len(), "computed centroid")?;
+    let norm = vector
         .iter()
         .map(|value| (*value as f64) * (*value as f64))
         .sum::<f64>()
         .sqrt();
-    if norm <= f64::EPSILON {
-        return;
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(ContextError::Storage(
+            "computed centroid has zero/invalid norm".into(),
+        ));
     }
-    let scale = confidence.clamp(0.25, 1.0) as f64 / norm;
-    for value in centroid {
-        *value = (*value as f64 * scale) as f32;
+    for value in vector {
+        *value = (*value as f64 / norm) as f32;
     }
+    Ok(())
 }
 
 /// 余弦距离 = 1 - 余弦相似度。
@@ -194,10 +254,10 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     if len == 0 {
         return 1.0;
     }
-    for i in 0..len {
-        dot += a[i] as f64 * b[i] as f64;
-        na += a[i] as f64 * a[i] as f64;
-        nb += b[i] as f64 * b[i] as f64;
+    for (&a_value, &b_value) in a.iter().zip(b).take(len) {
+        dot += a_value as f64 * b_value as f64;
+        na += a_value as f64 * a_value as f64;
+        nb += b_value as f64 * b_value as f64;
     }
     let denom = (na.sqrt() * nb.sqrt()).max(f64::EPSILON);
     1.0 - (dot / denom) as f32

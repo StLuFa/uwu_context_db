@@ -50,8 +50,11 @@ pub struct HallucinationDetector {
 }
 
 impl HallucinationDetector {
-    pub fn new(llm: Arc<dyn LlmClient>, threshold: f32) -> Self {
-        Self { llm, threshold }
+    pub fn new(llm: Arc<dyn LlmClient>, threshold: f32) -> std::result::Result<Self, String> {
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err("threshold must be finite and in [0, 1]".into());
+        }
+        Ok(Self { llm, threshold })
     }
 
     /// 对一批检索命中做质量评估。
@@ -198,11 +201,17 @@ pub struct CompressionAwareLoader {
 }
 
 impl CompressionAwareLoader {
-    pub fn new(window_total: usize, window_used: usize) -> Self {
-        Self {
+    pub fn new(window_total: usize, window_used: usize) -> std::result::Result<Self, String> {
+        if window_total == 0 {
+            return Err("window_total must be non-zero".into());
+        }
+        if window_used > window_total {
+            return Err("window_used must not exceed window_total".into());
+        }
+        Ok(Self {
             window_total,
             window_used,
-        }
+        })
     }
 
     pub fn pressure(&self) -> PressureLevel {
@@ -218,11 +227,16 @@ impl CompressionAwareLoader {
     ///
     /// 这里复用检索预算装载器的分层背包优化：每个 hit 同时竞争 L0/L1/L2
     /// 三种加载选择，目标是在剩余 token 窗口内最大化相关度和质量收益。
-    pub fn allocate_levels(&self, hits: &[crate::RetrievalHit]) -> Vec<(ContextUri, ContentLevel)> {
-        allocate_hit_levels(hits, self.remaining())
-            .into_iter()
-            .map(|allocation| (allocation.uri, allocation.level))
-            .collect()
+    pub fn allocate_levels(
+        &self,
+        hits: &[crate::RetrievalHit],
+    ) -> agent_context_db_core::Result<Vec<(ContextUri, ContentLevel)>> {
+        Ok(
+            allocate_hit_levels(hits, self.remaining(), crate::TokenBudgetConfig::default())?
+                .into_iter()
+                .map(|allocation| (allocation.uri, allocation.level))
+                .collect(),
+        )
     }
 
     /// 更新已用 token 数。
@@ -246,7 +260,7 @@ mod tests {
 
     #[test]
     fn allocate_respects_budget() {
-        let loader = CompressionAwareLoader::new(10000, 9000); // 只剩 1000 tokens
+        let loader = CompressionAwareLoader::new(10000, 9000).unwrap(); // 只剩 1000 tokens
 
         let hits = vec![crate::RetrievalHit {
             uri: ContextUri::parse("uwu://t/x").unwrap(),
@@ -264,7 +278,7 @@ mod tests {
             updated_at: None,
         }];
 
-        let plan = loader.allocate_levels(&hits);
+        let plan = loader.allocate_levels(&hits).unwrap();
         assert_eq!(plan.len(), 1);
         assert!(matches!(
             plan[0].1,

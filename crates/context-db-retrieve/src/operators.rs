@@ -865,7 +865,14 @@ mod tests {
             merge: QueryMergeStrategy::Union,
         };
 
-        let optimizer = CboOptimizer::new(Arc::new(crate::planner::StatisticsCollector::new()));
+        let optimizer = CboOptimizer::new(
+            Arc::new(
+                crate::planner::StatisticsCollector::new(crate::QueryPlanConfig::default())
+                    .unwrap(),
+            ),
+            crate::QueryPlanConfig::default(),
+        )
+        .unwrap();
         let physical = optimizer.optimize(&query_to_logical(&composite));
         let ctx = ExecContext {
             fs: store.clone(),
@@ -939,8 +946,15 @@ mod tests {
             order: SortKey::Natural,
             expand: None,
         };
-        let physical = CboOptimizer::new(Arc::new(crate::planner::StatisticsCollector::new()))
-            .optimize(&query_to_logical(&query));
+        let physical = CboOptimizer::new(
+            Arc::new(
+                crate::planner::StatisticsCollector::new(crate::QueryPlanConfig::default())
+                    .unwrap(),
+            ),
+            crate::QueryPlanConfig::default(),
+        )
+        .unwrap()
+        .optimize(&query_to_logical(&query));
         let ctx = ExecContext {
             fs: store.clone(),
             content: Some(store),
@@ -992,8 +1006,15 @@ mod tests {
             max_hops: 1,
             predicate: Predicate::new(),
         };
-        let physical = CboOptimizer::new(Arc::new(crate::planner::StatisticsCollector::new()))
-            .optimize(&query_to_logical(&query));
+        let physical = CboOptimizer::new(
+            Arc::new(
+                crate::planner::StatisticsCollector::new(crate::QueryPlanConfig::default())
+                    .unwrap(),
+            ),
+            crate::QueryPlanConfig::default(),
+        )
+        .unwrap()
+        .optimize(&query_to_logical(&query));
         let ctx = ExecContext {
             fs: store.clone(),
             content: Some(store.clone()),

@@ -158,8 +158,13 @@ impl CognitiveTreeSearch {
                     return rollout;
                 }
 
-                let idx = self.select_child(node);
-                self.simulate(&mut node.children[idx]).await
+                let Some(idx) = self.select_child(node) else {
+                    return self.value.evaluate(&node.state).composite;
+                };
+                let Some(child) = node.children.get_mut(idx) else {
+                    return self.value.evaluate(&node.state).composite;
+                };
+                self.simulate(child).await
             };
 
             node.visits += 1;
@@ -227,7 +232,7 @@ impl CognitiveTreeSearch {
         (total / norm).clamp(0.0, 1.0)
     }
 
-    fn select_child(&self, node: &SearchNode) -> usize {
+    fn select_child(&self, node: &SearchNode) -> Option<usize> {
         let parent_visits = node.visits.max(1) as f32;
         node.children
             .iter()
@@ -238,7 +243,6 @@ impl CognitiveTreeSearch {
                 sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(idx, _)| idx)
-            .unwrap_or(0)
     }
 
     fn path_by<F>(&self, choose: F, root: &SearchNode) -> Vec<SearchNode>
@@ -248,8 +252,13 @@ impl CognitiveTreeSearch {
         let mut path = vec![root.clone()];
         let mut node = root;
         while !node.children.is_empty() {
-            let idx = choose(&node.children).unwrap_or(0);
-            node = &node.children[idx];
+            let Some(idx) = choose(&node.children) else {
+                break;
+            };
+            let Some(child) = node.children.get(idx) else {
+                break;
+            };
+            node = child;
             path.push(node.clone());
         }
         path
@@ -316,7 +325,7 @@ async fn llm_expand_actions(
     llm: &dyn LlmClient,
     state: &CognitiveState,
     depth: usize,
-) -> std::result::Result<Vec<ActionCandidate>, agent_context_db_core::LlmError> {
+) -> agent_context_db_core::Result<Vec<ActionCandidate>> {
     let prompt = format!(
         r#"Generate candidate next reasoning actions for Language Agent Tree Search.
 Return JSON only, as an array:
@@ -338,8 +347,8 @@ Prefer actions that concretely reduce contradictions, validate hypotheses, impro
         confidence = state.avg_confidence,
     );
     let response = llm.complete(&prompt, &LlmOpts::default()).await?;
-    let json = extract_json_array(&response);
-    let raw = serde_json::from_str::<Vec<LlmActionCandidate>>(&json).unwrap_or_default();
+    let json = extract_json_array(&response)?;
+    let raw = serde_json::from_str::<Vec<LlmActionCandidate>>(json)?;
     Ok(raw
         .into_iter()
         .filter(|action| !action.description.trim().is_empty())
@@ -369,20 +378,21 @@ fn normalize_effects(effects: Vec<String>) -> Vec<String> {
     effects
 }
 
-fn extract_json_array(text: &str) -> String {
+fn extract_json_array(text: &str) -> agent_context_db_core::Result<&str> {
     let trimmed = text.trim();
-    if let Some(start) = trimmed.find("```json") {
-        let after = &trimmed[start + 7..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim().to_string();
-        }
-    }
-    if let Some(start) = trimmed.find('[')
-        && let Some(end) = trimmed.rfind(']')
+    if let Some(after) = trimmed.strip_prefix("```json")
+        && let Some((json, _)) = after.split_once("```")
     {
-        return trimmed[start..=end].to_string();
+        return Ok(json.trim());
     }
-    "[]".into()
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        return Ok(trimmed);
+    }
+    Err(agent_context_db_core::ContextError::Llm(
+        agent_context_db_core::LlmError::Provider(
+            "LATS action response must be a JSON array".into(),
+        ),
+    ))
 }
 
 fn puct_score(node: &SearchNode, parent_visits: f32, exploration_c: f32) -> f32 {

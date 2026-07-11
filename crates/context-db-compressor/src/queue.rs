@@ -12,6 +12,13 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{SemanticQueue, SemanticTask, TaskId, TaskOutcome};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerExit {
+    QueueClosed,
+}
+
+pub type WorkerResult = Result<WorkerExit>;
+
 /// 基于 tokio `mpsc` 的语义处理队列。
 ///
 /// - `enqueue`: 推入任务到无界通道
@@ -41,8 +48,12 @@ impl TokioSemanticQueue {
     /// 启动一个 worker，持续 dequeue 并回调 handler。
     ///
     /// `handler` 接收 (TaskId, SemanticTask) 并返回 TaskOutcome。
-    /// 返回的 `JoinHandle` 可被 abort 以停止 worker。
-    pub fn spawn_worker<F, Fut>(self: &Arc<Self>, handler: F) -> tokio::task::JoinHandle<()>
+    /// Worker only exits successfully after every sender has been dropped and the queue is drained.
+    /// Dequeue and completion failures are returned to the joining caller.
+    pub fn spawn_worker<F, Fut>(
+        self: &Arc<Self>,
+        handler: F,
+    ) -> tokio::task::JoinHandle<WorkerResult>
     where
         F: Fn(TaskId, SemanticTask) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = TaskOutcome> + Send + 'static,
@@ -50,16 +61,12 @@ impl TokioSemanticQueue {
         let this = self.clone();
         tokio::spawn(async move {
             loop {
-                match this.dequeue().await {
-                    Ok(Some((id, task))) => {
+                match this.dequeue().await? {
+                    Some((id, task)) => {
                         let outcome = handler(id, task).await;
-                        let _ = this.complete(id, outcome).await;
+                        this.complete(id, outcome).await?;
                     }
-                    Ok(None) => {
-                        // 通道关闭
-                        break;
-                    }
-                    Err(_) => break,
+                    None => return Ok(WorkerExit::QueueClosed),
                 }
             }
         })
@@ -112,7 +119,7 @@ impl SemanticQueue for TokioSemanticQueue {
 pub fn spawn_semantic_worker<F, Fut>(
     queue: &Arc<TokioSemanticQueue>,
     handler: F,
-) -> tokio::task::JoinHandle<()>
+) -> tokio::task::JoinHandle<WorkerResult>
 where
     F: Fn(TaskId, SemanticTask) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = TaskOutcome> + Send + 'static,

@@ -1,6 +1,7 @@
 //! CurriculumGenerator — 主动课程：知识图谱拓扑前沿 + ZPD 排序。
 
 use crate::TrainingGoal;
+use crate::config::CurriculumConfig;
 use agent_context_db_core::{ContentType, ContextUri, GraphRelation, GraphStore, Result};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -8,8 +9,7 @@ use std::sync::Arc;
 
 /// 课程生成器。
 pub struct CurriculumGenerator {
-    pub exploration_ratio: f32,
-    pub zpd_difficulty: f32,
+    config: CurriculumConfig,
     graph: Option<Arc<dyn GraphStore>>,
     bootstrap_frontier: Vec<FrontierNode>,
 }
@@ -26,22 +26,17 @@ pub struct FrontierNode {
 }
 
 impl CurriculumGenerator {
-    pub fn new(exploration_ratio: f32) -> Self {
-        Self {
-            exploration_ratio,
-            zpd_difficulty: 0.6,
+    pub fn new(config: CurriculumConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
             graph: None,
             bootstrap_frontier: Vec::new(),
-        }
+        })
     }
 
     pub fn with_graph(mut self, graph: Arc<dyn GraphStore>) -> Self {
         self.graph = Some(graph);
-        self
-    }
-
-    pub fn with_zpd_difficulty(mut self, difficulty: f32) -> Self {
-        self.zpd_difficulty = difficulty.clamp(0.0, 1.0);
         self
     }
 
@@ -74,8 +69,11 @@ impl CurriculumGenerator {
     /// 生成下一个训练目标。
     pub async fn next_goal(&self, known_uris: &[ContextUri]) -> Result<TrainingGoal> {
         if !known_uris.is_empty() {
-            let confidence: HashMap<ContextUri, f32> =
-                known_uris.iter().cloned().map(|uri| (uri, 0.85)).collect();
+            let confidence: HashMap<ContextUri, f32> = known_uris
+                .iter()
+                .cloned()
+                .map(|uri| (uri, self.config.bootstrap_known_confidence))
+                .collect();
             let frontier = self.find_graph_frontier(&confidence).await?;
             if let Some(node) = frontier.into_iter().next() {
                 let prerequisites = self.prerequisites_for(&node.uri, known_uris).await?;
@@ -129,10 +127,10 @@ impl CurriculumGenerator {
         let mut best_confidence: HashMap<ContextUri, f32> = HashMap::new();
 
         for (uri, confidence) in known {
-            if *confidence < 0.7 {
+            if *confidence < self.config.known_confidence_threshold {
                 continue;
             }
-            let neighbors = graph.neighbors(uri, None).await?;
+            let neighbors = graph.outgoing_neighbors(uri, None).await?;
             for neighbor in neighbors {
                 if known_set.contains(neighbor.as_str()) {
                     continue;
@@ -164,7 +162,7 @@ impl CurriculumGenerator {
     }
 
     pub fn zpd_score(&self, difficulty: f32) -> f32 {
-        let distance = (difficulty - self.zpd_difficulty).abs();
+        let distance = (difficulty - self.config.zpd_difficulty).abs();
         (1.0 - distance / 1.0).clamp(0.0, 1.0)
     }
 
@@ -191,7 +189,7 @@ impl CurriculumGenerator {
             .batch_traverse(
                 std::slice::from_ref(target),
                 &[GraphRelation::DerivedFrom, GraphRelation::EvidenceOf],
-                1,
+                self.config.traversal_hops,
             )
             .await
             .unwrap_or_default();
@@ -264,7 +262,7 @@ mod tests {
             Ok(())
         }
 
-        async fn neighbors(
+        async fn outgoing_neighbors(
             &self,
             uri: &ContextUri,
             _kind: Option<GraphRelation>,
@@ -316,7 +314,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let curriculum = CurriculumGenerator::new(0.2).with_graph(graph);
+        let curriculum = CurriculumGenerator::new(CurriculumConfig::default())
+            .unwrap()
+            .with_graph(graph);
         let known = HashMap::from([(uri("uwu://t/agent/a/memories/skill/base"), 0.9)]);
         let frontier = curriculum.find_graph_frontier(&known).await.unwrap();
         assert_eq!(frontier.len(), 1);
@@ -333,7 +333,9 @@ mod tests {
             .add_edge(&base, &next, GraphRelation::DerivedFrom)
             .await
             .unwrap();
-        let curriculum = CurriculumGenerator::new(0.2).with_graph(graph);
+        let curriculum = CurriculumGenerator::new(CurriculumConfig::default())
+            .unwrap()
+            .with_graph(graph);
         let goal = curriculum.next_goal(&[base]).await.unwrap();
         assert_eq!(goal.target_node, next);
         assert!(!goal.expected_new_knowledge.is_empty());
@@ -341,7 +343,7 @@ mod tests {
 
     #[test]
     fn no_graph_does_not_relabel_known_nodes_as_frontier() {
-        let curriculum = CurriculumGenerator::new(0.2);
+        let curriculum = CurriculumGenerator::new(CurriculumConfig::default()).unwrap();
         let known = HashMap::from([("uwu://t/agent/a/memories/skill/base".to_string(), 0.9)]);
         assert!(curriculum.find_frontier(&known).unwrap().is_empty());
         let invalid = HashMap::from([("not a uri".to_string(), 0.9)]);
@@ -350,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_goal_errors_without_frontier_or_bootstrap_targets() {
-        let curriculum = CurriculumGenerator::new(0.2);
+        let curriculum = CurriculumGenerator::new(CurriculumConfig::default()).unwrap();
         let err = curriculum.next_goal(&[]).await.unwrap_err();
         assert!(err.to_string().contains("no curriculum frontier"));
     }
@@ -358,7 +360,9 @@ mod tests {
     #[tokio::test]
     async fn next_goal_uses_configured_bootstrap_target() {
         let target = uri("uwu://t/agent/a/memories/skill/bootstrap");
-        let curriculum = CurriculumGenerator::new(0.2).with_bootstrap_targets(vec![target.clone()]);
+        let curriculum = CurriculumGenerator::new(CurriculumConfig::default())
+            .unwrap()
+            .with_bootstrap_targets(vec![target.clone()]);
         let goal = curriculum.next_goal(&[]).await.unwrap();
         assert_eq!(goal.target_node, target);
         assert!(goal.expected_new_knowledge.contains("frontier node"));

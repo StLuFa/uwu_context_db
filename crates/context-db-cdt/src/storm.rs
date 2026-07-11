@@ -3,6 +3,7 @@
 //! STORM 在 CDT 中承担“把分散记忆组织成结构化知识”的角色：
 //! 为主题生成多角色问题，按问题收集证据，再合成 outline/report，并输出 consolidation signal。
 
+use crate::config::StormConfig;
 use crate::consolidation::{CdtConsolidationSignal, CdtSignalSource};
 use crate::multi_perspective::{MultiPerspectiveConsolidator, Perspective};
 use agent_context_db_core::{ContentType, ContextEntry, ContextUri, EpistemicType, LlmClient};
@@ -40,26 +41,22 @@ pub struct StormReport {
 #[derive(Debug, Clone)]
 pub struct StormSynthesizer {
     perspectives: Vec<Perspective>,
-    max_questions_per_perspective: usize,
+    config: StormConfig,
     llm: Option<Arc<dyn LlmClient>>,
 }
 
 impl StormSynthesizer {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(config: StormConfig) -> agent_context_db_core::Result<Self> {
+        config.validate()?;
+        Ok(Self {
             perspectives: Perspective::all(),
-            max_questions_per_perspective: 2,
+            config,
             llm: None,
-        }
+        })
     }
 
     pub fn with_perspectives(mut self, perspectives: Vec<Perspective>) -> Self {
         self.perspectives = perspectives;
-        self
-    }
-
-    pub fn with_max_questions(mut self, max_questions_per_perspective: usize) -> Self {
-        self.max_questions_per_perspective = max_questions_per_perspective.max(1);
         self
     }
 
@@ -73,7 +70,7 @@ impl StormSynthesizer {
         topic_uri: &ContextUri,
         topic: &str,
         evidence: &[ContextEntry],
-    ) -> StormReport {
+    ) -> agent_context_db_core::Result<StormReport> {
         let questions = self.generate_questions(topic, evidence);
         let evidence_by_perspective = self.organize_evidence(evidence, &questions);
         let mut sections = Vec::new();
@@ -85,11 +82,12 @@ impl StormSynthesizer {
             sections.push(self.build_section(*perspective, &selected));
         }
 
-        let mut multi = MultiPerspectiveConsolidator::new().with_perspectives(self.perspectives.clone());
+        let mut multi =
+            MultiPerspectiveConsolidator::new().with_perspectives(self.perspectives.clone());
         if let Some(llm) = &self.llm {
             multi = multi.with_llm(llm.clone());
         }
-        let multi = multi.consolidate(topic_uri, topic, evidence).await;
+        let multi = multi.consolidate(topic_uri, topic, evidence).await?;
         let unresolved_questions = multi
             .discovered_gaps
             .iter()
@@ -100,17 +98,20 @@ impl StormSynthesizer {
         } else {
             sections.iter().map(|s| s.confidence).sum::<f32>() / sections.len() as f32
         };
-        let synthesis = self.compose_report(topic, &sections, &multi.synthesized, &unresolved_questions);
+        let synthesis =
+            self.compose_report(topic, &sections, &multi.synthesized, &unresolved_questions);
 
-        StormReport {
+        Ok(StormReport {
             topic_uri: topic_uri.clone(),
             topic: topic.into(),
             questions,
             sections,
             synthesis,
             unresolved_questions,
-            confidence: confidence.max(multi.overall_confidence * 0.8).clamp(0.0, 1.0),
-        }
+            confidence: confidence
+                .max(multi.overall_confidence * self.config.synthesis_confidence_weight)
+                .clamp(0.0, 1.0),
+        })
     }
 
     pub fn consolidation_signal(&self, report: &StormReport) -> CdtConsolidationSignal {
@@ -141,17 +142,24 @@ impl StormSynthesizer {
             let templates = question_templates(*perspective, topic);
             for (idx, question) in templates
                 .into_iter()
-                .take(self.max_questions_per_perspective)
+                .take(self.config.max_questions_per_perspective)
                 .enumerate()
             {
                 questions.push(StormQuestion {
                     perspective: *perspective,
                     question,
-                    priority: (0.7 + idx as f32 * 0.05 + (1.0 / evidence_count) * 0.1).clamp(0.0, 1.0),
+                    priority: (self.config.question_base_priority
+                        + idx as f32 * self.config.question_index_weight
+                        + (1.0 / evidence_count) * self.config.evidence_scarcity_weight)
+                        .clamp(0.0, 1.0),
                 });
             }
         }
-        questions.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal));
+        questions.sort_by(|a, b| {
+            b.priority
+                .partial_cmp(&a.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         questions
     }
 
@@ -164,12 +172,15 @@ impl StormSynthesizer {
         for question in questions {
             for entry in evidence {
                 if evidence_matches(entry, question) {
-                    map.entry(question.perspective).or_default().push(entry.clone());
+                    map.entry(question.perspective)
+                        .or_default()
+                        .push(entry.clone());
                 }
             }
         }
         for perspective in &self.perspectives {
-            map.entry(*perspective).or_insert_with(|| evidence.iter().take(3).cloned().collect());
+            map.entry(*perspective)
+                .or_insert_with(|| evidence.iter().take(self.config.fallback_evidence_limit).cloned().collect());
         }
         map
     }
@@ -177,14 +188,16 @@ impl StormSynthesizer {
     fn build_section(&self, perspective: Perspective, evidence: &[ContextEntry]) -> StormSection {
         let claims = evidence
             .iter()
-            .take(5)
+            .take(self.config.claims_per_section)
             .map(|entry| entry.l0_text().to_string())
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>();
         let confidence = if claims.is_empty() {
-            0.1
+            self.config.empty_section_confidence
         } else {
-            (0.35 + claims.len() as f32 * 0.12).clamp(0.0, 1.0)
+            (self.config.section_base_confidence
+                + claims.len() as f32 * self.config.claim_confidence_weight)
+                .clamp(0.0, 1.0)
         };
         StormSection {
             title: format!("{} view", perspective.name()),
@@ -218,17 +231,11 @@ impl StormSynthesizer {
         out.push('\n');
         if !unresolved.is_empty() {
             out.push_str("\n## Open Questions\n");
-            for question in unresolved.iter().take(5) {
+            for question in unresolved.iter().take(self.config.open_questions_limit) {
                 out.push_str(&format!("- {question}\n"));
             }
         }
         out
-    }
-}
-
-impl Default for StormSynthesizer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -256,10 +263,18 @@ fn question_templates(perspective: Perspective, topic: &str) -> Vec<String> {
 fn evidence_matches(entry: &ContextEntry, question: &StormQuestion) -> bool {
     let text = entry.l0_text().to_ascii_lowercase();
     match question.perspective {
-        Perspective::Causal => text.contains("because") || text.contains("failed") || text.contains("caused"),
-        Perspective::Temporal => text.contains("step") || text.contains("after") || text.contains("before"),
-        Perspective::Comparative => text.contains("success") || text.contains("failed") || text.contains("alternative"),
-        Perspective::Counterexample => text.contains("error") || text.contains("not") || text.contains("avoid"),
+        Perspective::Causal => {
+            text.contains("because") || text.contains("failed") || text.contains("caused")
+        }
+        Perspective::Temporal => {
+            text.contains("step") || text.contains("after") || text.contains("before")
+        }
+        Perspective::Comparative => {
+            text.contains("success") || text.contains("failed") || text.contains("alternative")
+        }
+        Perspective::Counterexample => {
+            text.contains("error") || text.contains("not") || text.contains("avoid")
+        }
     }
 }
 
@@ -284,8 +299,10 @@ mod tests {
                 "step one build before pushing image",
             ),
         ];
-        let storm = StormSynthesizer::new();
-        let report = storm.synthesize(&topic_uri, "deploy reliability", &evidence).await;
+        let storm = StormSynthesizer::new(StormConfig::default()).unwrap();
+        let report = storm
+            .synthesize(&topic_uri, "deploy reliability", &evidence)
+            .await;
         let signal = storm.consolidation_signal(&report);
         assert!(!report.questions.is_empty());
         assert_eq!(report.sections.len(), 4);

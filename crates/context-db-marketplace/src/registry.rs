@@ -64,7 +64,11 @@ impl FederatedRegistry {
             "uwu://market/{}/{}",
             entry.publisher, entry.id.0
         ))
-        .expect("marketplace URI is well-formed");
+        .map_err(|error| {
+            agent_context_db_core::ContextError::Storage(format!(
+                "invalid marketplace publication URI: {error}"
+            ))
+        })?;
         self.local_index
             .upsert(
                 "market",
@@ -86,14 +90,22 @@ impl FederatedRegistry {
 
         // 广播到 EventMesh
         if let Some(mesh) = self.event_mesh.clone() {
-            let topic_str = format!("market.publish.{}", entry.domain);
-            if let Ok(topic) = Topic::new(topic_str)
-                && let Ok(json) = serde_json::to_value(&entry)
-            {
-                tokio::spawn(async move {
-                    let _ = mesh.emit(&topic, json).await;
-                });
-            }
+            let topic =
+                Topic::new(format!("market.publish.{}", entry.domain)).map_err(|error| {
+                    agent_context_db_core::ContextError::Storage(format!(
+                        "invalid marketplace publication topic: {error}"
+                    ))
+                })?;
+            let json = serde_json::to_value(&entry).map_err(|error| {
+                agent_context_db_core::ContextError::Storage(format!(
+                    "serialize marketplace publication: {error}"
+                ))
+            })?;
+            mesh.emit(&topic, json).await.map_err(|error| {
+                agent_context_db_core::ContextError::Storage(format!(
+                    "broadcast marketplace publication: {error}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -183,18 +195,37 @@ impl FederatedRegistry {
     // ── 联邦查询 ──────────────────────────────
 
     /// 本地搜索（向量索引）。
-    pub async fn search_local(&self, embedding: &[f32], limit: usize) -> Vec<MarketEntry> {
+    pub async fn search_local(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+    ) -> agent_context_db_core::Result<Vec<MarketEntry>> {
         let hits = self
             .local_index
             .search("market", embedding.to_vec(), limit, None)
-            .await
-            .unwrap_or_default();
+            .await?;
         let pubs = self.publications.read();
         hits.iter()
-            .filter_map(|h| {
-                let id_str = h.payload.get("market_id")?.as_str()?;
-                let uid = uuid::Uuid::parse_str(id_str).ok()?;
-                pubs.get(&MarketId(uid)).cloned()
+            .map(|hit| {
+                let id = hit
+                    .payload
+                    .get("market_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        agent_context_db_core::ContextError::Storage(
+                            "market index hit is missing string market_id".into(),
+                        )
+                    })?;
+                let id = uuid::Uuid::parse_str(id).map_err(|error| {
+                    agent_context_db_core::ContextError::Storage(format!(
+                        "market index hit has invalid market_id: {error}"
+                    ))
+                })?;
+                pubs.get(&MarketId(id)).cloned().ok_or_else(|| {
+                    agent_context_db_core::ContextError::Storage(format!(
+                        "market index references unknown publication {id}"
+                    ))
+                })
             })
             .collect()
     }

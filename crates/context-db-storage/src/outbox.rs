@@ -147,18 +147,25 @@ pub struct OutboxRuntime {
     task: Option<JoinHandle<()>>,
 }
 impl OutboxRuntime {
-    pub async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.stop
+            .send(true)
+            .map_err(|error| ContextError::Storage(format!("stop outbox worker: {error}")))?;
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            task.await
+                .map_err(|error| ContextError::Storage(format!("join outbox worker: {error}")))?;
         }
+        Ok(())
     }
 }
 impl Drop for OutboxRuntime {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
+        if let Err(error) = self.stop.send(true) {
+            tracing::warn!(%error, "failed to signal outbox worker during drop");
+        }
         if let Some(task) = self.task.take() {
             task.abort();
+            tracing::debug!("aborted outbox worker during drop");
         }
     }
 }
@@ -466,7 +473,9 @@ mod tests {
         let database = uwu_database::Database::connect(&config).await.unwrap();
         migrate_sqlite(&database.pool).await.unwrap();
         let pool = Arc::new(database.pool);
-        let store = SqliteContextStore::try_new(pool.clone()).unwrap();
+        let store =
+            SqliteContextStore::try_new(pool.clone(), crate::GraphCentralityConfig::default())
+                .unwrap();
         (pool, store)
     }
 

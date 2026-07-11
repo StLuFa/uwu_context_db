@@ -56,21 +56,25 @@ impl DiscoveryEngine {
     }
 
     /// 三级搜索：本地 → 缓存 → 联邦。
-    pub async fn search(&self, query: &DiscoveryQuery, limit: usize) -> DiscoveryResult {
+    pub async fn search(
+        &self,
+        query: &DiscoveryQuery,
+        limit: usize,
+    ) -> agent_context_db_core::Result<DiscoveryResult> {
         // === Tier 1: 本地向量索引 ===
         let local = self
             .registry
-            .search_local(&query.query_embedding, limit * 2)
-            .await;
+            .search_local(&query.query_embedding, limit.saturating_mul(2))
+            .await?;
         if local.len() >= limit {
             let hits = self.rank(local, query, limit);
-            return DiscoveryResult {
+            return Ok(DiscoveryResult {
                 avg_quality: avg_quality(&hits),
                 domains_covered: domains_from(&hits),
                 total_available: hits.len(),
                 hits,
                 search_tier: SearchTier::Local,
-            };
+            });
         }
 
         // === Tier 2: 缓存命中 ===
@@ -78,13 +82,13 @@ impl DiscoveryEngine {
         if let Some(cached) = self.cache.read().get(&cache_key) {
             let hits = self.rank(cached.clone(), query, limit);
             if hits.len() >= limit / 2 {
-                return DiscoveryResult {
+                return Ok(DiscoveryResult {
                     avg_quality: avg_quality(&hits),
                     domains_covered: domains_from(&hits),
                     total_available: hits.len(),
                     hits,
                     search_tier: SearchTier::Cache,
-                };
+                });
             }
         }
 
@@ -108,13 +112,13 @@ impl DiscoveryEngine {
         }
 
         let hits = self.rank(all_results, query, limit);
-        DiscoveryResult {
+        Ok(DiscoveryResult {
             avg_quality: avg_quality(&hits),
             domains_covered: domains_from(&hits),
             total_available: hits.len(),
             hits,
             search_tier: SearchTier::Federation,
-        }
+        })
     }
 
     /// 声誉排序：relevance × (1 + reputation_bonus)。

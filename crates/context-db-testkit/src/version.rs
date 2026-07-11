@@ -15,10 +15,11 @@
 use agent_context_db_core::{ContentLevel, ContentPayload, ContextEntry, ContextUri};
 use agent_context_db_version::{
     AsOfTime, Author, Branch, BranchLifecycle, BranchName, BranchType, ChangeSet, Commit, CommitId,
-    CommitMeta, CommitTrigger, ConflictStrategy, ContentHash, GcPolicy, GcReport, ImpactAnalysis,
-    KnowledgeMergeStrategy, LogOpts, MergeResult, MergeStrategy, ProvenanceGraph, Result,
-    SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion, TreeDiff, VersionError,
-    VersionRef, VersionStore,
+    CommitMeta, CommitTrigger, ConflictStrategy, ContentHash, ContradictionDetector, GcPolicy,
+    GcReport, ImpactAnalysis, KnowledgeMergeStrategy, LogOpts, MergeResult, MergeStrategy,
+    ProvenanceGraph, Result, SquashResult, StructuredDiff, Tag, TagName, TagType, TemporalVersion,
+    TreeDiff, VersionAnalysisConfig, VersionError, VersionRef, VersionStore,
+    detect_snapshot_contradictions,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -42,18 +43,31 @@ pub struct MemoryVersionStore {
     heads: Mutex<HashMap<String, CommitId>>,
     /// scope_uri → 当前检出的分支。缺失时 HEAD 处于 detached 状态。
     attached_branches: Mutex<HashMap<String, BranchName>>,
+    contradiction_detector: Option<std::sync::Arc<dyn ContradictionDetector>>,
+    analysis_config: VersionAnalysisConfig,
 }
 
 impl MemoryVersionStore {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(analysis_config: VersionAnalysisConfig) -> Result<Self> {
+        analysis_config.validate()?;
+        Ok(Self {
             commits: Mutex::new(HashMap::new()),
             entry_snapshots: Mutex::new(HashMap::new()),
             branches: Mutex::new(HashMap::new()),
             tags: Mutex::new(HashMap::new()),
             heads: Mutex::new(HashMap::new()),
             attached_branches: Mutex::new(HashMap::new()),
-        }
+            contradiction_detector: None,
+            analysis_config,
+        })
+    }
+
+    pub fn with_contradiction_detector(
+        mut self,
+        detector: std::sync::Arc<dyn ContradictionDetector>,
+    ) -> Self {
+        self.contradiction_detector = Some(detector);
+        self
     }
 
     /// 获取 scope 的 HEAD commit（不存在时返回 None）。
@@ -116,12 +130,6 @@ impl MemoryVersionStore {
             .entry(commit_id.clone())
             .or_default()
             .insert(uri.to_string(), json);
-    }
-}
-
-impl Default for MemoryVersionStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -432,7 +440,9 @@ impl VersionStore for MemoryVersionStore {
                     let mut best: Option<(DateTime<Utc>, CommitId)> = None;
                     for (id, c) in commits.iter() {
                         if c.timestamp <= ts
-                            && (best.is_none() || c.timestamp > best.as_ref().unwrap().0)
+                            && best
+                                .as_ref()
+                                .is_none_or(|(timestamp, _)| c.timestamp > *timestamp)
                         {
                             best = Some((c.timestamp, id.clone()));
                         }
@@ -838,11 +848,10 @@ impl VersionStore for MemoryVersionStore {
             (b.head.clone(), o.head.clone())
         };
 
-        let new_ids = vec![
-            self.cherry_pick(scope, &branch_head, onto, strategy)
-                .await?,
-        ];
-        let new_tip = new_ids.last().cloned().expect("rebase produced a commit");
+        let new_tip = self
+            .cherry_pick(scope, &branch_head, onto, strategy)
+            .await?;
+        let new_ids = vec![new_tip.clone()];
         let mut branches = self.branches.lock();
         let rebased = branches
             .get_mut(&(scope_key.clone(), branch.as_str().to_string()))
@@ -890,15 +899,21 @@ impl VersionStore for MemoryVersionStore {
             let parent = stored_commits
                 .get(&commits[0])
                 .and_then(|commit| commit.parents.first().cloned());
+            let newest = commits
+                .last()
+                .ok_or_else(|| VersionError::Storage("squash needs commits".into()))?;
             let snapshot = self
                 .entry_snapshots
                 .lock()
-                .get(commits.last().expect("non-empty commits"))
+                .get(newest)
                 .cloned()
                 .unwrap_or_default();
             (parent, snapshot)
         };
-        let newest = commits.last().cloned().expect("non-empty commits");
+        let newest = commits
+            .last()
+            .cloned()
+            .ok_or_else(|| VersionError::Storage("squash needs commits".into()))?;
         let scope_key = Self::scope_key(scope);
         let referenced = self.head(&scope_key).as_ref() == Some(&newest)
             || self
@@ -956,7 +971,7 @@ impl VersionStore for MemoryVersionStore {
                 },
             )
             .await?;
-        let cutoff = log.len().saturating_sub(policy.keep_recent);
+        let _cutoff = log.len().saturating_sub(policy.keep_recent);
         let mut removed = 0;
         let mut freed = 0;
 
@@ -967,7 +982,6 @@ impl VersionStore for MemoryVersionStore {
             }
             removed += 1;
         }
-        let _ = cutoff;
         Ok(GcReport {
             removed_commits: removed,
             freed_snapshots: freed,
@@ -978,8 +992,7 @@ impl VersionStore for MemoryVersionStore {
         let tags = self.list_tags(scope).await?;
         let mut updates = Vec::new();
         for tag in tags {
-            if let TagType::Semantic { ref condition } = tag.tag_type {
-                let _ = condition;
+            if let TagType::Semantic { condition: _ } = tag.tag_type {
                 updates.push((tag.name, tag.target));
             }
         }
@@ -1005,21 +1018,23 @@ impl VersionStore for MemoryVersionStore {
 
     async fn impact_analysis(&self, commit: &CommitId) -> Result<ImpactAnalysis> {
         let commits = self.commits.lock();
+        let mut recent = commits.iter().collect::<Vec<_>>();
+        recent.sort_by(|(_, left), (_, right)| right.timestamp.cmp(&left.timestamp));
         let mut downstream = Vec::new();
         let target = commit.clone();
-        for (cid, c) in commits.iter() {
-            if c.parents.contains(&target)
-                && let Ok(u) = ContextUri::parse(format!("commit-{}", cid.0))
+        for (cid, candidate) in recent.into_iter().take(self.analysis_config.max_commits) {
+            if candidate.parents.contains(&target)
+                && let Ok(uri) = ContextUri::parse(format!("commit-{}", cid.0))
             {
-                downstream.push(u);
+                downstream.push(uri);
             }
         }
         let branches = self.branches.lock();
         let affected: Vec<BranchName> = branches
             .iter()
             .filter(|(_, b)| b.head == target)
-            .map(|((_, name), _)| BranchName::new(name.clone()))
-            .collect();
+            .map(|((_, name), _)| BranchName::parse(name.clone()))
+            .collect::<Result<_>>()?;
 
         Ok(ImpactAnalysis {
             commit: commit.clone(),
@@ -1145,21 +1160,12 @@ impl VersionStore for MemoryVersionStore {
         // 冲突检测（仅 ContradictionDetection 策略）
         let conflicts: Vec<ContextUri> = match strategy {
             KnowledgeMergeStrategy::ContradictionDetection { threshold } => {
-                let mut cs = Vec::new();
-                for (uri_str, from_val) in &from_snap {
-                    if let Some(into_val) = into_snap.get(uri_str) {
-                        if from_val == into_val {
-                            continue;
-                        }
-                        let sim = jaccard_similarity(from_val, into_val);
-                        if sim < threshold as f64
-                            && let Ok(u) = ContextUri::parse(uri_str.as_str())
-                        {
-                            cs.push(u);
-                        }
-                    }
-                }
-                cs
+                let detector = self.contradiction_detector.as_ref().ok_or_else(|| {
+                    VersionError::MergeConflict(
+                        "ContradictionDetection requires an injected detector".into(),
+                    )
+                })?;
+                detect_snapshot_contradictions(detector, &from_snap, &into_snap, threshold).await?
             }
             KnowledgeMergeStrategy::EntityAutoMerge | KnowledgeMergeStrategy::GraphMerge { .. } => {
                 Vec::new()
@@ -1220,24 +1226,6 @@ impl VersionStore for MemoryVersionStore {
             conflicts,
         })
     }
-}
-
-/// Jaccard 相似度（词袋，忽略大小写和标点）—— 用于冲突检测。
-fn jaccard_similarity(a: &str, b: &str) -> f64 {
-    let tokens = |s: &str| -> std::collections::HashSet<String> {
-        s.split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_lowercase())
-            .collect()
-    };
-    let sa = tokens(a);
-    let sb = tokens(b);
-    if sa.is_empty() && sb.is_empty() {
-        return 1.0;
-    }
-    let inter = sa.intersection(&sb).count() as f64;
-    let union = sa.union(&sb).count() as f64;
-    if union == 0.0 { 0.0 } else { inter / union }
 }
 
 // ===========================================================================
@@ -1319,13 +1307,13 @@ mod tests {
 
     #[test]
     fn new_store_has_no_head() {
-        let store = MemoryVersionStore::new();
+        let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
         assert!(store.head("uwu://t1/agent/a1/state/mid").is_none());
     }
 
     #[tokio::test]
     async fn commit_creates_dag_node() {
-        let store = MemoryVersionStore::new();
+        let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
         let s = scope();
 
         let id = store
@@ -1372,7 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch_and_merge_fast_forward() {
-        let store = MemoryVersionStore::new();
+        let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
         let s = scope();
 
         // commit on main
@@ -1382,8 +1370,8 @@ mod tests {
             .unwrap();
 
         // create a feature branch from c1
-        let main = BranchName::new("main");
-        let feat = BranchName::new("feat");
+        let main = BranchName::parse("main").unwrap();
+        let feat = BranchName::parse("feat").unwrap();
 
         store
             .create_branch(&s, main.clone(), c1.clone(), BranchType::Main)
@@ -1417,7 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn fast_forward_rejects_divergent() {
-        let store = MemoryVersionStore::new();
+        let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
         let s = scope();
 
         // 构造真实分叉：两个 commit 各自以 root 为 parent（模拟两种策略的并行推演）
@@ -1464,8 +1452,8 @@ mod tests {
         );
 
         // 创建分别指向两个 commit 的分支
-        let a = BranchName::new("a");
-        let b = BranchName::new("b");
+        let a = BranchName::parse("a").unwrap();
+        let b = BranchName::parse("b").unwrap();
         store
             .create_branch(&s, a.clone(), c_a, BranchType::Experiment)
             .await
@@ -1485,7 +1473,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_at_retrieves_entry_from_snapshot() {
-        let store = MemoryVersionStore::new();
+        let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
         let s = scope();
         let uri = entry_uri("uwu://t1/agent/a1/memories/cases/c1");
 
@@ -1518,7 +1506,7 @@ mod tests {
 
     #[tokio::test]
     async fn asof_read_by_timestamp() {
-        let store = MemoryVersionStore::new();
+        let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
         let s = scope();
         let uri = entry_uri("uwu://t1/agent/a1/memories/events/e1");
 
@@ -1540,7 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_between_commits() {
-        let store = MemoryVersionStore::new();
+        let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
         let s = scope();
         let uri_a = entry_uri("uwu://t1/agent/a1/memories/cases/c1");
         let uri_b = entry_uri("uwu://t1/agent/a1/memories/cases/c2");

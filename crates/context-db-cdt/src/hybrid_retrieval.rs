@@ -1,6 +1,7 @@
 //! 三维混合检索 — Relevance + Recency + EpistemicConfidence。
 
-use agent_context_db_core::ContentType;
+use crate::config::HybridRetrievalConfig;
+use agent_context_db_core::{ContentType, Result};
 use chrono::{DateTime, Utc};
 
 /// 检索权重配置。
@@ -27,11 +28,18 @@ pub struct HybridRetriever {
 }
 
 impl HybridRetriever {
-    pub fn new(weights: RetrievalWeights) -> Self {
-        Self { weights }
+    pub fn new(config: HybridRetrievalConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            weights: RetrievalWeights {
+                relevance: config.relevance_weight,
+                recency: config.recency_weight,
+                confidence: config.confidence_weight,
+            },
+        })
     }
-    pub fn with_default() -> Self {
-        Self::new(RetrievalWeights::default())
+    pub fn with_default() -> Result<Self> {
+        Self::new(HybridRetrievalConfig::default())
     }
 
     /// 三维加权评分 — Relevance + Recency + EpistemicConfidence。

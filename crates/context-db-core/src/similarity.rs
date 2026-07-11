@@ -1,6 +1,6 @@
 //! F14 跨 Agent 去重与相似度聚类。
 
-use crate::ContextUri;
+use crate::{ContextError, ContextUri, Result};
 use std::collections::{HashMap, HashSet};
 
 /// 跨 Agent 相似度结果。
@@ -58,6 +58,17 @@ impl VectorSimilarity {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CrossAgentSimilarityConfig {
+    pub threshold: f32,
+}
+
+impl CrossAgentSimilarityConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_similarity_threshold(self.threshold, "cross-agent similarity threshold")
+    }
+}
+
 /// 跨 Agent 去重与聚类引擎。
 pub struct CrossAgentDedup {
     /// 相似度阈值
@@ -67,11 +78,12 @@ pub struct CrossAgentDedup {
 }
 
 impl CrossAgentDedup {
-    pub fn new(threshold: f32) -> Self {
-        Self {
-            threshold,
+    pub fn new(config: CrossAgentSimilarityConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            threshold: config.threshold,
             embeddings: parking_lot::Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// 注册一个条目及其 embedding。
@@ -95,8 +107,9 @@ impl CrossAgentDedup {
                 let agent_a = &agents[i];
                 let agent_b = &agents[j];
 
-                let map_a = data.get(agent_a).unwrap();
-                let map_b = data.get(agent_b).unwrap();
+                let (Some(map_a), Some(map_b)) = (data.get(agent_a), data.get(agent_b)) else {
+                    continue;
+                };
 
                 for (uri_a, emb_a) in map_a {
                     for (uri_b, emb_b) in map_b {
@@ -174,7 +187,7 @@ impl CrossAgentDedup {
                     id: id.chars().take(8).collect(),
                     uris: uris
                         .into_iter()
-                        .map(|s| ContextUri::parse(s).unwrap())
+                        .filter_map(|s| ContextUri::parse(s).ok())
                         .collect(),
                     centroid_description: String::new(),
                     agents,
@@ -195,6 +208,30 @@ pub trait KnowledgeNetwork: Send + Sync {
     fn find_similar(&self) -> SimilarityResult;
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalKnowledgeNetworkConfig {
+    pub threshold: f32,
+    pub lsh_tables: usize,
+    pub lsh_hash_size: usize,
+}
+
+impl LocalKnowledgeNetworkConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_similarity_threshold(self.threshold, "local knowledge network threshold")?;
+        if self.lsh_tables == 0 {
+            return Err(ContextError::Unsupported(
+                "LSH table count must be greater than zero".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.lsh_hash_size) {
+            return Err(ContextError::Unsupported(
+                "LSH hash size must be in 1..=64".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 基于 LSH 的本地知识网络 — 替代 O(N²) 暴力比较。
 pub struct LocalKnowledgeNetwork {
     lsh: parking_lot::Mutex<crate::LshIndex>,
@@ -203,12 +240,26 @@ pub struct LocalKnowledgeNetwork {
 }
 
 impl LocalKnowledgeNetwork {
-    pub fn new(threshold: f32) -> Self {
-        Self {
-            lsh: parking_lot::Mutex::new(crate::LshIndex::new(5, 16)),
+    pub fn new(config: LocalKnowledgeNetworkConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            lsh: parking_lot::Mutex::new(crate::LshIndex::new(
+                config.lsh_tables,
+                config.lsh_hash_size,
+            )),
             embeddings: parking_lot::Mutex::new(HashMap::new()),
-            threshold,
-        }
+            threshold: config.threshold,
+        })
+    }
+}
+
+fn validate_similarity_threshold(threshold: f32, name: &str) -> Result<()> {
+    if threshold.is_finite() && threshold > 0.0 && threshold <= 1.0 {
+        Ok(())
+    } else {
+        Err(ContextError::Unsupported(format!(
+            "{name} must be finite and in (0, 1]"
+        )))
     }
 }
 
@@ -227,15 +278,17 @@ impl KnowledgeNetwork for LocalKnowledgeNetwork {
 
         for i in 0..uris.len() {
             for j in (i + 1)..uris.len() {
-                let (_, emb_i) = &embeds[&uris[i]];
-                let (_, emb_j) = &embeds[&uris[j]];
+                let (Some((_, emb_i)), Some((_, emb_j))) =
+                    (embeds.get(&uris[i]), embeds.get(&uris[j]))
+                else {
+                    continue;
+                };
                 let sim = VectorSimilarity::cosine(emb_i, emb_j);
-                if sim >= self.threshold {
-                    pairs.push((
-                        ContextUri::parse(&uris[i]).unwrap(),
-                        ContextUri::parse(&uris[j]).unwrap(),
-                        sim,
-                    ));
+                if sim >= self.threshold
+                    && let (Ok(uri_i), Ok(uri_j)) =
+                        (ContextUri::parse(&uris[i]), ContextUri::parse(&uris[j]))
+                {
+                    pairs.push((uri_i, uri_j, sim));
                 }
             }
         }
@@ -440,7 +493,7 @@ mod tests {
 
     #[test]
     fn cross_agent_dedup_finds_similar() {
-        let dedup = CrossAgentDedup::new(0.8);
+        let dedup = CrossAgentDedup::new(CrossAgentSimilarityConfig { threshold: 0.8 }).unwrap();
         let uri_a = ContextUri::parse("uwu://t1/agent/a/memories/cases/c1").unwrap();
         let uri_b = ContextUri::parse("uwu://t1/agent/b/memories/cases/c1").unwrap();
 

@@ -266,14 +266,19 @@ struct ReplayCache {
 }
 
 impl ReplayCache {
-    fn new(policy: &NatsSecurityConfig) -> Self {
-        let retention = chrono::Duration::from_std(policy.max_age + policy.max_clock_skew)
-            .unwrap_or(chrono::Duration::MAX);
-        Self {
+    fn new(policy: &NatsSecurityConfig) -> Result<Self, NatsBridgeError> {
+        let retention = policy
+            .max_age
+            .checked_add(policy.max_clock_skew)
+            .and_then(|duration| chrono::Duration::from_std(duration).ok())
+            .ok_or_else(|| {
+                NatsBridgeError::InvalidPolicy("freshness duration exceeds chrono range".into())
+            })?;
+        Ok(Self {
             seen: Mutex::new(HashMap::new()),
             capacity: policy.replay_capacity,
             retention,
-        }
+        })
     }
 
     fn insert(&self, id: String, now: DateTime<Utc>) -> Result<(), NatsBridgeError> {
@@ -320,8 +325,12 @@ fn verify_envelope(
         return Err(NatsBridgeError::TypeDenied(type_name));
     }
     let age = now.signed_duration_since(env.timestamp);
-    let max_age = chrono::Duration::from_std(policy.max_age).unwrap_or(chrono::Duration::MAX);
-    let skew = chrono::Duration::from_std(policy.max_clock_skew).unwrap_or(chrono::Duration::MAX);
+    let max_age = chrono::Duration::from_std(policy.max_age).map_err(|_| {
+        NatsBridgeError::InvalidPolicy("max_age exceeds chrono duration range".into())
+    })?;
+    let skew = chrono::Duration::from_std(policy.max_clock_skew).map_err(|_| {
+        NatsBridgeError::InvalidPolicy("max_clock_skew exceeds chrono duration range".into())
+    })?;
     if age > max_age || age < -skew || env.is_expired() {
         return Err(NatsBridgeError::Expired);
     }
@@ -360,7 +369,10 @@ struct HealthReporter {
 
 impl HealthReporter {
     fn set(&self, state: NatsHealthState) {
-        *self.state.write().expect("health lock poisoned") = state.clone();
+        match self.state.write() {
+            Ok(mut current) => *current = state.clone(),
+            Err(poisoned) => *poisoned.into_inner() = state.clone(),
+        }
         self.tx.send_replace(state);
     }
 }
@@ -395,11 +407,10 @@ impl EventSystem {
     }
 
     pub fn health(&self) -> NatsHealthState {
-        self.health
-            .state
-            .read()
-            .expect("health lock poisoned")
-            .clone()
+        match self.health.state.read() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     pub fn subscribe_health(&self) -> watch::Receiver<NatsHealthState> {
@@ -433,7 +444,16 @@ fn validate_policy(policy: &NatsSecurityConfig) -> Result<(), NatsBridgeError> {
 }
 
 async fn run_ingestor(cfg: NatsBridgeConfig, mesh: EventMesh, health: Arc<HealthReporter>) {
-    let replay = ReplayCache::new(&cfg.security);
+    let replay = match ReplayCache::new(&cfg.security) {
+        Ok(replay) => replay,
+        Err(error) => {
+            health.set(NatsHealthState::Degraded {
+                error: error.to_string(),
+                next_retry: Duration::ZERO,
+            });
+            return;
+        }
+    };
     let mut attempt = 0u32;
     loop {
         health.set(NatsHealthState::Connecting { attempt });
@@ -541,58 +561,62 @@ mod tests {
     }
 
     #[test]
-    fn rejects_forged_signature() {
+    fn rejects_forged_signature() -> Result<(), NatsBridgeError> {
         let policy = security();
         let mut env = envelope(&policy);
         env.payload_bytes = serde_json::to_vec(&json!({"x": 2})).unwrap();
         assert!(matches!(
-            verify_envelope(&env, &policy, &ReplayCache::new(&policy), Utc::now()),
+            verify_envelope(&env, &policy, &ReplayCache::new(&policy)?, Utc::now()),
             Err(NatsBridgeError::InvalidSignature)
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_replay() {
+    fn rejects_replay() -> Result<(), NatsBridgeError> {
         let policy = security();
         let env = envelope(&policy);
-        let cache = ReplayCache::new(&policy);
+        let cache = ReplayCache::new(&policy)?;
         verify_envelope(&env, &policy, &cache, Utc::now()).unwrap();
         assert!(matches!(
             verify_envelope(&env, &policy, &cache, Utc::now()),
             Err(NatsBridgeError::Replay(_))
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_expired_envelope() {
+    fn rejects_expired_envelope() -> Result<(), NatsBridgeError> {
         let policy = security();
         let mut env = envelope(&policy);
         env.timestamp = Utc::now() - chrono::Duration::minutes(5);
         sign_envelope(&mut env, &policy).unwrap();
         assert!(matches!(
-            verify_envelope(&env, &policy, &ReplayCache::new(&policy), Utc::now()),
+            verify_envelope(&env, &policy, &ReplayCache::new(&policy)?, Utc::now()),
             Err(NatsBridgeError::Expired)
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_unregistered_signer_and_disallowed_boundaries() {
+    fn rejects_unregistered_signer_and_disallowed_boundaries() -> Result<(), NatsBridgeError> {
         let trusted = security();
         let attacker = NatsSecurityConfig::new("attacker", SigningKey::from_bytes(&[9; 32]))
             .allow_source("worker-a")
             .allow_type_prefix("context.");
         let env = envelope(&attacker);
         assert!(matches!(
-            verify_envelope(&env, &trusted, &ReplayCache::new(&trusted), Utc::now()),
+            verify_envelope(&env, &trusted, &ReplayCache::new(&trusted)?, Utc::now()),
             Err(NatsBridgeError::UnknownSigner(_))
         ));
         let mut env = envelope(&trusted);
         env.source = Some("other".into());
         sign_envelope(&mut env, &trusted).unwrap();
         assert!(matches!(
-            verify_envelope(&env, &trusted, &ReplayCache::new(&trusted), Utc::now()),
+            verify_envelope(&env, &trusted, &ReplayCache::new(&trusted)?, Utc::now()),
             Err(NatsBridgeError::SourceDenied(_))
         ));
+        Ok(())
     }
 
     #[test]

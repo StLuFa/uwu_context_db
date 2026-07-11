@@ -26,23 +26,26 @@ pub mod types;
 pub mod voting;
 
 pub use cap::{CapPolicyEngine, ConsistencyLevel};
-pub use community::{CommunityDetector, SpeciationEvent, SpeciationFork, SpeciationTracker};
-pub use conflict::{ConflictResolver, MarketConflictResolution};
-pub use consensus::ConsensusTracker;
+pub use community::{
+    CommunityConfig, CommunityDetector, SpeciationConfig, SpeciationEvent, SpeciationFork,
+    SpeciationTracker,
+};
+pub use conflict::{ConflictConfig, ConflictResolver, DebateConfig, MarketConflictResolution};
+pub use consensus::{ConsensusConfig, ConsensusTracker};
 pub use crdt::{CrdtMergeStrategy, SemanticCrdtMerger};
 pub use discovery::{DiscoveryEngine, FederatedDiscoveryBackend};
 pub use feedback::{
     FeedbackError, FeedbackPayload, FeedbackRegistry, FeedbackSignatureVerifier, MarketFeedback,
     ReputationEngine,
 };
-pub use immune::ImmuneProtocol;
-pub use influence::InfluenceAnalyzer;
+pub use immune::{AntibodyBroadcast, AntibodyPublication, ImmuneProtocol};
+pub use influence::{InfluenceAnalyzer, PageRankConfig};
 pub use memetic::{
     EvolutionAction, EvolutionCandidate, EvolutionOffspring, EvolutionRunReport, FitnessScore,
     FitnessSignals, MemeticEvolutionConfig, MemeticEvolutionEngine, OffspringValidationStatus,
 };
 pub use phylogeny::CrossAgentPhylogeny;
-pub use publish::{KnowledgeSigner, PublishGate, PublishableProduct};
+pub use publish::{KnowledgeSigner, PublishConfig, PublishGate, PublishableProduct};
 pub use registry::FederatedRegistry;
 pub use secure_aggregation::{
     ContributionCommitment, DpBudget, HashProvenanceVerifier, PrivateContribution,
@@ -52,5 +55,5 @@ pub use secure_aggregation::{
 pub use types::*;
 pub use voting::{
     SignedVote, SocialVoter, VoteError, VoteOp, VotePayload, VoteReputationPolicy,
-    VoteSignatureVerifier, VoteTally,
+    VoteSignatureVerifier, VoteTally, VotingConfig,
 };

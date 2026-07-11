@@ -4,8 +4,8 @@
 //! compact, queryable model before the answer planner decides what to fetch.
 
 use agent_context_db_core::{
-    ContentPayload, ContentType, ContextEntry, ContextMeta, ContextUri, MediaType, MvccVersion,
-    TenantId,
+    ContentPayload, ContentType, ContextEntry, ContextError, ContextMeta, ContextUri, MediaType,
+    MvccVersion, Result, TenantId,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -177,13 +177,12 @@ impl TheoryOfMindModel {
         }
     }
 
-    pub fn to_entry(&self, tenant: TenantId, owner_agent: &str) -> ContextEntry {
+    pub fn to_entry(&self, tenant: TenantId, owner_agent: &str) -> Result<ContextEntry> {
         let slug = sanitize_segment(&self.subject_id);
         let uri = ContextUri::parse(format!(
             "uwu://{}/agent/{}/persona/relations/{}",
             tenant.0, owner_agent, slug
-        ))
-        .expect("generated Theory-of-Mind URI must be valid");
+        ))?;
         let mut metadata = ContextMeta {
             content_type: Some(ContentType::Profile),
             quality_score: Some(model_quality(self)),
@@ -191,16 +190,15 @@ impl TheoryOfMindModel {
         };
         metadata.tags.push("theory-of-mind".into());
         metadata.tags.push(format!("subject:{}", self.subject_id));
-        metadata
-            .set_custom_field(TOM_KEY, self)
-            .expect("Theory-of-Mind model must serialize");
-        ContextEntry {
+        metadata.set_custom_field(TOM_KEY, self)?;
+        let data = serde_json::to_value(self).map_err(ContextError::Serialization)?;
+        Ok(ContextEntry {
             uri,
             tenant,
             payload: ContentPayload::Structured {
                 summary: self.summary(),
                 schema: None,
-                data: serde_json::to_value(self).expect("Theory-of-Mind model must serialize"),
+                data,
             },
             media_type: MediaType::Text,
             metadata,
@@ -208,7 +206,7 @@ impl TheoryOfMindModel {
             created_at: self.updated_at,
             updated_at: self.updated_at,
             derivation: None,
-        }
+        })
     }
 
     fn summary(&self) -> String {
@@ -376,7 +374,9 @@ mod tests {
             observed_at: now,
         });
 
-        let entry = model.to_entry(TenantId(Uuid::nil()), "agent-1");
+        let entry = model
+            .to_entry(TenantId(Uuid::nil()), "agent-1")
+            .expect("test model should serialize");
         assert_eq!(entry.metadata.content_type, Some(ContentType::Profile));
         assert!(entry.uri.segments().ends_with(&[
             "agent".to_string(),

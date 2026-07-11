@@ -94,6 +94,18 @@ pub trait WatchSource: Send + Sync {
     fn current_checkpoint(&self) -> WatchCheckpoint;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchDelivery {
+    pub event: ChangeEvent,
+    pub live_receivers: usize,
+}
+
+impl WatchDelivery {
+    pub fn delivered_live(&self) -> bool {
+        self.live_receivers > 0
+    }
+}
+
 pub struct WatchHub {
     next: AtomicU64,
     tx: broadcast::Sender<ChangeEvent>,
@@ -119,7 +131,7 @@ impl WatchHub {
         uri: ContextUri,
         to_uri: Option<ContextUri>,
         version: Option<MvccVersion>,
-    ) -> ChangeEvent {
+    ) -> WatchDelivery {
         let checkpoint = WatchCheckpoint(self.next.fetch_add(1, Ordering::SeqCst));
         let event = ChangeEvent::new(checkpoint, kind, uri, to_uri, version);
         {
@@ -130,8 +142,11 @@ impl WatchHub {
                 history.drain(0..overflow);
             }
         }
-        let _ = self.tx.send(event.clone());
-        event
+        let live_receivers = self.tx.send(event.clone()).unwrap_or(0);
+        WatchDelivery {
+            event,
+            live_receivers,
+        }
     }
 }
 

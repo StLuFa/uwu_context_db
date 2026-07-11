@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::{RetrievalHit, RetrievalResult};
+use crate::{RagSynthesisConfig, RetrievalHit, RetrievalResult, RetrieveConfigError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnswerDecision {
@@ -67,15 +67,23 @@ impl Default for AnswerSynthesisConfig {
     }
 }
 
-#[derive(Default)]
 pub struct CalibratedAnswerSynthesizer {
     llm: Option<Arc<dyn LlmClient>>,
     config: AnswerSynthesisConfig,
+    scoring: RagSynthesisConfig,
 }
 
 impl CalibratedAnswerSynthesizer {
-    pub fn new(config: AnswerSynthesisConfig) -> Self {
-        Self { llm: None, config }
+    pub fn new(
+        config: AnswerSynthesisConfig,
+        scoring: RagSynthesisConfig,
+    ) -> Result<Self, RetrieveConfigError> {
+        validate_answer_config(config)?;
+        Ok(Self {
+            llm: None,
+            config,
+            scoring: scoring.validate()?,
+        })
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
@@ -89,7 +97,7 @@ impl CalibratedAnswerSynthesizer {
         retrieval: &RetrievalResult,
     ) -> CalibratedAnswer {
         let citations = self.select_citations(&retrieval.hits);
-        let confidence = confidence_for(question, &citations);
+        let confidence = confidence_for(question, &citations, self.scoring);
         if let Some(reason) = self.abstention_reason(&citations, &confidence) {
             return CalibratedAnswer {
                 decision: AnswerDecision::Abstain,
@@ -119,7 +127,8 @@ impl CalibratedAnswerSynthesizer {
             .iter()
             .map(|hit| {
                 let quality = hit.metadata.quality_score.unwrap_or(0.5).clamp(0.0, 1.0);
-                let score = hit.relevance.clamp(0.0, 1.0) * 0.65 + quality * 0.35;
+                let score = hit.relevance.clamp(0.0, 1.0) * self.scoring.relevance_weight
+                    + quality * self.scoring.quality_weight;
                 (hit, quality, score)
             })
             .collect::<Vec<_>>();
@@ -213,20 +222,26 @@ impl CalibratedAnswerSynthesizer {
     }
 }
 
-fn confidence_for(question: &str, citations: &[AnswerCitation]) -> AnswerConfidence {
+fn confidence_for(
+    question: &str,
+    citations: &[AnswerCitation],
+    config: RagSynthesisConfig,
+) -> AnswerConfidence {
     let evidence_score = if citations.is_empty() {
         0.0
     } else {
         citations
             .iter()
-            .map(|c| c.relevance * 0.65 + c.quality * 0.35)
+            .map(|c| c.relevance * config.relevance_weight + c.quality * config.quality_weight)
             .sum::<f32>()
             / citations.len() as f32
     };
     let coverage_score = lexical_coverage(question, citations);
-    let consistency_score = consistency_score(citations);
-    let final_score =
-        (evidence_score * 0.45 + coverage_score * 0.30 + consistency_score * 0.25).clamp(0.0, 1.0);
+    let consistency_score = consistency_score(citations, config);
+    let final_score = (evidence_score * config.evidence_weight
+        + coverage_score * config.coverage_weight
+        + consistency_score * config.consistency_weight)
+        .clamp(0.0, 1.0);
     AnswerConfidence {
         evidence_score,
         coverage_score,
@@ -253,16 +268,16 @@ fn lexical_coverage(question: &str, citations: &[AnswerCitation]) -> f32 {
     (covered as f32 / question_tokens.len() as f32).clamp(0.0, 1.0)
 }
 
-fn consistency_score(citations: &[AnswerCitation]) -> f32 {
+fn consistency_score(citations: &[AnswerCitation], config: RagSynthesisConfig) -> f32 {
     let mut penalty = 0.0f32;
     for i in 0..citations.len() {
         for j in (i + 1)..citations.len() {
             if has_contradiction_marker(&citations[i].excerpt, &citations[j].excerpt) {
-                penalty += 0.50;
+                penalty += config.contradiction_penalty;
             }
         }
     }
-    (1.0 - penalty.min(0.85)).clamp(0.0, 1.0)
+    (1.0 - penalty.min(config.max_contradiction_penalty)).clamp(0.0, 1.0)
 }
 
 fn extractive_answer(_question: &str, citations: &[AnswerCitation]) -> String {
@@ -312,6 +327,29 @@ fn has_contradiction_marker(a: &str, b: &str) -> bool {
     })
 }
 
+fn validate_answer_config(config: AnswerSynthesisConfig) -> Result<(), RetrieveConfigError> {
+    if config.max_citations == 0 || config.max_prompt_chars == 0 {
+        return Err(RetrieveConfigError::new(
+            "answer synthesis limits must be non-zero",
+        ));
+    }
+    let thresholds = [
+        config.min_evidence_score,
+        config.min_coverage_score,
+        config.min_consistency_score,
+        config.min_final_confidence,
+    ];
+    if thresholds
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(RetrieveConfigError::new(
+            "answer synthesis thresholds must be finite and in [0, 1]",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,9 +388,13 @@ mod tests {
             trace: Default::default(),
             tokens_used: 20,
         };
-        let answer = CalibratedAnswerSynthesizer::default()
-            .synthesize("cache writes require audit evidence", &result)
-            .await;
+        let answer = CalibratedAnswerSynthesizer::new(
+            AnswerSynthesisConfig::default(),
+            RagSynthesisConfig::default(),
+        )
+        .unwrap()
+        .synthesize("cache writes require audit evidence", &result)
+        .await;
         assert_eq!(answer.decision, AnswerDecision::Answer);
         assert_eq!(answer.citations.len(), 1);
         assert!(answer.answer.unwrap().contains("[1]"));
@@ -378,9 +420,13 @@ mod tests {
             trace: Default::default(),
             tokens_used: 20,
         };
-        let answer = CalibratedAnswerSynthesizer::default()
-            .synthesize("cache enabled writes", &result)
-            .await;
+        let answer = CalibratedAnswerSynthesizer::new(
+            AnswerSynthesisConfig::default(),
+            RagSynthesisConfig::default(),
+        )
+        .unwrap()
+        .synthesize("cache enabled writes", &result)
+        .await;
         assert_eq!(answer.decision, AnswerDecision::Abstain);
         assert!(answer.abstention_reason.unwrap().contains("conflicts"));
     }

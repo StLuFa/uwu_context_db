@@ -6,7 +6,7 @@ use agent_context_db_core::{ContentLevel, ContextEntry, ContextUri, TenantId};
 use agent_context_db_testkit::MemoryVersionStore;
 use agent_context_db_version::{
     AsOfTime, BranchName, BranchType, ChangeSet, CommitMeta, CommitTrigger, LogOpts, MergeStrategy,
-    UriChange, VersionRef, VersionStore,
+    UriChange, VersionAnalysisConfig, VersionRef, VersionStore,
 };
 
 fn scope() -> ContextUri {
@@ -25,7 +25,7 @@ fn entry(uri: &ContextUri, text: &str) -> ContextEntry {
 
 #[tokio::test]
 async fn m2_acceptance_fork_rewrite_rollback() {
-    let store = MemoryVersionStore::new();
+    let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
     let s = scope();
     let state_uri = uri("uwu://t1/agent/a1/state/mid/content.json");
 
@@ -43,14 +43,14 @@ async fn m2_acceptance_fork_rewrite_rollback() {
         .unwrap();
 
     // 创建 main 分支
-    let main = BranchName::new("main");
+    let main = BranchName::parse("main").unwrap();
     store
         .create_branch(&s, main.clone(), baseline.clone(), BranchType::Main)
         .await
         .unwrap();
 
     // 2. fork 实验分支
-    let fork = BranchName::new("fork-explore");
+    let fork = BranchName::parse("fork-explore").unwrap();
     store
         .create_branch(&s, fork.clone(), baseline.clone(), BranchType::StateFork)
         .await
@@ -147,7 +147,7 @@ async fn m2_acceptance_fork_rewrite_rollback() {
 
 #[tokio::test]
 async fn asof_read_by_timestamp_finds_prior_commit() {
-    let store = MemoryVersionStore::new();
+    let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
     let s = scope();
     let uri = uri("uwu://t1/agent/a1/memories/events/e99");
 
@@ -174,7 +174,7 @@ async fn asof_read_by_timestamp_finds_prior_commit() {
 
 #[tokio::test]
 async fn three_way_merge_on_divergent_branches() {
-    let store = MemoryVersionStore::new();
+    let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
     let s = scope();
 
     let root = store
@@ -186,8 +186,8 @@ async fn three_way_merge_on_divergent_branches() {
     let c_a = store.commit_on_parent(&root, CommitMeta::default());
     let c_b = store.commit_on_parent(&root, CommitMeta::default());
 
-    let a = BranchName::new("a");
-    let b = BranchName::new("b");
+    let a = BranchName::parse("a").unwrap();
+    let b = BranchName::parse("b").unwrap();
     store
         .create_branch(&s, a.clone(), c_a, BranchType::Experiment)
         .await
@@ -222,7 +222,7 @@ async fn three_way_merge_on_divergent_branches() {
 
 #[tokio::test]
 async fn create_and_list_tags() {
-    let store = MemoryVersionStore::new();
+    let store = MemoryVersionStore::new(VersionAnalysisConfig::default()).unwrap();
     let s = scope();
 
     let c1 = store
@@ -234,7 +234,7 @@ async fn create_and_list_tags() {
         .create_tag(
             &s,
             agent_context_db_version::Tag {
-                name: agent_context_db_version::TagName::new("stable"),
+                name: agent_context_db_version::TagName::parse("stable").unwrap(),
                 target: c1.clone(),
                 tag_type: agent_context_db_version::TagType::Mutable,
                 message: "first stable".into(),

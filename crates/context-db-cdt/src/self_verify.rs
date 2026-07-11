@@ -2,7 +2,8 @@
 //!
 //! 验证 Skill 执行是否引入知识图谱矛盾，认知置信度是否提升。
 
-use agent_context_db_core::{ContextUri, GraphStore};
+use crate::config::SelfVerifyConfig;
+use agent_context_db_core::{ContextUri, GraphStore, Result};
 
 /// 执行记录。
 pub struct Execution {
@@ -26,11 +27,12 @@ pub struct CognitiveSelfVerifier {
 }
 
 impl CognitiveSelfVerifier {
-    pub fn new(success_threshold: f32) -> Self {
-        Self {
+    pub fn new(config: SelfVerifyConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
             graph: None,
-            success_threshold,
-        }
+            success_threshold: config.success_threshold,
+        })
     }
 
     pub fn with_graph(mut self, graph: Box<dyn GraphStore>) -> Self {

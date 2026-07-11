@@ -194,16 +194,16 @@ impl PrivacyReservationGuard {
         }
     }
 
-    pub fn receipt(&self) -> &PrivacyReceipt {
-        self.receipt.as_ref().expect("active privacy reservation")
+    pub fn receipt(&self) -> Result<&PrivacyReceipt> {
+        self.receipt.as_ref().ok_or_else(|| {
+            KnowledgeNetworkError::PrivacyBudgetExhausted(
+                "privacy reservation is no longer active".into(),
+            )
+        })
     }
 
     pub async fn commit(mut self) -> Result<PrivacyReceipt> {
-        let mut receipt = self
-            .receipt
-            .as_ref()
-            .expect("active privacy reservation")
-            .clone();
+        let mut receipt = self.receipt()?.clone();
         self.ledger.commit(&receipt).await?;
         receipt.committed_at = Some(Utc::now());
         self.receipt = None;
@@ -211,14 +211,27 @@ impl PrivacyReservationGuard {
     }
 
     pub async fn refund(mut self) -> Result<PrivacyReceipt> {
-        let receipt = self
-            .receipt
-            .as_ref()
-            .expect("active privacy reservation")
-            .clone();
+        let receipt = self.receipt()?.clone();
         self.ledger.refund(&receipt).await?;
         self.receipt = None;
         Ok(receipt)
+    }
+
+    /// Refund after a primary operation failed. If refund also fails, preserve both diagnostics.
+    pub async fn refund_after_error(
+        mut self,
+        primary: KnowledgeNetworkError,
+    ) -> KnowledgeNetworkError {
+        let receipt = match self.receipt.take() {
+            Some(receipt) => receipt,
+            None => return primary,
+        };
+        match self.ledger.refund(&receipt).await {
+            Ok(()) => primary,
+            Err(refund) => KnowledgeNetworkError::PrivacyBudgetExhausted(format!(
+                "primary operation failed: {primary}; privacy refund failed: {refund}"
+            )),
+        }
     }
 }
 
@@ -230,7 +243,9 @@ impl Drop for PrivacyReservationGuard {
         let ledger = Arc::clone(&self.ledger);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = ledger.refund(&receipt).await;
+                if let Err(error) = ledger.refund(&receipt).await {
+                    tracing::error!(operation = "privacy_refund_on_drop", receipt_id = %receipt.id, %error, "privacy reservation refund failed during drop");
+                }
             });
         }
     }
@@ -602,7 +617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protect_query_reserves_rdp_receipt() {
+    async fn protect_query_reserves_rdp_receipt() -> Result<()> {
         let guard = PrivacyGuard::new(
             DpPolicy::default(),
             Arc::new(InMemoryPrivacyBudgetLedger::default()),
@@ -611,7 +626,7 @@ mod tests {
             .protect_query(&AgentId::new("agent-a"), &query())
             .await
             .unwrap();
-        let receipt = reservation.receipt();
+        let receipt = reservation.receipt()?;
         assert_eq!(receipt.cost.mechanism, DpMechanismKind::Gaussian);
         assert!(
             receipt
@@ -620,5 +635,6 @@ mod tests {
                 .epsilon_delta(receipt.cost.delta as f64)
                 .is_finite()
         );
+        Ok(())
     }
 }

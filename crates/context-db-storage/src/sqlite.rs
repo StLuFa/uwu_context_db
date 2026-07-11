@@ -18,24 +18,30 @@ use std::sync::Arc;
 use uuid::Uuid;
 use uwu_database::DbPool;
 
+use crate::graph::{GraphCentralityConfig, pagerank_score};
 use crate::outbox::{
     IndexMutation, collection_from_entry, enqueue_sqlite, point_from_entry, upsert_mutation,
 };
 
 #[derive(Clone)]
 pub struct SqliteContextStore {
-    pool: Arc<DbPool>,
+    pool: SqlitePool,
     read_cache: Option<Arc<dyn agent_context_db_core::ReadCache>>,
+    centrality_config: GraphCentralityConfig,
 }
 
 impl SqliteContextStore {
-    pub fn try_new(pool: Arc<DbPool>) -> Result<Self> {
-        pool.as_sqlite().map_err(|e| {
-            ContextError::Storage(format!("SqliteContextStore requires sqlite backend: {e}"))
-        })?;
+    pub fn try_new(pool: Arc<DbPool>, centrality_config: GraphCentralityConfig) -> Result<Self> {
+        let pool = pool
+            .as_sqlite()
+            .map_err(|e| {
+                ContextError::Storage(format!("SqliteContextStore requires sqlite backend: {e}"))
+            })?
+            .clone();
         Ok(Self {
             pool,
             read_cache: None,
+            centrality_config,
         })
     }
 
@@ -45,9 +51,7 @@ impl SqliteContextStore {
     }
 
     fn sqlite_pool(&self) -> &SqlitePool {
-        self.pool
-            .as_sqlite()
-            .expect("SqliteContextStore backend was validated at construction")
+        &self.pool
     }
 
     fn storage_err(op: &str, error: impl std::fmt::Display) -> ContextError {
@@ -75,7 +79,7 @@ impl SqliteContextStore {
         entry: &ContextEntry,
     ) -> Result<MvccVersion> {
         entry.validate_tenant_binding()?;
-        let mut entry = sanitize_entry_for_write(entry);
+        let mut entry = sanitize_entry_for_write(entry)?;
         let uri = entry.uri.to_string();
         let tenant = entry.tenant.0.to_string();
         let content_type = entry
@@ -482,16 +486,13 @@ impl FsOps for SqliteContextStore {
                 },
             });
         }
-        let next_cursor = has_more.then(|| {
-            items
-                .last()
-                .unwrap()
-                .uri
-                .as_str()
-                .strip_prefix(&prefix)
-                .unwrap()
-                .to_string()
-        });
+        let next_cursor = has_more
+            .then(|| {
+                items
+                    .last()
+                    .and_then(|item| item.uri.as_str().strip_prefix(&prefix).map(str::to_owned))
+            })
+            .flatten();
         Ok(Page::new(items, next_cursor))
     }
 
@@ -517,7 +518,9 @@ impl FsOps for SqliteContextStore {
             .take(page.effective_limit())
             .map(ContextUri::parse)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let next_cursor = has_more.then(|| items.last().unwrap().to_string());
+        let next_cursor = has_more
+            .then(|| items.last().map(ToString::to_string))
+            .flatten();
         Ok(Page::new(items, next_cursor))
     }
 
@@ -572,7 +575,7 @@ impl FsOps for SqliteContextStore {
         .fetch_all(self.sqlite_pool()).await.map_err(|e| Self::storage_err("tree", e))?;
         let has_more = rows.len() > page.effective_limit();
         rows.truncate(page.effective_limit());
-        let next_cursor = has_more.then(|| rows.last().unwrap().clone());
+        let next_cursor = has_more.then(|| rows.last().cloned()).flatten();
         Ok(Page::new(
             vec![TreeNode {
                 uri: root.clone(),
@@ -674,7 +677,9 @@ impl VersionOps for SqliteContextStore {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let next_cursor = has_more.then(|| items.last().unwrap().version.0.to_string());
+        let next_cursor = has_more
+            .then(|| items.last().map(|item| item.version.0.to_string()))
+            .flatten();
         Ok(Page::new(items, next_cursor))
     }
 
@@ -776,7 +781,9 @@ impl TenantOps for SqliteContextStore {
                     .map_err(|e| Self::storage_err("tenant id", e))
             })
             .collect::<Result<Vec<_>>>()?;
-        let next_cursor = has_more.then(|| items.last().unwrap().0.to_string());
+        let next_cursor = has_more
+            .then(|| items.last().map(|item| item.0.to_string()))
+            .flatten();
         Ok(Page::new(items, next_cursor))
     }
 }
@@ -820,7 +827,9 @@ impl ContentStore for SqliteContextStore {
             .take(page.effective_limit())
             .map(|json| serde_json::from_str::<ContextEntry>(&json).map_err(Into::into))
             .collect::<Result<Vec<_>>>()?;
-        let next_cursor = has_more.then(|| items.last().unwrap().uri.to_string());
+        let next_cursor = has_more
+            .then(|| items.last().map(|item| item.uri.to_string()))
+            .flatten();
         Ok(Page::new(items, next_cursor))
     }
 
@@ -852,7 +861,9 @@ impl ContentStore for SqliteContextStore {
             .take(page.effective_limit())
             .map(|json| serde_json::from_str::<ContextEntry>(&json).map_err(Into::into))
             .collect::<Result<Vec<_>>>()?;
-        let next_cursor = has_more.then(|| items.last().unwrap().uri.to_string());
+        let next_cursor = has_more
+            .then(|| items.last().map(|item| item.uri.to_string()))
+            .flatten();
         Ok(Page::new(items, next_cursor))
     }
 }
@@ -890,7 +901,9 @@ impl BrowsingOps for SqliteContextStore {
             .take(page.effective_limit())
             .map(ContextUri::parse)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let next_cursor = has_more.then(|| items.last().unwrap().to_string());
+        let next_cursor = has_more
+            .then(|| items.last().map(ToString::to_string))
+            .flatten();
         Ok(Page::new(items, next_cursor))
     }
     async fn grep(&self, scope: &ContextUri, pattern: &str) -> Result<Vec<GrepHit>> {
@@ -921,19 +934,34 @@ impl GraphStore for SqliteContextStore {
             .map_err(|e| Self::storage_err("remove edge", e))?;
         Ok(())
     }
-    async fn neighbors(
+    async fn outgoing_neighbors(
         &self,
         uri: &ContextUri,
         kind: Option<GraphRelation>,
     ) -> Result<Vec<ContextUri>> {
         let rows: Vec<String> = if let Some(kind) = kind {
-            sqlx::query_scalar("SELECT to_uri FROM context_relations WHERE from_uri = ? AND relation_kind = ? UNION SELECT from_uri FROM context_relations WHERE to_uri = ? AND relation_kind = ?")
-                .bind(uri.to_string()).bind(format!("{kind:?}")).bind(uri.to_string()).bind(format!("{kind:?}"))
-                .fetch_all(self.sqlite_pool()).await
+            sqlx::query_scalar("SELECT DISTINCT to_uri FROM context_relations WHERE from_uri = ? AND relation_kind = ? ORDER BY to_uri")
+                .bind(uri.to_string()).bind(format!("{kind:?}")).fetch_all(self.sqlite_pool()).await
         } else {
-            sqlx::query_scalar("SELECT to_uri FROM context_relations WHERE from_uri = ? UNION SELECT from_uri FROM context_relations WHERE to_uri = ?")
-                .bind(uri.to_string()).bind(uri.to_string()).fetch_all(self.sqlite_pool()).await
-        }.map_err(|e| Self::storage_err("neighbors", e))?;
+            sqlx::query_scalar("SELECT DISTINCT to_uri FROM context_relations WHERE from_uri = ? ORDER BY to_uri")
+                .bind(uri.to_string()).fetch_all(self.sqlite_pool()).await
+        }.map_err(|e| Self::storage_err("outgoing neighbors", e))?;
+        rows.into_iter()
+            .map(ContextUri::parse)
+            .collect::<std::result::Result<_, _>>()
+    }
+    async fn incoming_neighbors(
+        &self,
+        uri: &ContextUri,
+        kind: Option<GraphRelation>,
+    ) -> Result<Vec<ContextUri>> {
+        let rows: Vec<String> = if let Some(kind) = kind {
+            sqlx::query_scalar("SELECT DISTINCT from_uri FROM context_relations WHERE to_uri = ? AND relation_kind = ? ORDER BY from_uri")
+                .bind(uri.to_string()).bind(format!("{kind:?}")).fetch_all(self.sqlite_pool()).await
+        } else {
+            sqlx::query_scalar("SELECT DISTINCT from_uri FROM context_relations WHERE to_uri = ? ORDER BY from_uri")
+                .bind(uri.to_string()).fetch_all(self.sqlite_pool()).await
+        }.map_err(|e| Self::storage_err("incoming neighbors", e))?;
         rows.into_iter()
             .map(ContextUri::parse)
             .collect::<std::result::Result<_, _>>()
@@ -954,7 +982,7 @@ impl GraphStore for SqliteContextStore {
                     continue;
                 }
                 for kind in kinds {
-                    for neighbor in self.neighbors(&uri, Some(*kind)).await? {
+                    for neighbor in self.outgoing_neighbors(&uri, Some(*kind)).await? {
                         result.push((uri.clone(), neighbor.clone(), *kind));
                         next.push(neighbor);
                     }
@@ -968,12 +996,11 @@ impl GraphStore for SqliteContextStore {
         Ok(result)
     }
     async fn centrality(&self, uri: &ContextUri) -> Result<f32> {
-        const MAX_NODES: usize = 256;
-        const MAX_HOPS: usize = 3;
+        let config = self.centrality_config;
         let mut nodes = BTreeSet::from([uri.to_string()]);
         let mut frontier = vec![uri.to_string()];
-        for _ in 0..MAX_HOPS {
-            if frontier.is_empty() || nodes.len() >= MAX_NODES {
+        for _ in 0..config.max_hops() {
+            if frontier.is_empty() || nodes.len() >= config.max_nodes() {
                 break;
             }
             let placeholders = std::iter::repeat_n("?", frontier.len())
@@ -995,7 +1022,7 @@ impl GraphStore for SqliteContextStore {
                 .map_err(|e| Self::storage_err("centrality frontier", e))?;
             frontier.clear();
             for node in rows {
-                if nodes.len() >= MAX_NODES {
+                if nodes.len() >= config.max_nodes() {
                     break;
                 }
                 if nodes.insert(node.clone()) {
@@ -1014,13 +1041,20 @@ impl GraphStore for SqliteContextStore {
         let node_set = node_list.iter().cloned().collect::<HashSet<_>>();
         let edges = rows
             .into_iter()
-            .filter_map(|row| {
-                let from = row.try_get::<String, _>(0).ok()?;
-                let to = row.try_get::<String, _>(1).ok()?;
-                (node_set.contains(&from) && node_set.contains(&to)).then_some((from, to))
+            .map(|row| {
+                let from = row
+                    .try_get::<String, _>(0)
+                    .map_err(|e| Self::storage_err("centrality edge from_uri", e))?;
+                let to = row
+                    .try_get::<String, _>(1)
+                    .map_err(|e| Self::storage_err("centrality edge to_uri", e))?;
+                Ok((from, to))
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(from, to)| node_set.contains(from) && node_set.contains(to))
             .collect::<Vec<_>>();
-        Ok(pagerank_score(uri.as_str(), &node_list, &edges))
+        Ok(pagerank_score(uri.as_str(), &node_list, &edges, config))
     }
 }
 
@@ -1079,55 +1113,6 @@ fn validate_blob(blob_ref: &BlobRef, data: &[u8], mime_type: &str, stored_size: 
     Ok(())
 }
 
-fn pagerank_score(target: &str, nodes: &[String], edges: &[(String, String)]) -> f32 {
-    const DAMPING: f32 = 0.85;
-    const MAX_ITERS: usize = 32;
-    const EPSILON: f32 = 1e-5;
-    let n = nodes.len() as f32;
-    let mut outgoing = std::collections::HashMap::<&str, Vec<&str>>::new();
-    for (from, to) in edges {
-        outgoing.entry(from).or_default().push(to);
-    }
-    let mut ranks = nodes
-        .iter()
-        .map(|node| (node.as_str(), 1.0 / n))
-        .collect::<std::collections::HashMap<_, _>>();
-    for _ in 0..MAX_ITERS {
-        let dangling = nodes
-            .iter()
-            .filter(|node| outgoing.get(node.as_str()).is_none_or(Vec::is_empty))
-            .map(|node| ranks.get(node.as_str()).copied().unwrap_or(0.0))
-            .sum::<f32>()
-            / n;
-        let mut next = nodes
-            .iter()
-            .map(|node| (node.as_str(), (1.0 - DAMPING) / n + DAMPING * dangling))
-            .collect::<std::collections::HashMap<_, _>>();
-        for (from, targets) in &outgoing {
-            let contribution =
-                DAMPING * ranks.get(from).copied().unwrap_or(0.0) / targets.len() as f32;
-            for target in targets {
-                if let Some(value) = next.get_mut(target) {
-                    *value += contribution;
-                }
-            }
-        }
-        let delta = nodes
-            .iter()
-            .map(|node| {
-                (next.get(node.as_str()).copied().unwrap_or(0.0)
-                    - ranks.get(node.as_str()).copied().unwrap_or(0.0))
-                .abs()
-            })
-            .sum::<f32>();
-        ranks = next;
-        if delta < EPSILON {
-            break;
-        }
-    }
-    (ranks.get(target).copied().unwrap_or(0.0) * n).clamp(0.0, 1.0)
-}
-
 fn collect_json_changes(
     path: &str,
     left: &serde_json::Value,
@@ -1164,19 +1149,8 @@ fn collect_json_changes(
 }
 
 fn payload_levels(payload: &ContentPayload) -> (String, Option<String>, String) {
-    match payload {
-        ContentPayload::Text {
-            sparse,
-            dense,
-            full,
-        } => (sparse.clone(), Some(dense.clone()), full.clone()),
-        ContentPayload::Image { .. } => ("[image]".into(), None, String::new()),
-        ContentPayload::Audio { transcript, .. } => (transcript.clone(), None, transcript.clone()),
-        ContentPayload::Structured { summary, data, .. } => {
-            (summary.clone(), Some(data.to_string()), data.to_string())
-        }
-        ContentPayload::Composite { summary, .. } => (summary.clone(), None, summary.clone()),
-    }
+    let projection = payload.index_projection();
+    (projection.l0, projection.l1, projection.l2)
 }
 
 fn state_scope_name(scope: StateScope) -> &'static str {
@@ -1255,7 +1229,7 @@ mod tests {
         };
         let db = uwu_database::Database::connect(&cfg).await.unwrap();
         migrate_sqlite(&db.pool).await.unwrap();
-        SqliteContextStore::try_new(Arc::new(db.pool)).unwrap()
+        SqliteContextStore::try_new(Arc::new(db.pool), GraphCentralityConfig::default()).unwrap()
     }
 
     fn entry(uri: &str, text: &str) -> ContextEntry {
@@ -1341,7 +1315,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .neighbors(&entries[0].uri, Some(GraphRelation::Corroborates))
+                .outgoing_neighbors(&entries[0].uri, Some(GraphRelation::Corroborates))
                 .await
                 .unwrap(),
             vec![entries[1].uri.clone()]
@@ -1400,7 +1374,7 @@ mod tests {
         ContentRepo::delete(&store, &literal.uri).await.unwrap();
         assert!(
             store
-                .neighbors(&wildcard_neighbor.uri, None)
+                .outgoing_neighbors(&wildcard_neighbor.uri, None)
                 .await
                 .unwrap()
                 .is_empty()

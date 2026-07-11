@@ -6,7 +6,7 @@
 use crate::consolidation::{CdtConsolidationSignal, CdtSignalSource};
 use crate::trajectory_encoder::Trajectory;
 use crate::voting::EvolvableInsight;
-use agent_context_db_core::{ContentType, ContextEntry, ContextUri, EpistemicType};
+use agent_context_db_core::{ContentType, ContextEntry, ContextError, ContextUri, EpistemicType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -76,13 +76,16 @@ impl GenAgentMemory {
         }
     }
 
-    pub fn ingest_trajectory(&mut self, trajectory: &Trajectory) -> AgentEpisode {
+    pub fn ingest_trajectory(
+        &mut self,
+        trajectory: &Trajectory,
+    ) -> Result<AgentEpisode, ContextError> {
         let uri = make_agent_uri(
             &self.profile.agent_uri,
             "episode",
             self.episodes.len(),
             &trajectory.task_description,
-        );
+        )?;
         let outcome = match (trajectory.success, trajectory.error_message.is_some()) {
             (true, _) => EpisodeOutcome::Success,
             (false, true) => EpisodeOutcome::Failure,
@@ -117,17 +120,17 @@ impl GenAgentMemory {
             importance,
         };
         self.episodes.push(episode.clone());
-        episode
+        Ok(episode)
     }
 
-    pub fn ingest_insights(&mut self, insights: &[EvolvableInsight]) {
+    pub fn ingest_insights(&mut self, insights: &[EvolvableInsight]) -> Result<(), ContextError> {
         for insight in insights {
             let episode_uri = make_agent_uri(
                 &self.profile.agent_uri,
                 "episode",
                 self.episodes.len(),
                 &insight.content,
-            );
+            )?;
             self.episodes.push(AgentEpisode {
                 uri: episode_uri,
                 description: insight.content.clone(),
@@ -141,6 +144,7 @@ impl GenAgentMemory {
                 importance: insight.votes.net_score.clamp(0.1, 1.0),
             });
         }
+        Ok(())
     }
 
     pub fn forecast_behavior(&self, context: &[ContextEntry]) -> BehaviorForecast {
@@ -178,10 +182,10 @@ impl GenAgentMemory {
     pub fn consolidation_signals(
         &self,
         forecast: &BehaviorForecast,
-    ) -> Vec<CdtConsolidationSignal> {
+    ) -> Result<Vec<CdtConsolidationSignal>, ContextError> {
         let mut signals = Vec::new();
         signals.push(CdtConsolidationSignal {
-            uri: make_agent_uri(&self.profile.agent_uri, "profile", 0, &self.profile.name),
+            uri: make_agent_uri(&self.profile.agent_uri, "profile", 0, &self.profile.name)?,
             content_type: ContentType::Profile,
             epistemic_type: EpistemicType::Belief,
             content: format!(
@@ -206,7 +210,7 @@ impl GenAgentMemory {
                 "forecast",
                 0,
                 &forecast.next_action,
-            ),
+            )?,
             content_type: ContentType::Reflection,
             epistemic_type: EpistemicType::Heuristic,
             content: format!(
@@ -248,7 +252,7 @@ impl GenAgentMemory {
             hypothesis_outcome: None,
         }));
 
-        signals
+        Ok(signals)
     }
 }
 
@@ -261,11 +265,15 @@ fn compute_importance(outcome: EpisodeOutcome, steps: usize, knowledge_count: us
     (outcome_weight + steps as f32 * 0.03 + knowledge_count as f32 * 0.05).clamp(0.0, 1.0)
 }
 
-fn make_agent_uri(base: &ContextUri, kind: &str, index: usize, content: &str) -> ContextUri {
-    let hash = blake3::hash(content.as_bytes()).to_hex();
-    let short = &hash[..8];
+fn make_agent_uri(
+    base: &ContextUri,
+    kind: &str,
+    index: usize,
+    content: &str,
+) -> Result<ContextUri, ContextError> {
+    let hash = blake3::hash(content.as_bytes());
+    let short = hash.to_hex().chars().take(8).collect::<String>();
     ContextUri::parse(format!("{}/{}/{:02}-{}", base.as_str(), kind, index, short))
-        .unwrap_or_else(|_| ContextUri::parse("uwu://t/agent/gen/profile/fallback").unwrap())
 }
 
 #[cfg(test)]
@@ -297,9 +305,9 @@ mod tests {
             preferences: vec!["verify before deploy".into()],
         };
         let mut memory = GenAgentMemory::new(profile);
-        memory.ingest_trajectory(&trajectory(false));
+        memory.ingest_trajectory(&trajectory(false)).unwrap();
         let forecast = memory.forecast_behavior(&[]);
-        let signals = memory.consolidation_signals(&forecast);
+        let signals = memory.consolidation_signals(&forecast).unwrap();
         assert!(forecast.confidence > 0.0);
         assert!(signals.len() >= 3);
         assert!(

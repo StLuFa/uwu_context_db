@@ -5,6 +5,7 @@
 //! 2. CBO 优化器枚举候选 PhysicalPlan，估算成本，选最优
 //! 3. PhysicalPlan 交由物理算子执行
 
+use crate::config::{QueryPlanConfig, RetrieveConfigError};
 use crate::intent::{IntentDecision, IntentExecutionNodeKind, IntentRoute};
 use crate::query::{Condition, Predicate, QueryMergeStrategy, SortKey};
 use agent_context_db_core::{ContentLevel, ContentType, ContextUri};
@@ -173,16 +174,19 @@ pub struct StatisticsCollector {
     avg_depth: RwLock<HashMap<String, usize>>,
     /// 向量索引选择性。
     vector_selectivity: RwLock<f64>,
+    config: QueryPlanConfig,
 }
 
 impl StatisticsCollector {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(config: QueryPlanConfig) -> Result<Self, RetrieveConfigError> {
+        let config = config.validate()?;
+        Ok(Self {
             row_counts: RwLock::new(HashMap::new()),
             type_counts: RwLock::new(HashMap::new()),
             avg_depth: RwLock::new(HashMap::new()),
             vector_selectivity: RwLock::new(0.1),
-        }
+            config,
+        })
     }
 
     /// 更新统计信息（Sleeptime 或写入后调用）。
@@ -209,7 +213,7 @@ impl StatisticsCollector {
             .read()
             .ok()
             .and_then(|m| m.get(scope).copied())
-            .unwrap_or(2)
+            .unwrap_or(self.config.default_depth)
     }
 
     /// 估算按类型过滤后的行数。
@@ -218,7 +222,7 @@ impl StatisticsCollector {
             .read()
             .ok()
             .and_then(|m| m.get(ct).copied())
-            .unwrap_or(100)
+            .unwrap_or(self.config.default_type_rows)
     }
 
     /// 估算 scope 内的行数。
@@ -227,18 +231,15 @@ impl StatisticsCollector {
             .read()
             .ok()
             .and_then(|m| m.get(scope).copied())
-            .unwrap_or(1000)
+            .unwrap_or(self.config.default_scope_rows)
     }
 
     /// 向量索引选择性。
     pub fn vector_selectivity(&self) -> f64 {
-        *self.vector_selectivity.read().unwrap()
-    }
-}
-
-impl Default for StatisticsCollector {
-    fn default() -> Self {
-        Self::new()
+        self.vector_selectivity
+            .read()
+            .map(|value| *value)
+            .unwrap_or(0.1)
     }
 }
 
@@ -289,11 +290,18 @@ impl From<&IntentDecision> for IntentPlannerHint {
 /// CBO 优化器 — 基于统计信息选择最优物理计划。
 pub struct CboOptimizer {
     stats: std::sync::Arc<StatisticsCollector>,
+    config: QueryPlanConfig,
 }
 
 impl CboOptimizer {
-    pub fn new(stats: std::sync::Arc<StatisticsCollector>) -> Self {
-        Self { stats }
+    pub fn new(
+        stats: std::sync::Arc<StatisticsCollector>,
+        config: QueryPlanConfig,
+    ) -> Result<Self, RetrieveConfigError> {
+        Ok(Self {
+            stats,
+            config: config.validate()?,
+        })
     }
 
     /// 逻辑计划 → 物理计划（经 CBO 优化）。
@@ -330,7 +338,7 @@ impl CboOptimizer {
                 level: _,
                 limit,
             } => {
-                let limit = limit.unwrap_or(1000).min(budget);
+                let limit = limit.unwrap_or(self.config.default_scan_limit).min(budget);
                 if let Some(uri) = scope {
                     PhysicalPlan::PgPrefixScan {
                         uri_prefix: uri.to_string(),
@@ -468,9 +476,9 @@ impl CboOptimizer {
                     })
                     .unwrap_or(false)
                 {
-                    25
+                    self.config.preferred_temporal_limit
                 } else {
-                    10
+                    self.config.temporal_limit
                 };
                 PhysicalPlan::PgPrefixScan {
                     uri_prefix: uri.to_string(),
@@ -492,7 +500,7 @@ impl CboOptimizer {
     fn type_limit(&self, content_type: &ContentType) -> usize {
         self.stats
             .estimate_rows_by_type(content_type)
-            .clamp(1, 4096)
+            .clamp(1, self.config.max_type_limit)
     }
 
     /// 估算物理计划的执行成本。
@@ -513,11 +521,13 @@ impl CboOptimizer {
                 ..
             } => {
                 let rows = self.stats.estimate_rows_by_type(content_type);
-                ((*limit).min(rows) as f64) * 0.001 // PG WHERE 前缀扫描，很便宜
+                ((*limit).min(rows) as f64) * self.config.type_scan_cost // PG WHERE 前缀扫描，很便宜
             }
-            PhysicalPlan::PgPrefixScan { limit, .. } => (*limit as f64) * 0.002,
+            PhysicalPlan::PgPrefixScan { limit, .. } => {
+                (*limit as f64) * self.config.prefix_scan_cost
+            }
             PhysicalPlan::VectorSearch { limit, .. } => {
-                (*limit as f64) * 0.01 // 向量搜索，中等成本
+                (*limit as f64) * self.config.vector_cost // 向量搜索，中等成本
             }
             PhysicalPlan::GraphTraverse {
                 input,
@@ -526,15 +536,19 @@ impl CboOptimizer {
             } => {
                 // 图遍历成本随 hops 指数增长，并包含种子计划成本。
                 self.estimate_cost_with_intent(input, hint)
-                    + 10.0 * (edges.len() as f64) * 2_f64.powi(*max_hops as i32)
+                    + self.config.graph_cost * (edges.len() as f64) * 2_f64.powi(*max_hops as i32)
             }
-            PhysicalPlan::Filter { input, .. } => self.estimate_cost_with_intent(input, hint) * 1.1,
-            PhysicalPlan::Sort { input, .. } => self.estimate_cost_with_intent(input, hint) * 1.5,
+            PhysicalPlan::Filter { input, .. } => {
+                self.estimate_cost_with_intent(input, hint) * self.config.filter_multiplier
+            }
+            PhysicalPlan::Sort { input, .. } => {
+                self.estimate_cost_with_intent(input, hint) * self.config.sort_multiplier
+            }
             PhysicalPlan::Limit { input, .. } => self.estimate_cost_with_intent(input, hint),
             PhysicalPlan::HashJoin { left, right } => {
                 self.estimate_cost_with_intent(left, hint)
                     + self.estimate_cost_with_intent(right, hint)
-                    + 5.0
+                    + self.config.hash_join_cost
             }
             PhysicalPlan::NestedLoopJoin { left, right } => {
                 self.estimate_cost_with_intent(left, hint)
@@ -545,12 +559,12 @@ impl CboOptimizer {
                 plans
                     .iter()
                     .map(|p| self.estimate_cost_with_intent(p, hint))
-                    .max_by(|a, b| a.partial_cmp(b).unwrap())
+                    .max_by(|a, b| a.total_cmp(b))
                     .unwrap_or(0.0)
             }
             PhysicalPlan::FullScan { limit, .. } => {
-                let rows = 1000_f64; // 默认估算
-                ((*limit).min(rows as usize) as f64) * 0.05
+                let rows = self.config.default_scope_rows;
+                ((*limit).min(rows) as f64) * self.config.full_scan_cost
             }
         };
         base * intent_cost_multiplier(plan, hint)
@@ -687,7 +701,13 @@ mod tests {
 
     #[test]
     fn intent_hint_limits_graph_depth() {
-        let optimizer = CboOptimizer::new(std::sync::Arc::new(StatisticsCollector::new()));
+        let optimizer = CboOptimizer::new(
+            std::sync::Arc::new(
+                StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap(),
+            ),
+            crate::QueryPlanConfig::default(),
+        )
+        .unwrap();
         let logical = LogicalPlan::Traverse {
             input: Box::new(LogicalPlan::Scan {
                 scope: Some(ContextUri::parse("uwu://u/agent/a/memories").unwrap()),

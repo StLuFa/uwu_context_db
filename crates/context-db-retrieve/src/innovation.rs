@@ -1,5 +1,6 @@
 //! 创新功能扩展（F16 预测性预加载 + F28 增量检索学习）。
 
+use crate::{InnovationConfig, RetrieveConfigError};
 use agent_context_db_core::{ContentLevel, ContentPayload, ContentType, ContextUri, FsOps};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -49,16 +50,25 @@ pub struct PredictivePrefetcher {
     associations: parking_lot::Mutex<HashMap<String, Vec<(String, f32)>>>,
     /// 预取大小
     prefetch_size: usize,
+    config: InnovationConfig,
 }
 
 impl PredictivePrefetcher {
-    pub fn new(fs: Arc<dyn FsOps>, prefetch_size: usize) -> Self {
-        Self {
+    pub fn new(
+        fs: Arc<dyn FsOps>,
+        prefetch_size: usize,
+        config: InnovationConfig,
+    ) -> Result<Self, RetrieveConfigError> {
+        if prefetch_size == 0 {
+            return Err(RetrieveConfigError::new("prefetch size must be non-zero"));
+        }
+        Ok(Self {
             fs,
             access_history: parking_lot::Mutex::new(HashMap::new()),
             associations: parking_lot::Mutex::new(HashMap::new()),
             prefetch_size,
-        }
+            config: config.validate()?,
+        })
     }
 
     /// 记录一次上下文访问。
@@ -80,13 +90,13 @@ impl PredictivePrefetcher {
         let list = assoc.entry(from.to_string()).or_default();
         let to_str = to.to_string();
         if let Some(entry) = list.iter_mut().find(|(u, _)| u == &to_str) {
-            entry.1 += 0.1; // 强化
+            entry.1 += self.config.association_increment; // 强化
         } else {
-            list.push((to_str, 0.3));
+            list.push((to_str, self.config.association_initial));
         }
         // 衰减旧关联
         for (_, score) in list.iter_mut() {
-            *score *= 0.99;
+            *score *= self.config.association_decay;
         }
     }
 
@@ -212,19 +222,25 @@ pub struct IncrementalRetrievalLearner {
     missing_patterns: parking_lot::Mutex<Vec<MissingKnowledgeSignal>>,
     weights: parking_lot::RwLock<LearnedRankingWeights>,
     /// 学习率
-    learning_rate: f32,
+    config: InnovationConfig,
 }
 
 impl IncrementalRetrievalLearner {
-    pub fn new(learning_rate: f32) -> Self {
-        Self {
+    pub fn new(config: InnovationConfig) -> Result<Self, RetrieveConfigError> {
+        let config = config.validate()?;
+        Ok(Self {
             uri_scores: parking_lot::Mutex::new(HashMap::new()),
             dir_preferences: parking_lot::Mutex::new(HashMap::new()),
             query_type_weights: parking_lot::Mutex::new(HashMap::new()),
             missing_patterns: parking_lot::Mutex::new(Vec::new()),
-            weights: parking_lot::RwLock::new(LearnedRankingWeights::default()),
-            learning_rate,
-        }
+            weights: parking_lot::RwLock::new(LearnedRankingWeights {
+                semantic: config.semantic_weight,
+                uri_feedback: config.uri_weight,
+                query_type: config.query_type_weight,
+                exploration: config.exploration_weight,
+            }),
+            config,
+        })
     }
 
     /// 接受一批反馈，更新内部权重。
@@ -236,14 +252,15 @@ impl IncrementalRetrievalLearner {
             match fb {
                 RelevanceFeedback::Relevant { uri, score } => {
                     let entry = scores.entry(uri.to_string().clone()).or_insert(0.5);
-                    *entry = (*entry + self.learning_rate * (score.clamp(0.0, 1.0) - *entry))
+                    *entry = (*entry
+                        + self.config.learning_rate * (score.clamp(0.0, 1.0) - *entry))
                         .clamp(0.0, 1.0);
-                    reinforce_dir(&mut prefs, query, uri, self.learning_rate, *score);
+                    reinforce_dir(&mut prefs, query, uri, self.config.learning_rate, *score);
                 }
                 RelevanceFeedback::NotRelevant { uri } => {
                     let entry = scores.entry(uri.to_string().clone()).or_insert(0.5);
-                    *entry = (*entry * (1.0 - self.learning_rate)).max(0.05);
-                    reinforce_dir(&mut prefs, query, uri, self.learning_rate, 0.1);
+                    *entry = (*entry * (1.0 - self.config.learning_rate)).max(0.05);
+                    reinforce_dir(&mut prefs, query, uri, self.config.learning_rate, 0.1);
                 }
                 RelevanceFeedback::Missing { description } => {
                     self.record_missing(query, description);
@@ -369,7 +386,7 @@ impl IncrementalRetrievalLearner {
             .iter_mut()
             .find(|item| item.query == normalized && item.description == description)
         {
-            existing.weight = (existing.weight + self.learning_rate).min(1.0);
+            existing.weight = (existing.weight + self.config.learning_rate).min(1.0);
             return;
         }
         missing.push(MissingKnowledgeSignal {
@@ -379,15 +396,15 @@ impl IncrementalRetrievalLearner {
             weight: 0.5,
         });
         missing.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(Ordering::Equal));
-        missing.truncate(128);
+        missing.truncate(self.config.max_missing_patterns);
     }
 
     fn update_query_type(&self, query: &str, content_type: ContentType, reward: f32) {
         let mut map = self.query_type_weights.lock();
         let entry = map.entry(query_signature(query)).or_default();
         let weight = entry.entry(content_type).or_insert(0.5);
-        *weight =
-            (*weight + self.learning_rate * (reward.clamp(0.0, 1.0) - *weight)).clamp(0.0, 1.0);
+        *weight = (*weight + self.config.learning_rate * (reward.clamp(0.0, 1.0) - *weight))
+            .clamp(0.0, 1.0);
     }
 
     fn query_type_score(&self, query: &str, content_type: ContentType) -> Option<f32> {
@@ -423,11 +440,13 @@ impl IncrementalRetrievalLearner {
             .fold(0.0, f32::max)
             .clamp(0.0, 1.0);
         let mut weights = self.weights.write();
-        weights.exploration = (0.04 + missing_pressure * 0.08).clamp(0.04, 0.16);
-        weights.uri_feedback = (0.26 - weights.exploration * 0.35).clamp(0.18, 0.30);
-        weights.query_type = 0.14;
-        weights.semantic = (1.0 - weights.uri_feedback - weights.query_type - weights.exploration)
-            .clamp(0.45, 0.65);
+        let exploration_shift = missing_pressure * self.config.exploration_weight;
+        weights.exploration = self.config.exploration_weight + exploration_shift;
+        let remaining = 1.0 - weights.exploration;
+        let base_non_exploration = 1.0 - self.config.exploration_weight;
+        weights.semantic = self.config.semantic_weight / base_non_exploration * remaining;
+        weights.uri_feedback = self.config.uri_weight / base_non_exploration * remaining;
+        weights.query_type = self.config.query_type_weight / base_non_exploration * remaining;
     }
 }
 
@@ -539,7 +558,8 @@ mod tests {
 
     #[test]
     fn prefetcher_predicts_from_associations() {
-        let prefetcher = PredictivePrefetcher::new(Arc::new(NoopFs), 3);
+        let prefetcher =
+            PredictivePrefetcher::new(Arc::new(NoopFs), 3, InnovationConfig::default()).unwrap();
         let from = ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap();
         let to = ContextUri::parse("uwu://t/agent/a/memories/tools/t1").unwrap();
 
@@ -550,7 +570,7 @@ mod tests {
 
     #[test]
     fn incremental_learner_applies_feedback() {
-        let learner = IncrementalRetrievalLearner::new(0.1);
+        let learner = IncrementalRetrievalLearner::new(InnovationConfig::default()).unwrap();
         let uri = ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap();
 
         learner.apply_feedback(
@@ -566,7 +586,7 @@ mod tests {
 
     #[test]
     fn incremental_learner_penalizes_irrelevant() {
-        let learner = IncrementalRetrievalLearner::new(0.1);
+        let learner = IncrementalRetrievalLearner::new(InnovationConfig::default()).unwrap();
         let uri = ContextUri::parse("uwu://t/agent/a/memories/cases/c1").unwrap();
 
         // 初始：默认分 + 强化
@@ -591,7 +611,11 @@ mod tests {
 
     #[test]
     fn learner_reranks_hits_with_feedback_and_content_type() {
-        let learner = IncrementalRetrievalLearner::new(0.4);
+        let learner = IncrementalRetrievalLearner::new(InnovationConfig {
+            learning_rate: 0.4,
+            ..InnovationConfig::default()
+        })
+        .unwrap();
         let good = ContextUri::parse("uwu://t/a/memory/fact/good").unwrap();
         let weak = ContextUri::parse("uwu://t/a/memory/fact/weak").unwrap();
         learner.apply_feedback(
@@ -618,7 +642,11 @@ mod tests {
 
     #[test]
     fn missing_feedback_records_exploration_terms() {
-        let learner = IncrementalRetrievalLearner::new(0.2);
+        let learner = IncrementalRetrievalLearner::new(InnovationConfig {
+            learning_rate: 0.2,
+            ..InnovationConfig::default()
+        })
+        .unwrap();
         learner.apply_feedback(
             "cache audit",
             &[RelevanceFeedback::Missing {

@@ -16,6 +16,7 @@ pub mod associative;
 pub mod budget;
 pub mod cache;
 pub mod compiler;
+pub mod config;
 pub mod graph_rag;
 pub mod innovation;
 pub mod intent;
@@ -30,6 +31,10 @@ pub mod theory_of_mind;
 
 pub use associative::AssociativeExpander;
 pub use budget::{BudgetLoadPlan, LevelAllocation, allocate_hit_levels, load_hits_within_budget};
+pub use config::{
+    GraphRagConfig, InnovationConfig, QueryPlanConfig, RagSynthesisConfig, RetrieveConfigError,
+    TokenBudgetConfig,
+};
 pub use graph_rag::{
     GraphRagCommunity, GraphRagEngine, GraphRagIndex, GraphRagIndexConfig, GraphRagIndexStats,
     GraphRagIndexer, GraphRagRequest,
@@ -234,11 +239,13 @@ impl Reranker for LlmReranker {
 }
 
 fn content_preview(content: &ContentPayload, max_chars: usize) -> String {
-    let text = content.sparse_text().to_string();
-    if text.len() > max_chars {
-        format!("{}...", &text[..max_chars])
+    let text = content.sparse_text();
+    let mut chars = text.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
     } else {
-        text
+        preview
     }
 }
 

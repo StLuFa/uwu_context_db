@@ -224,6 +224,11 @@ impl SessionCompressorImpl {
             .parent()
             .ok_or_else(|| ContextError::InvalidUri("archive has no parent".into()))?;
         let overview = self.semantic.aggregate_upward(&parent).await?;
+        if overview.trim().is_empty() {
+            return Err(ContextError::Storage(
+                "semantic processor returned an empty overview".into(),
+            ));
+        }
         let diff_uri = Self::diff_uri(&record.session);
         self.store
             .write(text_entry(diff_uri.clone(), serde_json::to_string(&diff)?))
@@ -236,12 +241,14 @@ impl SessionCompressorImpl {
             memory_diff_uri: diff_uri,
         };
         self.store
+            .write(text_entry(done.overview_uri.clone(), overview))
+            .await?;
+        self.store
             .write(text_entry(
                 Self::done_uri(&record.session),
                 serde_json::to_string(&done)?,
             ))
             .await?;
-        let _ = overview;
         Ok(done)
     }
 

@@ -85,7 +85,12 @@ impl BatchWriteBuffer {
         // 批量写入
         for (entry, tx) in batch {
             let result = self.inner.write(entry).await;
-            let _ = tx.send(result);
+            if tx.send(result).is_err() {
+                tracing::debug!(
+                    operation = "batch_write_result_send",
+                    "batch write receiver was dropped"
+                );
+            }
         }
     }
 }
@@ -217,7 +222,8 @@ impl DedupStore {
         format!("dedup:idx:{uri}")
     }
 
-    /// 存储内容（自动去重+压缩）。若挂载了持久化后端，则 write-through 到后端（best-effort）。
+    /// 存储内容（自动去重+压缩）。若挂载了持久化后端，则异步 write-through。
+    /// 持久化是 best-effort：内存写入仍会成功，后端失败按 operation/key/error 记录告警。
     pub fn store(&self, uri: &str, data: &[u8]) -> String {
         let hash = content_hash(data);
         let compressed = {
@@ -249,11 +255,15 @@ impl DedupStore {
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
                     if let Some(bytes) = compressed {
-                        let _ = cache.set(&Self::blob_key(&hash_c), &bytes, None).await;
+                        let key = Self::blob_key(&hash_c);
+                        if let Err(error) = cache.set(&key, &bytes, None).await {
+                            tracing::warn!(operation = "dedup_cache_set_blob", %key, %error, "best-effort dedup persistence failed");
+                        }
                     }
-                    let _ = cache
-                        .set(&Self::idx_key(&uri_c), hash_c.as_bytes(), None)
-                        .await;
+                    let key = Self::idx_key(&uri_c);
+                    if let Err(error) = cache.set(&key, hash_c.as_bytes(), None).await {
+                        tracing::warn!(operation = "dedup_cache_set_index", %key, %error, "best-effort dedup persistence failed");
+                    }
                 });
             }
         }

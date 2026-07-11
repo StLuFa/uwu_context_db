@@ -1,6 +1,9 @@
 //! GraphRAG — 社区摘要索引 + 图增强检索。
 
-use crate::{RetrievalHit, RetrievalResult, RetrievalTrace, RetrieveContext, TraceStep};
+use crate::{
+    GraphRagConfig, RetrievalHit, RetrievalResult, RetrievalTrace, RetrieveConfigError,
+    RetrieveContext, TraceStep,
+};
 use agent_context_db_core::{
     ContentLevel, ContentPayload, ContextUri, FsOps, GraphRelation, GraphStore, LlmClient, LlmOpts,
     Result, count_tokens,
@@ -21,15 +24,20 @@ pub struct GraphRagRequest {
 }
 
 impl GraphRagRequest {
-    pub fn new(query: impl Into<String>, seed_uris: Vec<ContextUri>) -> Self {
-        Self {
+    pub fn new(
+        query: impl Into<String>,
+        seed_uris: Vec<ContextUri>,
+        config: GraphRagConfig,
+    ) -> std::result::Result<Self, RetrieveConfigError> {
+        let config = config.validate()?;
+        Ok(Self {
             query: query.into(),
             seed_uris,
             relations: default_graph_rag_relations(),
-            max_hops: 2,
-            max_communities: 4,
-            max_nodes_per_community: 8,
-        }
+            max_hops: config.request_hops,
+            max_communities: config.request_communities,
+            max_nodes_per_community: config.request_nodes,
+        })
     }
 }
 
@@ -39,17 +47,6 @@ pub struct GraphRagIndexConfig {
     pub relations: Vec<GraphRelation>,
     pub max_hops: usize,
     pub max_summary_nodes: usize,
-}
-
-impl GraphRagIndexConfig {
-    pub fn new(seed_uris: Vec<ContextUri>) -> Self {
-        Self {
-            seed_uris,
-            relations: default_graph_rag_relations(),
-            max_hops: 3,
-            max_summary_nodes: 16,
-        }
-    }
 }
 
 impl From<&GraphRagRequest> for GraphRagIndexConfig {
@@ -88,6 +85,7 @@ pub struct GraphRagIndex {
     node_centrality: HashMap<ContextUri, f32>,
     adjacency: HashMap<ContextUri, HashSet<ContextUri>>,
     stats: GraphRagIndexStats,
+    config: GraphRagConfig,
 }
 
 impl GraphRagIndex {
@@ -118,7 +116,7 @@ impl GraphRagIndex {
             let Some(community) = self.communities.get(idx) else {
                 continue;
             };
-            hits.push(community_summary_hit(community, score));
+            hits.push(community_summary_hit(community, score)?);
             for node in self
                 .rank_nodes_in_community(community, &request.query)
                 .into_iter()
@@ -132,7 +130,9 @@ impl GraphRagIndex {
                     uri: node.clone(),
                     level: ctx.prefer_level,
                     content,
-                    relevance: (score * 0.88 + self.node_score(&node) * 0.12).clamp(0.05, 1.0),
+                    relevance: (score * self.config.hit_community_weight
+                        + self.node_score(&node) * self.config.hit_node_weight)
+                        .clamp(self.config.min_hit_relevance, 1.0),
                     parent_chain: vec![
                         ContextUri::parse(format!("uwu://graph-rag/community/{}", community.id))
                             .unwrap_or_else(|_| {
@@ -149,7 +149,9 @@ impl GraphRagIndex {
         let tokens_used = hits
             .iter()
             .map(|hit| count_tokens(hit.content.sparse_text()))
-            .sum::<usize>();
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
         Ok(RetrievalResult {
             hits,
             trace: RetrievalTrace {
@@ -175,13 +177,16 @@ impl GraphRagIndex {
                 let summary_score = term_overlap(&query_terms, &self.summary_terms[idx]);
                 let node_score = community.score;
                 let global_boost = if community.parent.is_none() {
-                    0.08
+                    self.config.global_boost
                 } else {
                     0.0
                 };
                 (
                     idx,
-                    (summary_score * 0.72 + node_score * 0.20 + global_boost).clamp(0.0, 1.0),
+                    (summary_score * self.config.community_summary_weight
+                        + node_score * self.config.community_node_weight
+                        + global_boost)
+                        .clamp(0.0, 1.0),
                 )
             })
             .collect::<Vec<_>>();
@@ -209,14 +214,21 @@ impl GraphRagIndex {
     }
 
     fn node_score(&self, uri: &ContextUri) -> f32 {
-        let centrality = self.node_centrality.get(uri).copied().unwrap_or(0.5);
+        let centrality = self
+            .node_centrality
+            .get(uri)
+            .copied()
+            .unwrap_or(self.config.default_centrality);
         let degree = self.adjacency.get(uri).map(|n| n.len()).unwrap_or(0) as f32;
-        (centrality * 0.75 + (degree / 12.0).min(1.0) * 0.25).clamp(0.0, 1.0)
+        let degree_weight = 1.0 - self.config.retrieval_centrality_weight;
+        (centrality * self.config.retrieval_centrality_weight
+            + (degree / self.config.degree_saturation).min(1.0) * degree_weight)
+            .clamp(0.0, 1.0)
     }
 
     fn node_lexical_score(&self, uri: &ContextUri, query_terms: &HashSet<String>) -> f32 {
         let uri_terms = terms(uri.as_str());
-        term_overlap(query_terms, &uri_terms) * 0.2
+        term_overlap(query_terms, &uri_terms) * self.config.lexical_weight
     }
 }
 
@@ -224,15 +236,21 @@ pub struct GraphRagIndexer {
     fs: Arc<dyn FsOps>,
     graph: Arc<dyn GraphStore>,
     llm: Option<Arc<dyn LlmClient>>,
+    config: GraphRagConfig,
 }
 
 impl GraphRagIndexer {
-    pub fn new(fs: Arc<dyn FsOps>, graph: Arc<dyn GraphStore>) -> Self {
-        Self {
+    pub fn new(
+        fs: Arc<dyn FsOps>,
+        graph: Arc<dyn GraphStore>,
+        config: GraphRagConfig,
+    ) -> std::result::Result<Self, RetrieveConfigError> {
+        Ok(Self {
             fs,
             graph,
             llm: None,
-        }
+            config: config.validate()?,
+        })
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
@@ -245,15 +263,25 @@ impl GraphRagIndexer {
         let mut communities = detect_communities(&expanded.adjacency);
         for community in &mut communities {
             community.nodes.sort_by(|left, right| {
-                let left_score = node_rank(left, &expanded.adjacency, &expanded.centrality);
-                let right_score = node_rank(right, &expanded.adjacency, &expanded.centrality);
+                let left_score =
+                    node_rank(left, &expanded.adjacency, &expanded.centrality, self.config);
+                let right_score = node_rank(
+                    right,
+                    &expanded.adjacency,
+                    &expanded.centrality,
+                    self.config,
+                );
                 right_score
                     .partial_cmp(&left_score)
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| left.as_str().cmp(right.as_str()))
             });
-            community.score =
-                average_node_rank(&community.nodes, &expanded.adjacency, &expanded.centrality);
+            community.score = average_node_rank(
+                &community.nodes,
+                &expanded.adjacency,
+                &expanded.centrality,
+                self.config,
+            );
             community.summary = self
                 .summarize_community(&community.nodes, config.max_summary_nodes)
                 .await;
@@ -289,6 +317,7 @@ impl GraphRagIndexer {
             node_centrality: expanded.centrality,
             adjacency: expanded.adjacency,
             stats,
+            config: self.config,
         })
     }
 
@@ -309,7 +338,7 @@ impl GraphRagIndexer {
                 self.graph
                     .centrality(&uri)
                     .await
-                    .unwrap_or(0.5)
+                    .unwrap_or(self.config.default_centrality)
                     .clamp(0.0, 1.0),
             );
             if depth >= config.max_hops {
@@ -320,7 +349,7 @@ impl GraphRagIndexer {
                 let neighbors = match neighbor_cache.get(&key) {
                     Some(cached) => cached.clone(),
                     None => {
-                        let loaded = self.graph.neighbors(&uri, Some(*relation)).await?;
+                        let loaded = self.graph.outgoing_neighbors(&uri, Some(*relation)).await?;
                         neighbor_cache.insert(key, loaded.clone());
                         loaded
                     }
@@ -338,7 +367,7 @@ impl GraphRagIndexer {
                         self.graph
                             .centrality(&neighbor)
                             .await
-                            .unwrap_or(0.5)
+                            .unwrap_or(self.config.default_centrality)
                             .clamp(0.0, 1.0),
                     );
                     if visited.insert(neighbor.clone()) {
@@ -385,7 +414,7 @@ impl GraphRagIndexer {
             format!(
                 "Community theme from {} nodes: {}",
                 nodes.len(),
-                truncate(&evidence.replace('\n', " "), 900)
+                truncate(&evidence.replace('\n', " "), self.config.summary_chars)
             )
         }
     }
@@ -396,7 +425,11 @@ impl GraphRagIndexer {
             if let Ok(payload) = self.fs.read(uri, ContentLevel::L0).await {
                 let text = payload.sparse_text();
                 if !text.is_empty() {
-                    evidence.push(format!("- {}: {}", uri, truncate(text, 360)));
+                    evidence.push(format!(
+                        "- {}: {}",
+                        uri,
+                        truncate(text, self.config.evidence_chars)
+                    ));
                 }
             }
         }
@@ -408,15 +441,21 @@ pub struct GraphRagEngine {
     fs: Arc<dyn FsOps>,
     graph: Arc<dyn GraphStore>,
     llm: Option<Arc<dyn LlmClient>>,
+    config: GraphRagConfig,
 }
 
 impl GraphRagEngine {
-    pub fn new(fs: Arc<dyn FsOps>, graph: Arc<dyn GraphStore>) -> Self {
-        Self {
+    pub fn new(
+        fs: Arc<dyn FsOps>,
+        graph: Arc<dyn GraphStore>,
+        config: GraphRagConfig,
+    ) -> std::result::Result<Self, RetrieveConfigError> {
+        Ok(Self {
             fs,
             graph,
             llm: None,
-        }
+            config: config.validate()?,
+        })
     }
 
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
@@ -425,7 +464,12 @@ impl GraphRagEngine {
     }
 
     pub async fn build_index(&self, config: &GraphRagIndexConfig) -> Result<GraphRagIndex> {
-        let mut indexer = GraphRagIndexer::new(self.fs.clone(), self.graph.clone());
+        let mut indexer = GraphRagIndexer {
+            fs: self.fs.clone(),
+            graph: self.graph.clone(),
+            llm: None,
+            config: self.config,
+        };
         if let Some(llm) = &self.llm {
             indexer = indexer.with_llm(llm.clone());
         }
@@ -512,10 +556,9 @@ fn build_hierarchy(mut communities: Vec<GraphRagCommunity>) -> Vec<GraphRagCommu
     out
 }
 
-fn community_summary_hit(community: &GraphRagCommunity, score: f32) -> RetrievalHit {
-    RetrievalHit {
-        uri: ContextUri::parse(format!("uwu://graph-rag/community/{}", community.id))
-            .unwrap_or_else(|_| ContextUri::parse("uwu://graph-rag/community/root").unwrap()),
+fn community_summary_hit(community: &GraphRagCommunity, score: f32) -> Result<RetrievalHit> {
+    Ok(RetrievalHit {
+        uri: ContextUri::parse(format!("uwu://graph-rag/community/{}", community.id))?,
         level: ContentLevel::L1,
         content: ContentPayload::Text {
             sparse: community.summary.clone(),
@@ -528,7 +571,7 @@ fn community_summary_hit(community: &GraphRagCommunity, score: f32) -> Retrieval
         metadata: Default::default(),
         created_at: None,
         updated_at: None,
-    }
+    })
 }
 
 fn empty_text_payload() -> ContentPayload {
@@ -556,23 +599,30 @@ fn node_rank(
     uri: &ContextUri,
     adjacency: &HashMap<ContextUri, HashSet<ContextUri>>,
     centrality: &HashMap<ContextUri, f32>,
+    config: GraphRagConfig,
 ) -> f32 {
     let degree = adjacency.get(uri).map(|n| n.len()).unwrap_or(0) as f32;
-    let centrality = centrality.get(uri).copied().unwrap_or(0.5);
-    (centrality * 0.72 + (degree / 12.0).min(1.0) * 0.28).clamp(0.0, 1.0)
+    let centrality = centrality
+        .get(uri)
+        .copied()
+        .unwrap_or(config.default_centrality);
+    (centrality * config.index_centrality_weight
+        + (degree / config.degree_saturation).min(1.0) * config.degree_weight)
+        .clamp(0.0, 1.0)
 }
 
 fn average_node_rank(
     nodes: &[ContextUri],
     adjacency: &HashMap<ContextUri, HashSet<ContextUri>>,
     centrality: &HashMap<ContextUri, f32>,
+    config: GraphRagConfig,
 ) -> f32 {
     if nodes.is_empty() {
         return 0.0;
     }
     nodes
         .iter()
-        .map(|node| node_rank(node, adjacency, centrality))
+        .map(|node| node_rank(node, adjacency, centrality, config))
         .sum::<f32>()
         / nodes.len() as f32
 }
@@ -601,8 +651,11 @@ fn community_id(nodes: &[ContextUri]) -> String {
         .map(|n| n.as_str())
         .collect::<Vec<_>>()
         .join("|");
-    let hash = blake3::hash(joined.as_bytes()).to_hex().to_string();
-    hash[..12].to_string()
+    blake3::hash(joined.as_bytes())
+        .to_hex()
+        .chars()
+        .take(12)
+        .collect()
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -614,7 +667,8 @@ fn truncate(text: &str, max_chars: usize) -> String {
         .nth(max_chars)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len());
-    format!("{}...", &text[..end])
+    let prefix = text.get(..end).unwrap_or(text);
+    format!("{prefix}...")
 }
 
 #[cfg(test)]
@@ -626,6 +680,14 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn truncate_is_unicode_safe_and_handles_zero_limit() {
+        assert_eq!(truncate("你好世界", 2), "你好...");
+        assert_eq!(truncate("éclair", 1), "é...");
+        assert_eq!(truncate("坏", 0), "...");
+        assert_eq!(truncate("short", 10), "short");
+    }
 
     #[derive(Default)]
     struct MockFs {
@@ -708,7 +770,7 @@ mod tests {
             Ok(())
         }
 
-        async fn neighbors(
+        async fn outgoing_neighbors(
             &self,
             uri: &ContextUri,
             _kind: Option<GraphRelation>,
@@ -727,15 +789,14 @@ mod tests {
             &self,
             seeds: &[ContextUri],
             kinds: &[GraphRelation],
-            max_hops: usize,
+            _max_hops: usize,
         ) -> Result<Vec<(ContextUri, ContextUri, GraphRelation)>> {
             let mut out = Vec::new();
             for seed in seeds {
-                for neighbor in self.neighbors(seed, None).await? {
+                for neighbor in self.outgoing_neighbors(seed, None).await? {
                     out.push((seed.clone(), neighbor, kinds[0]));
                 }
             }
-            let _ = max_hops;
             Ok(out)
         }
 
@@ -781,10 +842,15 @@ mod tests {
             .add_edge(&b, &c, GraphRelation::EvolvedTo)
             .await
             .unwrap();
-        let engine = GraphRagEngine::new(fs, graph);
+        let engine = GraphRagEngine::new(fs, graph, GraphRagConfig::default()).unwrap();
         let result = engine
             .retrieve(
-                &GraphRagRequest::new("overall architecture evolution", vec![a]),
+                &GraphRagRequest::new(
+                    "overall architecture evolution",
+                    vec![a],
+                    GraphRagConfig::default(),
+                )
+                .unwrap(),
                 &RetrieveContext {
                     prefer_level: ContentLevel::L0,
                     ..Default::default()
@@ -811,7 +877,8 @@ mod tests {
             .add_edge(&b, &c, GraphRelation::EvolvedTo)
             .await
             .unwrap();
-        let indexer = GraphRagIndexer::new(fs.clone(), graph.clone());
+        let indexer =
+            GraphRagIndexer::new(fs.clone(), graph.clone(), GraphRagConfig::default()).unwrap();
         let index = indexer
             .build_index(&GraphRagIndexConfig {
                 seed_uris: vec![a.clone()],
@@ -825,7 +892,8 @@ mod tests {
         let result = index
             .retrieve(
                 fs,
-                &GraphRagRequest::new("architecture retrieval", vec![a]),
+                &GraphRagRequest::new("architecture retrieval", vec![a], GraphRagConfig::default())
+                    .unwrap(),
                 &RetrieveContext {
                     prefer_level: ContentLevel::L0,
                     ..Default::default()

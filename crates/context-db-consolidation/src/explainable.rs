@@ -1,8 +1,8 @@
 //! 可解释性血统 — 证据树追溯到原始 session。
 
-use agent_context_db_core::{ContentLevel, ContextUri, FsOps, Result};
+use agent_context_db_core::{ContentLevel, ContextUri, FsOps, GraphRelation, GraphStore, Result};
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 /// 证据树 — 从产物追溯到原始证据的完整链路。
 #[derive(Debug, Clone)]
@@ -36,34 +36,25 @@ pub struct EvolutionStep {
 /// 无 `fs`：仅生成占位证据链（URI-only）。
 /// 注入 `fs`：`explain_async` 会加载 L0 摘要 + 递归展开子证据。
 pub struct ExplainableLineage {
-    fs: Option<Arc<dyn FsOps>>,
+    fs: Arc<dyn FsOps>,
+    graph: Arc<dyn GraphStore>,
     max_depth: usize,
 }
 
-impl Default for ExplainableLineage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ExplainableLineage {
-    pub fn new() -> Self {
-        Self {
-            fs: None,
-            max_depth: 3,
+    pub fn new(
+        fs: Arc<dyn FsOps>,
+        graph: Arc<dyn GraphStore>,
+        max_depth: usize,
+    ) -> std::result::Result<Self, crate::ConfigError> {
+        if max_depth == 0 {
+            return Err(crate::ConfigError("max_depth must be non-zero".into()));
         }
-    }
-
-    pub fn with_fs(fs: Arc<dyn FsOps>) -> Self {
-        Self {
-            fs: Some(fs),
-            max_depth: 3,
-        }
-    }
-
-    pub fn with_max_depth(mut self, depth: usize) -> Self {
-        self.max_depth = depth;
-        self
+        Ok(Self {
+            fs,
+            graph,
+            max_depth,
+        })
     }
 
     /// 同步版：仅构造占位节点（URI-only），不加载内容。
@@ -103,15 +94,15 @@ impl ExplainableLineage {
         content: &str,
         evidence_uris: &[ContextUri],
     ) -> Result<EvidenceTree> {
-        let fs = match &self.fs {
-            Some(f) => f,
-            None => return Ok(self.explain(product_uri, content, evidence_uris)),
-        };
-
-        let mut children = Vec::with_capacity(evidence_uris.len());
-        for uri in evidence_uris {
-            let node = self.build_node(fs.as_ref(), uri, 0).await;
-            children.push(node);
+        let mut roots = evidence_uris.to_vec();
+        roots.sort_by_key(ToString::to_string);
+        roots.dedup();
+        let mut visited = HashSet::new();
+        let mut children = Vec::with_capacity(roots.len());
+        for uri in roots {
+            if visited.insert(uri.clone()) {
+                children.push(self.build_node(&uri, 0, &mut visited).await?);
+            }
         }
 
         Ok(EvidenceTree {
@@ -124,34 +115,45 @@ impl ExplainableLineage {
 
     fn build_node<'a>(
         &'a self,
-        fs: &'a dyn FsOps,
         uri: &'a ContextUri,
-        _depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = EvidenceNode> + Send + 'a>> {
+        depth: usize,
+        visited: &'a mut HashSet<ContextUri>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EvidenceNode>> + Send + 'a>>
+    {
         Box::pin(async move {
-            let (summary, timestamp) = match fs.read(uri, ContentLevel::L0).await {
-                Ok(payload) => {
-                    let text = payload.sparse_text().to_string();
-                    let trimmed = if text.len() > 240 {
-                        format!("{}…", &text[..240])
-                    } else {
-                        text
-                    };
-                    (trimmed, None)
-                }
-                Err(_) => (String::new(), None),
+            let payload = self.fs.read(uri, ContentLevel::L0).await?;
+            let summary: String = payload.sparse_text().chars().take(240).collect();
+            let summary = if payload.sparse_text().chars().count() > 240 {
+                format!("{summary}…")
+            } else {
+                summary
             };
-            let session = extract_session_id(uri);
-            // 递归 —— DerivedFrom / EvidenceOf 子引用暂不透过 FsOps 拿到，
-            // 后续可接入 GraphStore 遍历。此处仅在 depth < max_depth 时占位。
-            let children = vec![];
-            EvidenceNode {
+            let mut children = Vec::new();
+            if depth < self.max_depth {
+                let mut candidates = self
+                    .graph
+                    .outgoing_neighbors(uri, Some(GraphRelation::DerivedFrom))
+                    .await?;
+                candidates.extend(
+                    self.graph
+                        .incoming_neighbors(uri, Some(GraphRelation::EvidenceOf))
+                        .await?,
+                );
+                candidates.sort_by_key(ToString::to_string);
+                candidates.dedup();
+                for child in candidates {
+                    if visited.insert(child.clone()) {
+                        children.push(self.build_node(&child, depth + 1, visited).await?);
+                    }
+                }
+            }
+            Ok(EvidenceNode {
                 uri: uri.clone(),
                 content_summary: summary,
-                source_session: session,
-                timestamp,
+                source_session: extract_session_id(uri),
+                timestamp: None,
                 children,
-            }
+            })
         })
     }
 
@@ -179,15 +181,19 @@ impl ExplainableLineage {
             tree.root_uri, tree.root_principle
         );
         out.push_str("Evidence chain:\n");
-        for (i, node) in tree.evidence_chain.iter().enumerate() {
+        fn format_node(out: &mut String, node: &EvidenceNode, depth: usize, ordinal: usize) {
+            let indent = "  ".repeat(depth + 1);
             let src = node.source_session.as_deref().unwrap_or("-");
             out.push_str(&format!(
-                "  {}. {} [session={}] — {}\n",
-                i + 1,
-                node.uri,
-                src,
-                node.content_summary
+                "{indent}{ordinal}. {} [session={src}] — {}\n",
+                node.uri, node.content_summary
             ));
+            for (index, child) in node.children.iter().enumerate() {
+                format_node(out, child, depth + 1, index + 1);
+            }
+        }
+        for (index, node) in tree.evidence_chain.iter().enumerate() {
+            format_node(&mut out, node, 0, index + 1);
         }
         if !tree.evolution.is_empty() {
             out.push_str("\nEvolution:\n");

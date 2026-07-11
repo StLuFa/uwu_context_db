@@ -6,11 +6,7 @@
 
 use agent_context_db_core::{ContentLevel, ContentPayload, count_tokens_with_floor};
 
-use crate::RetrievalHit;
-
-const L0_FLOOR: usize = 1;
-const L1_FLOOR: usize = 50;
-const L2_FLOOR: usize = 100;
+use crate::{RetrievalHit, TokenBudgetConfig};
 
 #[derive(Debug, Clone)]
 pub struct BudgetLoadPlan {
@@ -35,19 +31,23 @@ struct Choice {
 }
 
 /// Select hits and content levels with a multiple-choice knapsack optimizer.
-pub fn load_hits_within_budget(hits: Vec<RetrievalHit>, budget: usize) -> BudgetLoadPlan {
+pub fn load_hits_within_budget(
+    hits: Vec<RetrievalHit>,
+    budget: usize,
+    config: TokenBudgetConfig,
+) -> agent_context_db_core::Result<BudgetLoadPlan> {
     if budget == 0 || hits.is_empty() {
-        return BudgetLoadPlan {
+        return Ok(BudgetLoadPlan {
             hits: Vec::new(),
             tokens_used: 0,
-        };
+        });
     }
 
     let choices_by_hit: Vec<Vec<Choice>> = hits
         .iter()
         .enumerate()
-        .map(|(idx, hit)| choices_for_hit(idx, hit, budget))
-        .collect();
+        .map(|(idx, hit)| choices_for_hit(idx, hit, budget, config))
+        .collect::<agent_context_db_core::Result<_>>()?;
 
     let selected = select_choices(&choices_by_hit, budget);
     let mut tokens_used = 0usize;
@@ -68,28 +68,32 @@ pub fn load_hits_within_budget(hits: Vec<RetrievalHit>, budget: usize) -> Budget
             .then_with(|| a.uri.to_string().cmp(&b.uri.to_string()))
     });
 
-    BudgetLoadPlan {
+    Ok(BudgetLoadPlan {
         hits: loaded,
         tokens_used,
-    }
+    })
 }
 
 /// Allocate only URI levels for callers that will load content later.
-pub fn allocate_hit_levels(hits: &[RetrievalHit], budget: usize) -> Vec<LevelAllocation> {
+pub fn allocate_hit_levels(
+    hits: &[RetrievalHit],
+    budget: usize,
+    config: TokenBudgetConfig,
+) -> agent_context_db_core::Result<Vec<LevelAllocation>> {
     let choices_by_hit: Vec<Vec<Choice>> = hits
         .iter()
         .enumerate()
-        .map(|(idx, hit)| choices_for_hit(idx, hit, budget))
-        .collect();
+        .map(|(idx, hit)| choices_for_hit(idx, hit, budget, config))
+        .collect::<agent_context_db_core::Result<_>>()?;
 
-    select_choices(&choices_by_hit, budget)
+    Ok(select_choices(&choices_by_hit, budget)
         .into_iter()
         .map(|choice| LevelAllocation {
             uri: hits[choice.hit_index].uri.clone(),
             level: choice.level,
             tokens: choice.cost,
         })
-        .collect()
+        .collect())
 }
 
 fn select_choices(choices_by_hit: &[Vec<Choice>], budget: usize) -> Vec<Choice> {
@@ -130,11 +134,16 @@ fn select_choices(choices_by_hit: &[Vec<Choice>], budget: usize) -> Vec<Choice> 
     paths.swap_remove(best_budget)
 }
 
-fn choices_for_hit(idx: usize, hit: &RetrievalHit, budget: usize) -> Vec<Choice> {
+fn choices_for_hit(
+    idx: usize,
+    hit: &RetrievalHit,
+    budget: usize,
+    config: TokenBudgetConfig,
+) -> agent_context_db_core::Result<Vec<Choice>> {
     let mut choices = Vec::new();
-    push_text_choices(&mut choices, idx, hit, budget);
+    push_text_choices(&mut choices, idx, hit, budget, config)?;
     if choices.is_empty() {
-        let cost = fallback_cost(&hit.content);
+        let cost = fallback_cost(&hit.content, config)?;
         if cost <= budget {
             choices.push(Choice {
                 hit_index: idx,
@@ -145,20 +154,26 @@ fn choices_for_hit(idx: usize, hit: &RetrievalHit, budget: usize) -> Vec<Choice>
             });
         }
     }
-    choices
+    Ok(choices)
 }
 
-fn push_text_choices(choices: &mut Vec<Choice>, idx: usize, hit: &RetrievalHit, budget: usize) {
+fn push_text_choices(
+    choices: &mut Vec<Choice>,
+    idx: usize,
+    hit: &RetrievalHit,
+    budget: usize,
+    config: TokenBudgetConfig,
+) -> agent_context_db_core::Result<()> {
     let ContentPayload::Text {
         sparse,
         dense,
         full,
     } = &hit.content
     else {
-        return;
+        return Ok(());
     };
 
-    let l0_cost = count_tokens_with_floor(sparse, L0_FLOOR);
+    let l0_cost = count_tokens_with_floor(sparse, config.l0_floor)?;
     if l0_cost <= budget {
         choices.push(Choice {
             hit_index: idx,
@@ -170,7 +185,7 @@ fn push_text_choices(choices: &mut Vec<Choice>, idx: usize, hit: &RetrievalHit, 
     }
 
     if !dense.trim().is_empty() {
-        let l1_cost = count_tokens_with_floor(dense, L1_FLOOR);
+        let l1_cost = count_tokens_with_floor(dense, config.l1_floor)?;
         if l1_cost <= budget {
             choices.push(Choice {
                 hit_index: idx,
@@ -183,7 +198,7 @@ fn push_text_choices(choices: &mut Vec<Choice>, idx: usize, hit: &RetrievalHit, 
     }
 
     if !full.trim().is_empty() {
-        let l2_cost = count_tokens_with_floor(full, L2_FLOOR);
+        let l2_cost = count_tokens_with_floor(full, config.l2_floor)?;
         if l2_cost <= budget {
             choices.push(Choice {
                 hit_index: idx,
@@ -194,6 +209,7 @@ fn push_text_choices(choices: &mut Vec<Choice>, idx: usize, hit: &RetrievalHit, 
             });
         }
     }
+    Ok(())
 }
 
 fn text_payload(sparse: &str, dense: &str, full: &str) -> ContentPayload {
@@ -204,13 +220,22 @@ fn text_payload(sparse: &str, dense: &str, full: &str) -> ContentPayload {
     }
 }
 
-fn fallback_cost(content: &ContentPayload) -> usize {
+fn fallback_cost(
+    content: &ContentPayload,
+    config: TokenBudgetConfig,
+) -> agent_context_db_core::Result<usize> {
     match content {
-        ContentPayload::Text { sparse, .. } => count_tokens_with_floor(sparse, L2_FLOOR),
-        ContentPayload::Image { .. } => L0_FLOOR,
-        ContentPayload::Audio { transcript, .. } => count_tokens_with_floor(transcript, L1_FLOOR),
-        ContentPayload::Structured { summary, .. } => count_tokens_with_floor(summary, L1_FLOOR),
-        ContentPayload::Composite { summary, .. } => count_tokens_with_floor(summary, L1_FLOOR),
+        ContentPayload::Text { sparse, .. } => count_tokens_with_floor(sparse, config.l2_floor),
+        ContentPayload::Image { .. } => Ok(config.l0_floor),
+        ContentPayload::Audio { transcript, .. } => {
+            count_tokens_with_floor(transcript, config.l1_floor)
+        }
+        ContentPayload::Structured { summary, .. } => {
+            count_tokens_with_floor(summary, config.l1_floor)
+        }
+        ContentPayload::Composite { summary, .. } => {
+            count_tokens_with_floor(summary, config.l1_floor)
+        }
     }
 }
 
@@ -271,7 +296,7 @@ mod tests {
             hit("uwu://t/agent/a/fact/c", 0.88, "gamma", "gamma", "gamma"),
         ];
 
-        let plan = load_hits_within_budget(hits, 20);
+        let plan = load_hits_within_budget(hits, 20, TokenBudgetConfig::default()).unwrap();
         assert!(plan.tokens_used <= 20);
         assert!(plan.hits.len() >= 2);
     }
@@ -285,7 +310,7 @@ mod tests {
             "alpha",
             "alpha",
         )];
-        let plan = allocate_hit_levels(&hits, 10);
+        let plan = allocate_hit_levels(&hits, 10, TokenBudgetConfig::default()).unwrap();
         assert_eq!(plan.len(), 1);
         assert!(plan[0].tokens <= 10);
     }

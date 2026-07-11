@@ -89,29 +89,32 @@ pub struct OptimizedPrompt {
     pub compressed: bool,
 }
 
-pub fn optimize_prompt(prompt: &str, optimization: &PromptOptimization) -> OptimizedPrompt {
-    let original_tokens = count_tokens(prompt);
+pub fn optimize_prompt(
+    prompt: &str,
+    optimization: &PromptOptimization,
+) -> crate::Result<OptimizedPrompt> {
+    let original_tokens = count_tokens(prompt)?;
     let target = optimization.compression_target_tokens.unwrap_or(usize::MAX);
     if optimization.compression == PromptCompressionMode::Off || original_tokens <= target {
-        return OptimizedPrompt {
+        return Ok(OptimizedPrompt {
             text: prompt.to_string(),
             original_tokens,
             optimized_tokens: original_tokens,
             compressed: false,
-        };
+        });
     }
 
-    let text = extractive_compress(prompt, target);
-    let optimized_tokens = count_tokens(&text);
-    OptimizedPrompt {
+    let text = extractive_compress(prompt, target)?;
+    let optimized_tokens = count_tokens(&text)?;
+    Ok(OptimizedPrompt {
         text,
         original_tokens,
         optimized_tokens,
         compressed: optimized_tokens < original_tokens,
-    }
+    })
 }
 
-fn extractive_compress(prompt: &str, target_tokens: usize) -> String {
+fn extractive_compress(prompt: &str, target_tokens: usize) -> crate::Result<String> {
     let mut kept = Vec::new();
     let mut used = 0usize;
     let mut seen = std::collections::HashSet::new();
@@ -135,7 +138,7 @@ fn extractive_compress(prompt: &str, target_tokens: usize) -> String {
             continue;
         }
 
-        let cost = count_tokens(trimmed).max(1);
+        let cost = count_tokens(trimmed)?.max(1);
         if used + cost > target_tokens && score < 4 {
             continue;
         }
@@ -147,14 +150,14 @@ fn extractive_compress(prompt: &str, target_tokens: usize) -> String {
         used += cost;
     }
 
-    if kept.is_empty() {
+    Ok(if kept.is_empty() {
         prompt
             .chars()
             .take(target_tokens.saturating_mul(4))
             .collect()
     } else {
         kept.join("\n")
-    }
+    })
 }
 
 fn line_score(line: &str) -> u8 {
@@ -192,23 +195,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compresses_repeated_prompt_lines() {
+    fn compresses_repeated_prompt_lines() -> crate::Result<()> {
         let prompt = format!(
             "Return JSON only\n{}\nEvidence: alpha\nEvidence: alpha\nFinal instruction",
             "low value filler line that can be dropped\n".repeat(200)
         );
-        let optimized = optimize_prompt(&prompt, &PromptOptimization::default().target_tokens(80));
+        let optimized = optimize_prompt(&prompt, &PromptOptimization::default().target_tokens(80))?;
         assert!(optimized.compressed);
         assert!(optimized.text.contains("Return JSON only"));
         assert!(optimized.text.contains("Evidence: alpha"));
         assert_eq!(optimized.text.matches("Evidence: alpha").count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn disabled_compression_returns_original() {
+    fn disabled_compression_returns_original() -> crate::Result<()> {
         let opts = PromptOptimization::default().no_compression();
-        let optimized = optimize_prompt("hello world", &opts);
+        let optimized = optimize_prompt("hello world", &opts)?;
         assert_eq!(optimized.text, "hello world");
         assert!(!optimized.compressed);
+        Ok(())
     }
 }

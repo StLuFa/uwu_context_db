@@ -39,21 +39,42 @@ pub struct SpeciationFork {
     pub lineage: LineageNode,
 }
 
-/// 社区检测器 — 基于 Agent-领域共现图的标签传播社区发现。
-pub struct CommunityDetector {
-    /// min_agents_per_community。
-    min_agents: usize,
+#[derive(Debug, Clone)]
+pub struct CommunityConfig {
+    pub min_agents: usize,
+    pub max_label_iterations: usize,
 }
 
-impl Default for CommunityDetector {
+impl Default for CommunityConfig {
     fn default() -> Self {
-        Self::new()
+        Self {
+            min_agents: 2,
+            max_label_iterations: 16,
+        }
     }
 }
 
+impl CommunityConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_agents < 2 {
+            return Err("min_agents must be at least 2".into());
+        }
+        if self.max_label_iterations == 0 {
+            return Err("max_label_iterations must be non-zero".into());
+        }
+        Ok(())
+    }
+}
+
+/// 社区检测器 — 基于 Agent-领域共现图的标签传播社区发现。
+pub struct CommunityDetector {
+    config: CommunityConfig,
+}
+
 impl CommunityDetector {
-    pub fn new() -> Self {
-        Self { min_agents: 2 }
+    pub fn new(config: CommunityConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     /// 从市场条目中检测社区。
@@ -72,7 +93,7 @@ impl CommunityDetector {
                 .insert(entry.id);
         }
 
-        if agent_domains.len() < self.min_agents {
+        if agent_domains.len() < self.config.min_agents {
             return Vec::new();
         }
 
@@ -99,7 +120,7 @@ impl CommunityDetector {
             .iter()
             .map(|agent| (agent.clone(), agent.clone()))
             .collect::<HashMap<_, _>>();
-        for _ in 0..16 {
+        for _ in 0..self.config.max_label_iterations {
             let mut changed = false;
             let mut ordered = agents.clone();
             ordered.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -143,7 +164,7 @@ impl CommunityDetector {
             .filter_map(|(label, mut members)| {
                 members.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 members.dedup();
-                if members.len() < self.min_agents {
+                if members.len() < self.config.min_agents {
                     return None;
                 }
 
@@ -262,28 +283,72 @@ fn community_internal_weight(
     weight
 }
 
+#[derive(Debug, Clone)]
+pub struct SpeciationConfig {
+    pub threshold: f32,
+    pub min_hits: usize,
+    pub quality_base_multiplier: f32,
+    pub quality_ratio_multiplier: f32,
+    pub confidence_base_multiplier: f32,
+    pub confidence_ratio_multiplier: f32,
+}
+
+impl Default for SpeciationConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 0.8,
+            min_hits: 10,
+            quality_base_multiplier: 0.92,
+            quality_ratio_multiplier: 0.08,
+            confidence_base_multiplier: 0.88,
+            confidence_ratio_multiplier: 0.10,
+        }
+    }
+}
+
+impl SpeciationConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("threshold", self.threshold),
+            ("quality_base_multiplier", self.quality_base_multiplier),
+            ("quality_ratio_multiplier", self.quality_ratio_multiplier),
+            (
+                "confidence_base_multiplier",
+                self.confidence_base_multiplier,
+            ),
+            (
+                "confidence_ratio_multiplier",
+                self.confidence_ratio_multiplier,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(format!("{name} must be finite and in [0, 1]"));
+            }
+        }
+        if self.min_hits == 0 {
+            return Err("min_hits must be non-zero".into());
+        }
+        Ok(())
+    }
+}
+
 /// 物种形成追踪器 — 检测何时需要 fork 特化版。
 pub struct SpeciationTracker {
     hit_distribution: parking_lot::RwLock<HashMap<MarketId, HashMap<AgentId, usize>>>,
     entries: parking_lot::RwLock<HashMap<MarketId, MarketEntry>>,
     forks: parking_lot::RwLock<HashMap<(MarketId, AgentId), MarketId>>,
-    speciation_threshold: f32,
-}
-
-impl Default for SpeciationTracker {
-    fn default() -> Self {
-        Self::new()
-    }
+    config: SpeciationConfig,
 }
 
 impl SpeciationTracker {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(config: SpeciationConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
             hit_distribution: parking_lot::RwLock::new(HashMap::new()),
             entries: parking_lot::RwLock::new(HashMap::new()),
             forks: parking_lot::RwLock::new(HashMap::new()),
-            speciation_threshold: 0.8,
-        }
+            config,
+        })
     }
 
     /// 注册可被物种分化的源条目。
@@ -334,8 +399,13 @@ impl SpeciationTracker {
             sanitize_domain_segment(agent.as_str())
         );
         forked.principle = format!("[specialized for {}] {}", agent, source.principle);
-        forked.quality_score = (source.quality_score * (0.92 + ratio * 0.08)).clamp(0.0, 1.0);
-        forked.confidence = (source.confidence * (0.88 + ratio * 0.10)).clamp(0.0, 1.0);
+        forked.quality_score = (source.quality_score
+            * (self.config.quality_base_multiplier + ratio * self.config.quality_ratio_multiplier))
+            .clamp(0.0, 1.0);
+        forked.confidence = (source.confidence
+            * (self.config.confidence_base_multiplier
+                + ratio * self.config.confidence_ratio_multiplier))
+            .clamp(0.0, 1.0);
         forked.created_at = chrono::Utc::now();
         forked.provenance = None;
 
@@ -368,12 +438,12 @@ impl SpeciationTracker {
         let dist = self.hit_distribution.read();
         let hits = dist.get(entry_id)?;
         let total: usize = hits.values().sum();
-        if total < 10 {
+        if total < self.config.min_hits {
             return None;
         }
         hits.iter()
             .map(|(agent, count)| (agent.clone(), *count as f32 / total as f32))
-            .filter(|(_, ratio)| *ratio >= self.speciation_threshold)
+            .filter(|(_, ratio)| *ratio >= self.config.threshold)
             .max_by(|a, b| a.1.total_cmp(&b.1))
     }
 }
@@ -419,7 +489,7 @@ mod tests {
 
     #[test]
     fn speciation_tracker_creates_derived_fork_once() {
-        let tracker = SpeciationTracker::new();
+        let tracker = SpeciationTracker::new(SpeciationConfig::default()).unwrap();
         let entry = market_entry();
         let original = entry.id;
         tracker.register_entry(entry);

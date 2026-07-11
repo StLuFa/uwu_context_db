@@ -1,7 +1,19 @@
 //! Immune Memory Protocol — 只共享攻击签名，不共享原始数据。
 
 use crate::types::*;
-use agent_context_db_core::{EventMesh, Topic};
+use agent_context_db_core::{ContextError, EventMesh, Topic};
+
+#[derive(Debug, Clone)]
+pub struct AntibodyPublication {
+    pub antibody: Antibody,
+    pub broadcast: AntibodyBroadcast,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AntibodyBroadcast {
+    Delivered,
+    NotConfigured,
+}
 
 /// 抗体 — 攻击模式的特征签名（不是原始 prompt）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -73,7 +85,7 @@ impl ImmuneProtocol {
         threat_type: ThreatType,
         severity: ThreatSeverity,
         detected_by: AgentId,
-    ) -> Antibody {
+    ) -> agent_context_db_core::Result<AntibodyPublication> {
         let antibody = Antibody {
             id: MarketId::new(),
             pattern_signature,
@@ -86,19 +98,26 @@ impl ImmuneProtocol {
 
         self.antibodies.write().push(antibody.clone());
 
-        // 广播到 EventMesh → 所有订阅 Agent 自动加载
-        if let Some(ref mesh) = self.event_mesh
-            && let Ok(payload) = serde_json::to_value(&antibody)
-        {
-            let mesh = mesh.clone();
-            if let Ok(topic) = Topic::new("immune.broadcast") {
-                tokio::spawn(async move {
-                    let _ = mesh.emit(&topic, payload).await;
-                });
-            }
-        }
+        // Security propagation is part of the observable result: never detach or hide failure.
+        let broadcast = if let Some(mesh) = &self.event_mesh {
+            let payload = serde_json::to_value(&antibody).map_err(|error| {
+                ContextError::Storage(format!("serialize immune antibody: {error}"))
+            })?;
+            let topic = Topic::new("immune.broadcast").map_err(|error| {
+                ContextError::Storage(format!("invalid immune broadcast topic: {error}"))
+            })?;
+            mesh.emit(&topic, payload).await.map_err(|error| {
+                ContextError::Storage(format!("broadcast immune antibody: {error}"))
+            })?;
+            AntibodyBroadcast::Delivered
+        } else {
+            AntibodyBroadcast::NotConfigured
+        };
 
-        antibody
+        Ok(AntibodyPublication {
+            antibody,
+            broadcast,
+        })
     }
 
     /// 加载外部抗体（从 EventMesh 收到广播时调用）。

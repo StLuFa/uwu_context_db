@@ -8,32 +8,53 @@ use crate::RetrievalHit;
 use agent_context_db_core::{ContentLevel, ContentPayload, FsOps, GraphStore, Result};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy)]
+pub struct AssociativeConfig {
+    pub max_hops: usize,
+    pub decay_factor: f32,
+    pub min_weight: f32,
+}
+
+impl Default for AssociativeConfig {
+    fn default() -> Self {
+        Self {
+            max_hops: 2,
+            decay_factor: 0.5,
+            min_weight: 0.1,
+        }
+    }
+}
+
+impl AssociativeConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.max_hops == 0 {
+            return Err("max_hops must be non-zero".into());
+        }
+        if !self.decay_factor.is_finite() || !(0.0..=1.0).contains(&self.decay_factor) {
+            return Err("decay_factor must be finite and in [0, 1]".into());
+        }
+        if !self.min_weight.is_finite() || !(0.0..=1.0).contains(&self.min_weight) {
+            return Err("min_weight must be finite and in [0, 1]".into());
+        }
+        Ok(())
+    }
+}
+
 /// 联想扩展器 —— 在向量/类型召回基础上沿联想图扩展。
 pub struct AssociativeExpander {
     fs: Arc<dyn FsOps>,
     graph: Arc<dyn GraphStore>,
-    max_hops: usize,
-    decay_factor: f32,
+    config: AssociativeConfig,
 }
 
 impl AssociativeExpander {
-    pub fn new(fs: Arc<dyn FsOps>, graph: Arc<dyn GraphStore>) -> Self {
-        Self {
-            fs,
-            graph,
-            max_hops: 2,
-            decay_factor: 0.5,
-        }
-    }
-
-    pub fn with_max_hops(mut self, hops: usize) -> Self {
-        self.max_hops = hops;
-        self
-    }
-
-    pub fn with_decay(mut self, decay: f32) -> Self {
-        self.decay_factor = decay.clamp(0.0, 1.0);
-        self
+    pub fn new(
+        fs: Arc<dyn FsOps>,
+        graph: Arc<dyn GraphStore>,
+        config: AssociativeConfig,
+    ) -> std::result::Result<Self, String> {
+        config.validate()?;
+        Ok(Self { fs, graph, config })
     }
 
     /// 对现有命中做联想扩展，返回**新增**的命中（不含种子本身）。
@@ -46,19 +67,19 @@ impl AssociativeExpander {
             base_hits.iter().map(|h| h.uri.to_string()).collect();
 
         for hit in base_hits {
-            let neighbors = match self.graph.neighbors(&hit.uri, None).await {
+            let neighbors = match self.graph.outgoing_neighbors(&hit.uri, None).await {
                 Ok(n) => n,
                 Err(_) => continue,
             };
             for (hop, neighbor_uri) in neighbors.iter().enumerate() {
-                if hop >= self.max_hops {
+                if hop >= self.config.max_hops {
                     break;
                 }
                 if !seen.insert(neighbor_uri.to_string()) {
                     continue; // 避免重复
                 }
-                let weight = self.decay_factor.powi(hop as i32);
-                if weight < 0.1 {
+                let weight = self.config.decay_factor.powi(hop as i32);
+                if weight < self.config.min_weight {
                     continue;
                 }
                 let payload = self

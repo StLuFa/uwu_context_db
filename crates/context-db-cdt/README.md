@@ -58,6 +58,8 @@ let pipeline = CognitiveTrainingPipeline::new(
     consolidation_engine,
     lifecycle_engine,
     llm_client,
+    graph_store,
+    signal_provider,
 );
 let report = pipeline.train(&TrainingConfig::default(), &trajectories).await?;
 

@@ -1,5 +1,6 @@
 //! SkillLibrary — embedding 检索 + deposit（课程驱动）。
 
+use crate::config::SkillLibraryConfig;
 use agent_context_db_core::{ContextError, ContextUri, Result, VectorIndex};
 use agent_context_db_version::ReplaySkillCandidate;
 use std::sync::Arc;
@@ -20,10 +21,16 @@ pub struct SkillLibrary {
     index: Arc<dyn VectorIndex>,
     scope: ContextUri,
     collection: String,
+    config: SkillLibraryConfig,
 }
 
 impl SkillLibrary {
-    pub fn new(index: Arc<dyn VectorIndex>, scope: ContextUri) -> Result<Self> {
+    pub fn new(
+        index: Arc<dyn VectorIndex>,
+        scope: ContextUri,
+        config: SkillLibraryConfig,
+    ) -> Result<Self> {
+        config.validate()?;
         let segments = scope.segments();
         if segments.len() < 3 || segments[1] != "agent" {
             return Err(ContextError::InvalidUri(format!(
@@ -34,8 +41,22 @@ impl SkillLibrary {
         Ok(Self {
             index,
             scope,
-            collection: format!("skills_{}", &namespace[..24]),
+            collection: format!("skills_{}", &namespace[..config.collection_hash_chars]),
+            config,
         })
+    }
+
+    fn validate_writeback(&self, success_rate: f32) -> Result<()> {
+        if success_rate.is_finite()
+            && (self.config.min_writeback_success_rate..=1.0).contains(&success_rate)
+        {
+            Ok(())
+        } else {
+            Err(ContextError::Unsupported(format!(
+                "skill success rate must be finite and within {}..=1 (got {success_rate})",
+                self.config.min_writeback_success_rate
+            )))
+        }
     }
 
     fn owns(&self, uri: &ContextUri) -> bool {
@@ -44,10 +65,15 @@ impl SkillLibrary {
     }
 
     /// 新任务时检索 top-K 相似 skill。
-    pub async fn retrieve(&self, task_embedding: &[f32], k: usize) -> Result<Vec<SkillEntry>> {
+    pub async fn retrieve(&self, task_embedding: &[f32]) -> Result<Vec<SkillEntry>> {
         let hits = self
             .index
-            .search(&self.collection, task_embedding.to_vec(), k, None)
+            .search(
+                &self.collection,
+                task_embedding.to_vec(),
+                self.config.default_retrieval_limit,
+                None,
+            )
             .await?;
         let skills = hits.into_iter()
             .filter_map(|hit| {
@@ -90,6 +116,7 @@ impl SkillLibrary {
 
     /// 执行成功后存入 skill library。
     pub async fn deposit(&self, skill: &SkillEntry) -> Result<()> {
+        self.validate_writeback(skill.success_rate)?;
         self.deposit_with_payload(
             skill.uri.clone(),
             skill.embedding.clone(),
@@ -110,6 +137,7 @@ impl SkillLibrary {
         candidate: &ReplaySkillCandidate,
         embedding: Vec<f32>,
     ) -> Result<()> {
+        self.validate_writeback(candidate.success_rate)?;
         self.deposit_with_payload(
             candidate.uri.clone(),
             embedding.clone(),
@@ -211,6 +239,7 @@ mod tests {
         let library = SkillLibrary::new(
             Arc::new(RoundTripIndex::default()),
             ContextUri::parse("uwu://tenant/agent/a").unwrap(),
+            SkillLibraryConfig::default(),
         )
         .unwrap();
         let skill = SkillEntry {
@@ -222,7 +251,7 @@ mod tests {
             embedding: vec![0.1, 0.2, 0.3],
         };
         library.deposit(&skill).await.unwrap();
-        let result = library.retrieve(&[0.1, 0.2, 0.3], 1).await.unwrap();
+        let result = library.retrieve(&[0.1, 0.2, 0.3]).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, skill.name);
         assert_eq!(result[0].description, skill.description);

@@ -5,10 +5,29 @@ use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy)]
+pub struct EntanglementConfig {
+    pub co_occurrence_threshold: f32,
+}
+
+impl EntanglementConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        crate::validate_unit_f32("co_occurrence_threshold", self.co_occurrence_threshold)
+    }
+}
+
+impl Default for EntanglementConfig {
+    fn default() -> Self {
+        Self {
+            co_occurrence_threshold: 0.3,
+        }
+    }
+}
+
 /// 纠缠检测器 — Sleeptime 阶段分析 patch 共现。
 pub struct EntanglementDetector {
     entanglements: parking_lot::RwLock<HashMap<String, Vec<Entanglement>>>,
-    co_occurrence_threshold: f32,
+    config: EntanglementConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +49,15 @@ pub struct CascadeInvalidationConfig {
     pub max_nodes: usize,
     pub min_co_occurrence: f32,
     pub graph_expansion: bool,
+}
+
+impl CascadeInvalidationConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.max_depth == 0 || self.max_nodes == 0 {
+            return Err(crate::ConfigError("cascade limits must be nonzero".into()));
+        }
+        crate::validate_unit_f32("min_co_occurrence", self.min_co_occurrence)
+    }
 }
 
 impl Default for CascadeInvalidationConfig {
@@ -70,11 +98,12 @@ pub struct CascadeInvalidator {
 }
 
 impl EntanglementDetector {
-    pub fn new(threshold: f32) -> Self {
-        Self {
+    pub fn new(config: EntanglementConfig) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self {
             entanglements: parking_lot::RwLock::new(HashMap::new()),
-            co_occurrence_threshold: threshold,
-        }
+            config,
+        })
     }
 
     /// 记录一次 patch 共现。
@@ -110,7 +139,7 @@ impl EntanglementDetector {
 
     /// 检测 A 的所有纠缠伙伴（共现率 > 阈值）。
     pub fn get_entangled(&self, uri: &ContextUri) -> Vec<ContextUri> {
-        self.entanglements_for(uri, self.co_occurrence_threshold)
+        self.entanglements_for(uri, self.config.co_occurrence_threshold)
             .into_iter()
             .map(|e| e.partner_uri)
             .collect()
@@ -143,21 +172,20 @@ impl EntanglementDetector {
 }
 
 impl CascadeInvalidator {
-    pub fn new(detector: Arc<EntanglementDetector>) -> Self {
-        Self {
+    pub fn new(
+        detector: Arc<EntanglementDetector>,
+        config: CascadeInvalidationConfig,
+    ) -> Result<Self, crate::ConfigError> {
+        config.validate()?;
+        Ok(Self {
             detector,
             graph: None,
-            config: CascadeInvalidationConfig::default(),
-        }
+            config,
+        })
     }
 
     pub fn with_graph(mut self, graph: Arc<dyn GraphStore>) -> Self {
         self.graph = Some(graph);
-        self
-    }
-
-    pub fn with_config(mut self, config: CascadeInvalidationConfig) -> Self {
-        self.config = config;
         self
     }
 
@@ -298,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn cascade_follows_entanglement_with_depth_limit() {
-        let detector = Arc::new(EntanglementDetector::new(0.3));
+        let detector = Arc::new(EntanglementDetector::new(EntanglementConfig::default()).unwrap());
         let a = uri("a");
         let b = uri("b");
         let c = uri("c");
@@ -306,13 +334,16 @@ mod tests {
             detector.record_co_patch(&a, &b);
             detector.record_co_patch(&b, &c);
         }
-        let invalidator =
-            CascadeInvalidator::new(detector).with_config(CascadeInvalidationConfig {
+        let invalidator = CascadeInvalidator::new(
+            detector,
+            CascadeInvalidationConfig {
                 max_depth: 1,
                 max_nodes: 16,
                 min_co_occurrence: 0.3,
                 graph_expansion: false,
-            });
+            },
+        )
+        .unwrap();
 
         let plan = invalidator.plan_from_invalidated(&a).await;
 
@@ -323,19 +354,22 @@ mod tests {
 
     #[tokio::test]
     async fn cascade_applies_invalidation_and_revalidation_tags() {
-        let detector = Arc::new(EntanglementDetector::new(0.3));
+        let detector = Arc::new(EntanglementDetector::new(EntanglementConfig::default()).unwrap());
         let a = uri("a");
         let b = uri("b");
         for _ in 0..8 {
             detector.record_co_patch(&a, &b);
         }
-        let invalidator =
-            CascadeInvalidator::new(detector).with_config(CascadeInvalidationConfig {
+        let invalidator = CascadeInvalidator::new(
+            detector,
+            CascadeInvalidationConfig {
                 max_depth: 2,
                 max_nodes: 16,
                 min_co_occurrence: 0.3,
                 graph_expansion: false,
-            });
+            },
+        )
+        .unwrap();
         let mut entry = ContextEntry::new_text(b.clone(), TenantId(Uuid::nil()), "dependent fact");
         entry.metadata.content_type = Some(ContentType::Fact);
         entry.metadata.state_scope = Some(StateScope::Long);

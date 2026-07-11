@@ -54,9 +54,16 @@ impl ContextRetriever {
         index: Option<Arc<dyn VectorIndex>>,
         planner: Arc<dyn QueryPlanner>,
         reranker: Arc<dyn Reranker>,
+<<<<<<< Updated upstream
     ) -> Self {
         let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
         Self {
+=======
+    ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        let config = crate::QueryPlanConfig::default();
+        let stats = Arc::new(StatisticsCollector::new(config)?);
+        Ok(Self {
+>>>>>>> Stashed changes
             fs,
             content: None,
             index,
@@ -68,9 +75,13 @@ impl ContextRetriever {
             reranker,
             retrieval_learner: None,
             intent_analyzer: None,
+<<<<<<< Updated upstream
             optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
+=======
+            optimizer: CboOptimizer::new(stats, config)?,
+>>>>>>> Stashed changes
             plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        }
+        })
     }
 
     /// 注入完整内容端口，让 WQL 条件、排序和 prefix scan 使用真实条目元数据。
@@ -423,8 +434,18 @@ impl QueryPlanner for RuleBasedPlanner {
     }
 
     async fn plan(&self, logical: &LogicalPlan) -> Result<PhysicalPlan> {
+<<<<<<< Updated upstream
         let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
         let optimizer = CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap();
+=======
+        let config = crate::QueryPlanConfig::default();
+        let stats = Arc::new(
+            StatisticsCollector::new(config)
+                .map_err(|error| ContextError::Unsupported(error.to_string()))?,
+        );
+        let optimizer = CboOptimizer::new(stats, config)
+            .map_err(|error| ContextError::Unsupported(error.to_string()))?;
+>>>>>>> Stashed changes
         Ok(optimizer.optimize(logical))
     }
 }
@@ -512,20 +533,20 @@ impl ContextRetrieverBuilder {
         self
     }
 
-    pub fn build(self) -> ContextRetriever {
+    pub fn build(self) -> std::result::Result<ContextRetriever, crate::RetrieveConfigError> {
         let planner = self
             .planner
             .unwrap_or_else(|| Arc::new(RuleBasedPlanner::new("default", "default")));
         let reranker = self
             .reranker
             .unwrap_or_else(|| Arc::new(crate::ScoreReranker { keep: 20 }));
-        let mut r = ContextRetriever::new(self.fs, self.index, planner, reranker);
+        let mut r = ContextRetriever::new(self.fs, self.index, planner, reranker)?;
         r.content = self.content;
         r.graph = self.graph;
         r.associative_enabled = self.associative_enabled;
         r.graph_rag_llm = self.graph_rag_llm;
         r.graph_rag_index = self.graph_rag_index;
         r.retrieval_learner = self.retrieval_learner;
-        r
+        Ok(r)
     }
 }

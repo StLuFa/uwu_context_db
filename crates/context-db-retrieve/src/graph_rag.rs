@@ -133,12 +133,19 @@ impl GraphRagIndex {
                     relevance: (score * self.config.hit_community_weight
                         + self.node_score(&node) * self.config.hit_node_weight)
                         .clamp(self.config.min_hit_relevance, 1.0),
+<<<<<<< Updated upstream
                     parent_chain: vec![
                         ContextUri::parse(format!("uwu://graph-rag/community/{}", community.id))
                             .unwrap_or_else(|_| {
                                 ContextUri::parse("uwu://graph-rag/community/root").unwrap()
                             }),
                     ],
+=======
+                    parent_chain: vec![ContextUri::parse(format!(
+                        "uwu://graph-rag/community/{}",
+                        community.id
+                    ))?],
+>>>>>>> Stashed changes
                     content_type: None,
                     metadata: Default::default(),
                     created_at: None,

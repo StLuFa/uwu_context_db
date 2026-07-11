@@ -275,10 +275,14 @@ mod tests {
     impl LlmClient for MockLlm {
         async fn complete(
             &self,
-            _: &str,
+            prompt: &str,
             _: &LlmOpts,
         ) -> std::result::Result<String, agent_context_db_core::LlmError> {
-            Ok(r#"{"did_what": "deployed app", "how": "used docker compose", "result": "deployment succeeded"}"#.into())
+            if prompt.contains("induce a reusable experience") {
+                Ok(r#"{"situation": "deploying an application", "approach": "use docker compose", "reflect": "verify service health after deployment"}"#.into())
+            } else {
+                Ok(r#"{"did_what": "deployed app", "how": "used docker compose", "result": "deployment succeeded"}"#.into())
+            }
         }
         async fn embed(
             &self,

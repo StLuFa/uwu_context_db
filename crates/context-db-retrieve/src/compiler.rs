@@ -11,7 +11,7 @@
 //!
 //! ## 用法
 //! ```ignore
-//! let compiler = RetrieverCompiler::new(planner);
+//! let compiler = RetrieverCompiler::new(planner)?;
 //! let plan = compiler.compile_text("给我所有 fact", &ctx)?;
 //! let plan2 = compiler.compile_query(&Query::Find { .. }, &ctx)?;
 //! let batch = plan.execute(&exec_ctx).await?;
@@ -67,20 +67,37 @@ pub struct RetrieverCompiler {
 }
 
 impl RetrieverCompiler {
+<<<<<<< Updated upstream
     pub fn new(planner: Arc<dyn QueryPlanner>) -> Self {
         let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
         Self {
             planner,
             optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
         }
+=======
+    pub fn new(
+        planner: Arc<dyn QueryPlanner>,
+    ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        let config = crate::QueryPlanConfig::default();
+        let stats = Arc::new(StatisticsCollector::new(config)?);
+        Self::with_stats(planner, stats)
+>>>>>>> Stashed changes
     }
 
     /// 使用外部统计信息构建（用于 CBO 代价估算更准确）。
-    pub fn with_stats(planner: Arc<dyn QueryPlanner>, stats: Arc<StatisticsCollector>) -> Self {
-        Self {
+    pub fn with_stats(
+        planner: Arc<dyn QueryPlanner>,
+        stats: Arc<StatisticsCollector>,
+    ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        Ok(Self {
             planner,
+<<<<<<< Updated upstream
             optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
         }
+=======
+            optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default())?,
+        })
+>>>>>>> Stashed changes
     }
 
     /// 编译自然语言查询 → CompiledPlan（异步，需 LLM/规则解析）。
@@ -189,13 +206,13 @@ impl CompiledRetriever {
         planner: Arc<dyn QueryPlanner>,
         exec_ctx: ExecContext,
         reranker: Arc<dyn crate::Reranker>,
-    ) -> Self {
-        Self {
-            compiler: RetrieverCompiler::new(planner),
+    ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        Ok(Self {
+            compiler: RetrieverCompiler::new(planner)?,
             executor: PlanExecutor::new(exec_ctx),
             reranker,
             plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        }
+        })
     }
 
     /// 自然语言查询（带计划缓存）。
@@ -423,9 +440,10 @@ mod tests {
     use agent_context_db_core::ContentType;
 
     #[test]
-    fn compile_query_produces_physical_plan() {
+    fn compile_query_produces_physical_plan() -> std::result::Result<(), crate::RetrieveConfigError>
+    {
         let planner: Arc<dyn QueryPlanner> = Arc::new(RuleBasedPlanner::new("t", "a"));
-        let compiler = RetrieverCompiler::new(planner);
+        let compiler = RetrieverCompiler::new(planner)?;
         let ctx = RetrieveContext::default();
         let query = Query::Find {
             scope: None,
@@ -438,6 +456,7 @@ mod tests {
         // 谓词下推：执行树内部应该包含 TypeScan。
         assert!(contains_type_scan(&plan.physical));
         assert!(plan.estimated_cost > 0.0);
+        Ok(())
     }
 
     fn contains_type_scan(plan: &PhysicalPlan) -> bool {
@@ -457,9 +476,9 @@ mod tests {
     }
 
     #[test]
-    fn explain_is_non_empty() {
+    fn explain_is_non_empty() -> std::result::Result<(), crate::RetrieveConfigError> {
         let planner: Arc<dyn QueryPlanner> = Arc::new(RuleBasedPlanner::new("t", "a"));
-        let compiler = RetrieverCompiler::new(planner);
+        let compiler = RetrieverCompiler::new(planner)?;
         let ctx = RetrieveContext::default();
         let query = Query::Find {
             scope: None,
@@ -472,5 +491,6 @@ mod tests {
         let explain = plan.explain();
         assert!(explain.contains("LogicalPlan"));
         assert!(explain.contains("PhysicalPlan"));
+        Ok(())
     }
 }

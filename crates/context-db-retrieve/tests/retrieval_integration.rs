@@ -28,13 +28,16 @@ fn entry(uri_str: &str, abstract_: &str, content_type: ContentType) -> ContextEn
 
 fn retriever(store: Arc<MemoryContextStore>) -> ContextRetriever {
     let fs: Arc<dyn FsOps> = store;
+    let intent_analyzer = RuleBasedIntentAnalyzer::new("t1", "a1")
+        .unwrap_or_else(|error| panic!("default intent policy must compile: {error}"));
     ContextRetriever::new(
         fs,
         None,
         Arc::new(RuleBasedPlanner::new("t1", "a1")),
         Arc::new(ScoreReranker { keep: 10 }),
     )
-    .with_intent_analyzer(Arc::new(RuleBasedIntentAnalyzer::new("t1", "a1")))
+    .unwrap_or_else(|error| panic!("default query plan config must validate: {error}"))
+    .with_intent_analyzer(Arc::new(intent_analyzer))
 }
 
 /// 构建一个包含多种记忆的 MemoryContextStore。

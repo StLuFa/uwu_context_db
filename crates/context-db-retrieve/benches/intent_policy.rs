@@ -14,7 +14,8 @@ fn bench_compile_default_policy(c: &mut Criterion) {
 }
 
 fn bench_decide_default_policy(c: &mut Criterion) {
-    let analyzer = RuleBasedIntentAnalyzer::new("u1", "a1");
+    let analyzer = RuleBasedIntentAnalyzer::new("u1", "a1")
+        .unwrap_or_else(|error| panic!("default intent policy must compile: {error}"));
     let ctx = RetrieveContext {
         user_id: Some("u1".into()),
         agent_id: Some("a1".into()),
@@ -34,7 +35,9 @@ fn bench_reload_layered_provider(c: &mut Criterion) {
     let provider = Arc::new(LayeredIntentPolicyProvider::new(vec![Arc::new(
         BuiltinIntentPolicyProvider,
     )]));
-    let analyzer = RuleBasedIntentAnalyzer::new("u1", "a1").with_policy_provider(provider);
+    let analyzer = RuleBasedIntentAnalyzer::new("u1", "a1")
+        .unwrap_or_else(|error| panic!("default intent policy must compile: {error}"))
+        .with_policy_provider(provider);
     c.bench_function("intent_reload_layered_provider", |b| {
         b.iter(|| analyzer.reload_from_provider());
     });

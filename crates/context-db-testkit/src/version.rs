@@ -1019,7 +1019,11 @@ impl VersionStore for MemoryVersionStore {
     async fn impact_analysis(&self, commit: &CommitId) -> Result<ImpactAnalysis> {
         let commits = self.commits.lock();
         let mut recent = commits.iter().collect::<Vec<_>>();
+<<<<<<< Updated upstream
         recent.sort_by(|(_, left), (_, right)| right.timestamp.cmp(&left.timestamp));
+=======
+        recent.sort_by_key(|(_, commit)| std::cmp::Reverse(commit.timestamp));
+>>>>>>> Stashed changes
         let mut downstream = Vec::new();
         let target = commit.clone();
         for (cid, candidate) in recent.into_iter().take(self.analysis_config.max_commits) {

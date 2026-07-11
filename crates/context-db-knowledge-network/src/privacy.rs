@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use rand::rngs::OsRng;
-use rand_distr::{Distribution, Normal};
+use rand_distr::{Distribution, StandardNormal};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -398,8 +398,8 @@ impl SamplingDpMechanism {
         if sigma <= 0.0 || !sigma.is_finite() {
             return 0.0;
         }
-        let normal = Normal::new(0.0, sigma as f64).expect("positive finite sigma");
-        normal.sample(&mut OsRng) as f32
+        let standard: f64 = StandardNormal.sample(&mut OsRng);
+        (standard * f64::from(sigma)) as f32
     }
 
     fn laplace_noise(scale: f32) -> f32 {

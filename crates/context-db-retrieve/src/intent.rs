@@ -1145,11 +1145,17 @@ pub struct RuleBasedIntentAnalyzer {
 }
 
 impl RuleBasedIntentAnalyzer {
-    pub fn new(default_user_id: impl Into<String>, default_agent_id: impl Into<String>) -> Self {
-        let pack = IntentPolicyPack::default_builtin().expect("builtin intent policy must parse");
-        let compiled =
-            CompiledIntentPolicy::compile(pack).expect("builtin intent policy must compile");
-        Self::with_compiled(default_user_id, default_agent_id, compiled)
+    pub fn new(
+        default_user_id: impl Into<String>,
+        default_agent_id: impl Into<String>,
+    ) -> Result<Self> {
+        let pack = IntentPolicyPack::default_builtin()?;
+        let compiled = CompiledIntentPolicy::compile(pack)?;
+        Ok(Self::with_compiled(
+            default_user_id,
+            default_agent_id,
+            compiled,
+        ))
     }
 
     pub fn from_policy_pack(
@@ -1537,14 +1543,16 @@ mod tests {
 
     #[tokio::test]
     async fn event_query_routes_to_event_recall() {
-        let ia = RuleBasedIntentAnalyzer::new("u1", "a1");
+        let ia =
+            RuleBasedIntentAnalyzer::new("u1", "a1").expect("default intent policy must compile");
         let decision = ia.decide("when did that migration happen?", &ctx());
         assert_eq!(decision.primary, IntentKind::EventRecall);
     }
 
     #[tokio::test]
     async fn pattern_query_gets_pattern_match() {
-        let ia = RuleBasedIntentAnalyzer::new("u1", "a1");
+        let ia =
+            RuleBasedIntentAnalyzer::new("u1", "a1").expect("default intent policy must compile");
         let decision = ia.decide("rust async patterns", &ctx());
         assert!(
             decision
@@ -1556,7 +1564,8 @@ mod tests {
 
     #[tokio::test]
     async fn preference_query_falls_back_to_semantic() {
-        let ia = RuleBasedIntentAnalyzer::new("u1", "a1");
+        let ia =
+            RuleBasedIntentAnalyzer::new("u1", "a1").expect("default intent policy must compile");
         let decision = ia.decide("what does the user like?", &ctx());
         assert_eq!(decision.primary, IntentKind::SemanticSearch);
     }
@@ -1583,7 +1592,8 @@ mod tests {
 
     #[test]
     fn decision_contains_execution_graph() {
-        let ia = RuleBasedIntentAnalyzer::new("u1", "a1");
+        let ia =
+            RuleBasedIntentAnalyzer::new("u1", "a1").expect("default intent policy must compile");
         let decision = ia.decide("who owns the project?", &ctx());
         assert_eq!(decision.primary, IntentKind::EntityLookup);
         assert_eq!(decision.policy.id, "context-db.default.intent");
@@ -1653,8 +1663,9 @@ mod tests {
             }
         }
 
-        let ia =
-            RuleBasedIntentAnalyzer::new("u1", "a1").with_policy_provider(Arc::new(BadProvider));
+        let ia = RuleBasedIntentAnalyzer::new("u1", "a1")
+            .expect("default intent policy must compile")
+            .with_policy_provider(Arc::new(BadProvider));
         let before = ia.active_policy();
         let report = ia.reload_from_provider();
         assert!(matches!(
@@ -1666,7 +1677,8 @@ mod tests {
 
     #[test]
     fn feedback_bias_changes_candidate_breakdown() {
-        let ia = RuleBasedIntentAnalyzer::new("u1", "a1");
+        let ia =
+            RuleBasedIntentAnalyzer::new("u1", "a1").expect("default intent policy must compile");
         ia.record_feedback(IntentFeedbackEvent {
             query: "pattern".into(),
             predicted: IntentKind::PatternMatch,
@@ -1710,6 +1722,7 @@ mod tests {
             }),
         };
         let ia = RuleBasedIntentAnalyzer::new("u1", "a1")
+            .expect("default intent policy must compile")
             .with_policy_provider(Arc::new(SignedProvider(layer)))
             .with_signature_verifier(verifier);
         let report = ia.reload_from_provider();

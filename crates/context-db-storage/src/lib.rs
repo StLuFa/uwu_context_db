@@ -4,7 +4,7 @@
 //! - [`SqliteContextStore`]：默认嵌入式内容后端。
 //! - [`PgContextStore`]：可选 PostgreSQL 内容后端。
 //! - [`UwuVectorIndex`]：将 `uwu_database::VectorStore` 适配为 core 的 `VectorIndex`；默认由 Qdrant Edge 提供。
-//! - [`ContextDbService`]：composition root，唯一同时持有内容层与索引层的地方。
+//! - [`StorageAssemblyParts`]：供应用层 composition root 消费的装配结果。
 //! - `IndexPoint` / `IndexHit` / `VectorIndex` 从 `agent_context_db_core` re-export。
 //!
 //! ## 解耦约束
@@ -189,8 +189,7 @@ impl ContentRepo for SqlContextStore {
 // 装配根：唯一持有内容层 + 索引层的地方
 // ===========================================================================
 
-/// Composition root。内容层用任意 `ContextStore`（PG 或 Memory），
-/// 索引层用 `VectorIndex`。上层拿到的是它暴露的窄端口克隆。
+/// Child-crate storage service retained as a stable compatibility API.
 pub struct ContextDbService<S> {
     content: Arc<S>,
     index: Arc<dyn VectorIndex>,
@@ -201,9 +200,8 @@ pub struct ContextDbService<S> {
 
 impl<S> ContextDbService<S>
 where
-    S: agent_context_db_core::FsOps + agent_context_db_core::ContentRepo + 'static,
+    S: FsOps + ContentRepo + 'static,
 {
-    /// 通用构造器：注入任意实现了 ContextStore 的内容层 + VectorIndex。
     pub fn new(
         content: Arc<S>,
         index: Arc<dyn VectorIndex>,
@@ -218,31 +216,18 @@ where
             _outbox_runtime: None,
         }
     }
-
-    fn with_outbox_runtime(mut self, runtime: outbox::OutboxRuntime) -> Self {
-        self._outbox_runtime = Some(Arc::new(runtime));
-        self
-    }
-
-    /// 交出内容层的只读寻址窄端口（供检索层使用）。
     pub fn fs_ops(&self) -> Arc<S> {
         self.content.clone()
     }
-
-    /// 交出内容层的写端口。
     pub fn content_repo(&self) -> Arc<S> {
         self.content.clone()
     }
-
-    /// 交出索引层端口。
     pub fn vector_index(&self) -> Arc<dyn VectorIndex> {
         self.index.clone()
     }
-
     pub fn version_store(&self) -> Arc<dyn agent_context_db_version::VersionStore> {
         self.version.clone()
     }
-
     pub fn interactive_version_store(
         &self,
     ) -> Arc<dyn agent_context_db_version::InteractiveVersionStore> {
@@ -250,11 +235,7 @@ where
     }
 }
 
-impl<S> ContextDbService<S>
-where
-    S: WatchSource + 'static,
-{
-    /// 交出 CDC/watch 端口。
+impl<S: WatchSource + 'static> ContextDbService<S> {
     pub fn watch_source(&self) -> Arc<S> {
         self.content.clone()
     }
@@ -272,6 +253,17 @@ impl<S> Clone for ContextDbService<S> {
     }
 }
 
+/// Concrete storage assembly consumed by the root application facade.
+///
+/// Policy, tenant and deadline enforcement remain owned by `agent-context-db`.
+pub struct StorageAssemblyParts<S> {
+    pub content: Arc<S>,
+    pub index: Arc<dyn VectorIndex>,
+    pub version: Arc<dyn agent_context_db_version::VersionStore>,
+    pub interactive_version: Arc<dyn agent_context_db_version::InteractiveVersionStore>,
+    pub runtime_guard: Option<Arc<outbox::OutboxRuntime>>,
+}
+
 // ===========================================================================
 // uwu_database 便捷构造器
 // ===========================================================================
@@ -280,7 +272,7 @@ impl<S> Clone for ContextDbService<S> {
 ///
 /// SQLite 与 PostgreSQL 都在这里选择并迁移；向量后端必须由调用方通过
 /// `Database::connect_with_vector` 初始化，避免配置错误时静默降级为无索引。
-pub async fn service_from_uwu_db(
+pub async fn assemble_uwu_database(
     db: uwu_database::Database,
     acl: Arc<PathAcl>,
     principal: Principal,
@@ -288,7 +280,9 @@ pub async fn service_from_uwu_db(
     centrality_config: GraphCentralityConfig,
     version_analysis_config: agent_context_db_version::VersionAnalysisConfig,
 ) -> Result<
-    ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>>,
+    StorageAssemblyParts<
+        WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>,
+    >,
 > {
     let pool = Arc::new(db.pool.clone());
     let (store, version, interactive_version): (
@@ -358,10 +352,42 @@ pub async fn service_from_uwu_db(
     })?;
     let index: Arc<dyn VectorIndex> = Arc::new(UwuVectorIndex::new(vector));
     let runtime = outbox::start_worker(pool, index.clone(), outbox::OutboxConfig::default());
-    Ok(
-        ContextDbService::new(content, index, version, interactive_version)
-            .with_outbox_runtime(runtime),
+    Ok(StorageAssemblyParts {
+        content,
+        index,
+        version,
+        interactive_version,
+        runtime_guard: Some(Arc::new(runtime)),
+    })
+}
+
+/// Backwards-compatible constructor returning the child storage service.
+pub async fn service_from_uwu_db(
+    db: uwu_database::Database,
+    acl: Arc<PathAcl>,
+    principal: Principal,
+    contradiction_detector: Arc<dyn agent_context_db_version::ContradictionDetector>,
+    centrality_config: GraphCentralityConfig,
+    version_analysis_config: agent_context_db_version::VersionAnalysisConfig,
+) -> Result<
+    ContextDbService<WatchableStore<SemanticWriteDedupStore<AclProtectedStore<SqlContextStore>>>>,
+> {
+    let parts = assemble_uwu_database(
+        db,
+        acl,
+        principal,
+        contradiction_detector,
+        centrality_config,
+        version_analysis_config,
     )
+    .await?;
+    Ok(ContextDbService {
+        content: parts.content,
+        index: parts.index,
+        version: parts.version,
+        interactive_version: parts.interactive_version,
+        _outbox_runtime: parts.runtime_guard,
+    })
 }
 
 pub(crate) fn max_connections(
@@ -433,7 +459,7 @@ pub fn default_runtime_config() -> Result<uwu_database::RuntimeConfig> {
     runtime_config(&agent_context_db_core::config::StorageConfig::default())
 }
 
-/// Connect and assemble the default embedded database in one call.
+/// Connect and assemble the default embedded storage service.
 pub async fn default_embedded_service(
     acl: Arc<PathAcl>,
     principal: Principal,
@@ -444,7 +470,9 @@ pub async fn default_embedded_service(
     let config = default_runtime_config()?;
     let db = uwu_database::Database::connect_with_vector(&config)
         .await
-        .map_err(|e| ContextError::Storage(format!("connect embedded database failed: {e}")))?;
+        .map_err(|error| {
+            ContextError::Storage(format!("connect embedded database failed: {error}"))
+        })?;
     service_from_uwu_db(
         db,
         acl,
@@ -515,7 +543,7 @@ mod config_tests {
 }
 
 // ===========================================================================
-// PG 集成测试（service_from_uwu_db 全链路）
+// PG 集成测试（assemble_uwu_database 全链路）
 // ===========================================================================
 
 #[cfg(test)]
@@ -593,7 +621,7 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    async fn test_service_from_uwu_db_assembles() {
+    async fn test_assemble_uwu_database_assembles() {
         let Some(url) = pg_url() else { return };
         let cfg = test_cfg(url);
         let db = Database::connect_with_vector(&cfg).await.unwrap();
@@ -619,13 +647,13 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    async fn test_service_from_uwu_db_migration_idempotent() {
+    async fn test_assemble_uwu_database_migration_idempotent() {
         let Some(url) = pg_url() else { return };
         let cfg = test_cfg(url);
 
         // 第一次：创建表
         let db1 = Database::connect_with_vector(&cfg).await.unwrap();
-        let svc1 = service_from_uwu_db(
+        let svc1 = assemble_uwu_database(
             db1,
             full_acl(),
             test_principal(),

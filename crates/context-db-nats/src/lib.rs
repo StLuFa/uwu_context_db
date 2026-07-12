@@ -611,15 +611,18 @@ pub async fn run_nats_env_probe(
 fn validated_endpoint(raw: &str, schemes: &[&str]) -> Result<(String, String), NatsBridgeError> {
     let parsed = url::Url::parse(raw)
         .map_err(|_| NatsBridgeError::ProbeConfiguration("endpoint is not a valid URL".into()))?;
-    if !schemes.contains(&parsed.scheme()) || parsed.host_str().is_none() {
+    if !schemes.contains(&parsed.scheme()) {
         return Err(NatsBridgeError::ProbeConfiguration(
-            "endpoint scheme or host is invalid".into(),
+            "endpoint scheme is invalid".into(),
         ));
     }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| NatsBridgeError::ProbeConfiguration("endpoint host is missing".into()))?;
     let canonical = format!(
         "{}://{}:{}",
         parsed.scheme(),
-        parsed.host_str().unwrap(),
+        host,
         parsed.port_or_known_default().unwrap_or(0)
     );
     let fingerprint = blake3::hash(canonical.as_bytes()).to_hex().to_string();

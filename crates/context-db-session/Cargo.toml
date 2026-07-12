@@ -7,14 +7,14 @@ description = "agent-context-db L4 会话层：两阶段 commit SessionCompresso
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
 agent-context-db-parse = { path = "../context-db-parse" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-parking_lot = "0.12"
-zstd = "0.13"
-base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4", "v5", "serde"] }
+chrono.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+zstd.workspace = true
+base64.workspace = true
 
 [features]
 default = []

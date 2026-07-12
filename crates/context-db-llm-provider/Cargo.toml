@@ -6,13 +6,13 @@ description = "HTTP LLM providers for agent-context-db: OpenAI, Anthropic, and O
 
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
-async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "1"
-url = "2"
-base64 = "0.22"
+async-trait.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }

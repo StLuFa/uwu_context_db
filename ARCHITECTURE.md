@@ -32,7 +32,9 @@
 
 ## crate 清单
 
-workspace 内 15 个 crate，全部命名 `agent-context-db-*`（目录 `crates/context-db-*/`）。
+根包 `agent-context-db` 是推荐的应用门面，同时保留由领域 crate 组成的 workspace。领域 crate 是有意公开的低层 API，直接依赖它们的调用方需自行承担租户、策略、审计和资源边界；workspace 无法也不声称强制所有调用都经过根门面。根 `ContextDb` 是 cheap-clone、不可变的 composition root；其所有操作显式接收 canonical tenant identity、actor、request、deadline/cancellation 绑定的 `RequestContext`，不使用全局可变租户。通过根门面执行时，内部端口不会泄漏，租户校验、绝对 deadline、ExecutionGate、生命周期路由、审计和 reaction 由门面统一执行。可选能力未配置时返回 `NotConfigured`。
+
+workspace 领域 crate 全部命名 `agent-context-db-*`（目录 `crates/context-db-*/`）。
 
 | crate | 职责 |
 |-------|------|
@@ -42,7 +44,7 @@ workspace 内 15 个 crate，全部命名 `agent-context-db-*`（目录 `crates/
 | `context-db-session` | 两阶段 commit 会话压缩 |
 | `context-db-parse` | SemanticProcessor + 内容哈希/子摘要指纹增量缓存 + MemoryExtractor(ContentType 分类) + TrajectoryExtractor(两层归纳) |
 | `context-db-compressor` | tokio mpsc 进程内异步语义处理队列 |
-| `context-db-storage` | Pg/SQLite ContextStore + VersionStore（Git 风格差量 + L1 内存 + L2 checkpoint 三级快照缓存 + 可选持久化 version_conflict_sessions）+ 事务索引 outbox + UwuVectorIndex + UwuCacheAdapter + ContextDbService（ACL → 写入前语义去重 → WatchableStore 主路径） |
+| `context-db-storage` | Pg/SQLite ContextStore + VersionStore（Git 风格差量 + L1 内存 + L2 checkpoint 三级快照缓存 + 可选持久化 version_conflict_sessions）+ 事务索引 outbox + UwuVectorIndex + UwuCacheAdapter；仅通过 `StorageAssemblyParts` 向根应用装配层交付端口与 runtime guard，不再拥有应用 service |
 | `context-db-wiki` | wiki-core → context-db 存储桥接（WikiVectorStoreAdapter） |
 | `context-db-testkit` | MemoryContextStore + MemoryVersionStore |
 | `context-db-nats` | EventSystem 装配壳：EventMesh + NatsBridge(按事件类型路由 Main/Consolidation/Monitoring) + NatsIngestor 跨进程事件桥接 |

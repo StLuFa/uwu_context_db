@@ -6,13 +6,13 @@ description = "agent-context-db L5 解析层：SemanticProcessor + MemoryExtract
 
 [dependencies]
 agent-context-db-core = { path = "../context-db-core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-blake3 = "1"
-moka = { version = "0.12", features = ["future"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+moka.workspace = true
 
 [features]
 default = []

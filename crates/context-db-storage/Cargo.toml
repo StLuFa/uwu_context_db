@@ -8,9 +8,7 @@ description = "agent-context-db L7 存储层：SQLite/PostgreSQL 内容适配器
 agent-context-db-core = { path = "../context-db-core" }
 agent-context-db-version = { path = "../context-db-version" }
 uwu_database = {
-    git = "https://github.com/StLuFa/uwu_database.git",
-    rev = "ce2fad2",
-    default-features = false,
+    workspace = true,
     features = [
         "postgres",
         "sqlite",

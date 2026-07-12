@@ -1,3 +1,10 @@
+[package]
+name = "agent-context-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tenant-safe application facade for agent context-db"
+
 [workspace]
 members = [
     "crates/context-db-core",
@@ -25,21 +32,68 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+aho-corasick = "1"
+anyhow = "1"
+arc-swap = "1"
+async-trait = "0.1"
+base64 = "0.22"
+blake3 = "1"
+cel-interpreter = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+criterion = "0.5"
+ed25519-dalek = "2"
+fs2 = "0.4"
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+metrics = "0.24"
+moka = { version = "0.12", features = ["future"] }
+parking_lot = "0.12"
+proptest = "1"
+rand = "0.8"
+rand_distr = "0.4"
+regex = "1"
+reqwest = "0.12"
+rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
+sha2 = "0.10"
+smallvec = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls"] }
 thiserror = "1"
-parking_lot = "0.12"
-tokio = { version = "1", features = ["rt", "macros"] }
-# uwu 生态依赖：本地 rev 与 uwu_nats_bridge 内部依赖的 uwu_event_mesh 会被 cargo
-# 视为不同 source（重复实例 → 类型不兼容 E0308）。上游未 pin 之前，我们只固定
-# uwu_visual_script（无传递依赖冲突），其余依赖 Cargo.lock 保证可重现构建。
+tiktoken-rs = "0.6"
+tokio = "1"
+toml = "0.8"
+tracing = "0.1"
+url = "2"
+uuid = "1"
+wasmtime = "37.0.2"
+wat = "1"
+zstd = "0.13"
+# Keep ecosystem crates on canonical remote git sources. Cargo.lock pins revisions.
+uwu-crdt = { git = "https://github.com/StLuFa/uwu-crdt.git" }
+uwu_database = { git = "https://github.com/StLuFa/uwu_database.git", rev = "ce2fad2", default-features = false }
 uwu_event_mesh = { git = "https://github.com/StLuFa/uwu_event_mesh.git" }
 uwu_nats_bridge = { git = "https://github.com/StLuFa/uwu_nats_bridge.git" }
 uwu_visual_script = { git = "https://github.com/StLuFa/uwu_visual_script.git", rev = "25e021618297f8a5453c7a649ed4d5b226cac35e" }
-uwu-crdt = { git = "https://github.com/StLuFa/uwu-crdt.git" }
 uwu_wasm = { git = "https://github.com/StLuFa/uwu_wasm.git" }
-cel-interpreter = "0.9"
-arc-swap = "1"
+wiki-core = { git = "https://github.com/StLuFa/uwu_wiki.git" }
+
+[dependencies]
+agent-context-db-core = { path = "crates/context-db-core" }
+agent-context-db-retrieve = { path = "crates/context-db-retrieve" }
+agent-context-db-version = { path = "crates/context-db-version" }
+agent-context-db-storage = { path = "crates/context-db-storage" }
+agent-context-db-consolidation = { path = "crates/context-db-consolidation" }
+agent-context-db-wasm = { path = "crates/context-db-wasm" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+agent-context-db-testkit = { path = "crates/context-db-testkit" }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }

@@ -5,24 +5,24 @@ edition = "2024"
 description = "agent-context-db 内核：uwu:// URI + 核心类型 + FsOps/ContentRepo/VersionOps/TenantOps 窄端口（零实现，无 uwu 依赖）"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-thiserror = "1"
-parking_lot = "0.12"
-tokio = { version = "1", features = ["sync"] }
-moka = { version = "0.12", features = ["future"] }
-metrics = "0.23"
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
+chrono.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+moka.workspace = true
+metrics.workspace = true
 metrics-exporter-prometheus = "0.15"
-arc-swap = { workspace = true }
-blake3 = "1"
-tiktoken-rs = "0.6"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-base64 = "0.22"
+arc-swap.workspace = true
+blake3.workspace = true
+tiktoken-rs.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+base64.workspace = true
 redis = { version = "0.25", features = ["aio", "tokio-comp", "streams"], optional = true }
-rmp-serde = { version = "1", optional = true }
+rmp-serde = { workspace = true, optional = true }
 uwu_event_mesh = { workspace = true }
 
 [dev-dependencies]

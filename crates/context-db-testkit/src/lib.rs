@@ -30,6 +30,7 @@ pub struct MemoryContextStore {
     l2_blobs: Mutex<HashMap<String, Vec<u8>>>,
     // from uri -> typed outgoing edges
     graph_edges: Mutex<HashMap<String, Vec<(String, GraphRelation)>>>,
+    graph_revisions: Mutex<HashMap<String, u64>>,
 }
 
 impl MemoryContextStore {
@@ -77,17 +78,30 @@ impl GraphStore for MemoryContextStore {
         to: &ContextUri,
         kind: GraphRelation,
     ) -> Result<()> {
-        self.graph_edges
-            .lock()
-            .entry(from.to_string())
-            .or_default()
-            .push((to.to_string(), kind));
+        let mut edges = self.graph_edges.lock();
+        let list = edges.entry(from.to_string()).or_default();
+        if !list.iter().any(|edge| edge == &(to.to_string(), kind)) {
+            list.push((to.to_string(), kind));
+            *self
+                .graph_revisions
+                .lock()
+                .entry(from.tenant().to_owned())
+                .or_default() += 1;
+        }
         Ok(())
     }
 
     async fn remove_edge(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
         if let Some(edges) = self.graph_edges.lock().get_mut(&from.to_string()) {
+            let before = edges.len();
             edges.retain(|(target, _)| target != &to.to_string());
+            if edges.len() != before {
+                *self
+                    .graph_revisions
+                    .lock()
+                    .entry(from.tenant().to_owned())
+                    .or_default() += 1;
+            }
         }
         Ok(())
     }
@@ -172,6 +186,14 @@ impl GraphStore for MemoryContextStore {
             .filter(|(target, _)| target == &uri.to_string())
             .count();
         Ok(((out_degree + in_degree) as f32 / 16.0).min(1.0))
+    }
+
+    async fn graph_revision(&self, scope: &ContextUri) -> Result<u64> {
+        Ok(*self
+            .graph_revisions
+            .lock()
+            .get(scope.tenant())
+            .unwrap_or(&0))
     }
 }
 

@@ -804,7 +804,7 @@ impl IntentTraceSink for EventMeshIntentTraceSink {
         let mesh = self.mesh.clone();
         tokio::spawn(async move {
             if let Err(error) = mesh.publish(env).await {
-                tracing::error!(%error, "intent trace EventMesh publish failed");
+                tracing::error!(error = ?agent_context_db_core::ErrorReport::from_error(&error), "intent trace EventMesh publish failed");
             }
         });
         IntentTraceDiagnostic::Accepted

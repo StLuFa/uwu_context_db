@@ -17,3 +17,8 @@ tracing = "0.1"
 chrono = { workspace = true }
 ed25519-dalek = "2"
 hex = "0.4"
+futures = "0.3"
+blake3 = "1"
+uuid = { workspace = true }
+url = "2"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono"] }

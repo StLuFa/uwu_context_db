@@ -10,7 +10,7 @@
 //! - **TTL 抖动**：调用方（如 `MemoryReadCache`）已在传入 TTL 前抖动；本层直接透传。
 
 use agent_context_db_core::read_cache::ReadCache;
-use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri};
+use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, ErrorReport};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,7 +56,7 @@ impl ReadCache for UwuCacheAdapter {
             Ok(Some(data)) => data,
             Ok(None) => return None,
             Err(error) => {
-                tracing::warn!(%error, %key, "read cache get failed");
+                tracing::warn!(error = ?ErrorReport::from_error(&error), "read cache get failed");
                 return None;
             }
         };
@@ -66,7 +66,7 @@ impl ReadCache for UwuCacheAdapter {
         match serde_json::from_slice(&data) {
             Ok(payload) => Some(Some(payload)),
             Err(error) => {
-                tracing::warn!(%error, %key, "read cache payload is corrupt; treating as miss");
+                tracing::warn!(error = ?ErrorReport::from_error(&error), "read cache payload is corrupt; treating as miss");
                 None
             }
         }
@@ -84,10 +84,12 @@ impl ReadCache for UwuCacheAdapter {
         match serde_json::to_vec(&payload) {
             Ok(data) => {
                 if let Err(error) = self.inner.set(&key, &data, Some(effective)).await {
-                    tracing::warn!(%error, %key, "read cache put failed");
+                    tracing::warn!(error = ?ErrorReport::from_error(&error), "read cache put failed");
                 }
             }
-            Err(error) => tracing::warn!(%error, %key, "read cache serialization failed"),
+            Err(error) => {
+                tracing::warn!(error = ?ErrorReport::from_error(&error), "read cache serialization failed")
+            }
         }
     }
 
@@ -98,7 +100,7 @@ impl ReadCache for UwuCacheAdapter {
             .set(&key, NEG_MARKER, Some(self.negative_ttl))
             .await
         {
-            tracing::warn!(%error, %key, "negative cache put failed");
+            tracing::warn!(error = ?ErrorReport::from_error(&error), "negative cache put failed");
         }
     }
 
@@ -106,7 +108,7 @@ impl ReadCache for UwuCacheAdapter {
         for level in [ContentLevel::L0, ContentLevel::L1, ContentLevel::L2] {
             let key = self.key(uri, level);
             if let Err(error) = self.inner.del(&key).await {
-                tracing::warn!(%error, %key, "read cache invalidation failed");
+                tracing::warn!(error = ?ErrorReport::from_error(&error), "read cache invalidation failed");
             }
         }
     }

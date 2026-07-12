@@ -236,6 +236,11 @@ pub trait GraphStore: Send + Sync {
         max_hops: usize,
     ) -> Result<Vec<(ContextUri, ContextUri, GraphRelation)>>;
     async fn centrality(&self, uri: &ContextUri) -> Result<f32>;
+    /// Monotonically increasing revision of the graph containing `scope`.
+    /// Stateless graph adapters may use revision zero; persistent mutable stores override this.
+    async fn graph_revision(&self, _scope: &ContextUri) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 /// 图关系类型。

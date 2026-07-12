@@ -1,8 +1,8 @@
 //! 性能优化层：P1 查询编译器 + P2 向量分层 + P3 量化压缩 + P4 流水线并行 + P6 物化视图 + P9 分区并行。
 
 use agent_context_db_core::{
-    ContextUri, EmbeddingCache, FsOps, LlmClient, LlmOpts, MemoryEmbeddingCache, Result,
-    VectorIndex, embedding_content_hash,
+    ContextUri, EmbeddingCache, EmbeddingSpaceId, EncodedEmbedding, FsOps, LlmClient, LlmOpts,
+    MemoryEmbeddingCache, Result, VectorIndex, embedding_content_hash,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -343,21 +343,28 @@ fn squared_euclidean(a: &[f32], b: &[f32]) -> f32 {
 pub struct ParallelGenerator {
     llm: Arc<dyn LlmClient>,
     max_concurrency: usize,
+    embedding_space: EmbeddingSpaceId,
     embed_cache: Arc<dyn EmbeddingCache>,
     embed_cache_ttl: Duration,
 }
 
 impl ParallelGenerator {
-    pub fn new(llm: Arc<dyn LlmClient>, max: usize) -> Self {
-        Self {
+    pub fn new(
+        llm: Arc<dyn LlmClient>,
+        max: usize,
+        embedding_space: EmbeddingSpaceId,
+    ) -> Result<Self> {
+        embedding_space.validate()?;
+        Ok(Self {
             llm,
             max_concurrency: max,
+            embedding_space,
             embed_cache: Arc::new(MemoryEmbeddingCache::new(
                 10_000,
                 Duration::from_secs(86_400),
             )),
             embed_cache_ttl: Duration::from_secs(86_400),
-        }
+        })
     }
 
     pub fn with_embedding_cache(mut self, cache: Arc<dyn EmbeddingCache>) -> Self {
@@ -415,9 +422,13 @@ impl ParallelGenerator {
         let mut missing_index_by_hash = HashMap::new();
 
         for (idx, text) in texts.iter().enumerate() {
-            let hash = embedding_content_hash(text);
-            if let Some(embedding) = self.embed_cache.get(&hash).await {
-                results[idx] = Some(embedding);
+            let hash = embedding_content_hash(&self.embedding_space, text.as_bytes());
+            if let Some(embedding) = self
+                .embed_cache
+                .get(&self.embedding_space, text.as_bytes())
+                .await
+            {
+                results[idx] = Some(embedding.values);
             } else if let Some(first_missing_idx) = missing_index_by_hash.get(&hash).copied() {
                 missing_hashes.push((idx, hash, first_missing_idx));
             } else {
@@ -438,12 +449,18 @@ impl ParallelGenerator {
                 )));
             }
 
-            for (idx, hash, first_missing_idx) in missing_hashes {
-                let embedding = loaded[first_missing_idx].vector.clone();
+            for (idx, _hash, first_missing_idx) in missing_hashes {
+                let vector = loaded[first_missing_idx].vector.clone();
+                let embedding =
+                    EncodedEmbedding::new(self.embedding_space.clone(), vector.clone())?;
                 self.embed_cache
-                    .put(&hash, embedding.clone(), self.embed_cache_ttl)
+                    .put(
+                        missing_texts[first_missing_idx].as_bytes(),
+                        embedding,
+                        self.embed_cache_ttl,
+                    )
                     .await;
-                results[idx] = Some(embedding);
+                results[idx] = Some(vector);
             }
         }
 
@@ -643,7 +660,18 @@ mod tests {
     #[tokio::test]
     async fn batch_embed_deduplicates_same_batch_by_content_hash() {
         let llm = Arc::new(CountingLlm::new());
-        let generator = ParallelGenerator::new(llm.clone(), 4);
+        let generator = ParallelGenerator::new(
+            llm.clone(),
+            4,
+            EmbeddingSpaceId {
+                model: "test-model".into(),
+                checkpoint: "v1".into(),
+                preprocess: "text-v1".into(),
+                dim: 1,
+                normalization: agent_context_db_core::EmbeddingNormalization::None,
+            },
+        )
+        .unwrap();
         let texts = vec!["alpha".to_string(), "alpha".to_string(), "beta".to_string()];
 
         let embeddings = generator.batch_embed(&texts).await.unwrap();
@@ -655,7 +683,18 @@ mod tests {
     #[tokio::test]
     async fn batch_embed_reuses_cached_embedding_across_batches() {
         let llm = Arc::new(CountingLlm::new());
-        let generator = ParallelGenerator::new(llm.clone(), 4);
+        let generator = ParallelGenerator::new(
+            llm.clone(),
+            4,
+            EmbeddingSpaceId {
+                model: "test-model".into(),
+                checkpoint: "v1".into(),
+                preprocess: "text-v1".into(),
+                dim: 1,
+                normalization: agent_context_db_core::EmbeddingNormalization::None,
+            },
+        )
+        .unwrap();
         let texts = vec!["alpha".to_string(), "beta".to_string()];
 
         let first = generator.batch_embed(&texts).await.unwrap();

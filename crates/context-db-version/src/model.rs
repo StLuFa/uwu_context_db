@@ -536,16 +536,7 @@ pub enum CorrectionType {
 
 /// 知识图谱合并策略。
 pub enum KnowledgeMergeStrategy {
-    EntityAutoMerge,
-    GraphMerge { edge_policy: EdgePolicy },
     ContradictionDetection { threshold: f32 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EdgePolicy {
-    AutoMerge,
-    RequireConsensus,
-    ManualOnly,
 }
 
 /// 冲突解决器 trait。

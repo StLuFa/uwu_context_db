@@ -75,10 +75,11 @@ impl SkillLibrary {
                 None,
             )
             .await?;
-        let skills = hits.into_iter()
+        let skills = hits
+            .into_iter()
             .filter_map(|hit| {
                 if !self.owns(&hit.uri) {
-                    tracing::warn!(uri = %hit.uri, scope = %self.scope, "cross-namespace skill ignored");
+                    tracing::warn!("cross-namespace skill ignored");
                     return None;
                 }
                 let payload = hit.payload.as_object()?;

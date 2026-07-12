@@ -281,7 +281,7 @@ impl SqliteVersionStore {
         };
         let key = Self::snapshot_cache_key(id);
         if let Err(error) = cache.set(&key, &bytes, self.cache_ttl).await {
-            tracing::warn!(operation = "snapshot_cache_put", %key, %error, "best-effort snapshot cache operation failed");
+            tracing::warn!(operation = "snapshot_cache_put", key = tracing::field::Empty, error = ?agent_context_db_core::ErrorReport::from_error(&error), "best-effort snapshot cache operation failed");
         }
     }
 
@@ -292,7 +292,7 @@ impl SqliteVersionStore {
         };
         let key = Self::snapshot_cache_key(id);
         if let Err(error) = cache.del(&key).await {
-            tracing::warn!(operation = "snapshot_cache_delete", %key, %error, "best-effort snapshot cache operation failed");
+            tracing::warn!(operation = "snapshot_cache_delete", key = tracing::field::Empty, error = ?agent_context_db_core::ErrorReport::from_error(&error), "best-effort snapshot cache operation failed");
         }
     }
 
@@ -325,7 +325,7 @@ impl SqliteVersionStore {
         .execute(self.sqlite())
         .await
         {
-            tracing::warn!(operation = "checkpoint_touch", key = %id.0, %error, "best-effort checkpoint heat update failed");
+            tracing::warn!(operation = "checkpoint_touch", key = tracing::field::Empty, error = ?agent_context_db_core::ErrorReport::from_error(&error), "best-effort checkpoint heat update failed");
         }
     }
 
@@ -402,7 +402,7 @@ impl SqliteVersionStore {
         .execute(self.sqlite())
         .await
         {
-            tracing::warn!(operation = "checkpoint_prune", key = "version_commit_checkpoints", %error, "best-effort checkpoint pruning failed");
+            tracing::warn!(operation = "checkpoint_prune", error = ?agent_context_db_core::ErrorReport::from_error(&error), "best-effort checkpoint pruning failed");
         }
     }
 
@@ -1082,7 +1082,7 @@ fn branch_type_str(bt: BranchType) -> &'static str {
 impl VersionStore for SqliteVersionStore {
     // ---- Commit -----------------------------------------------------------
 
-    #[tracing::instrument(skip(self, changes, meta), fields(scope = %scope, adds = changes.adds.len(), updates = changes.updates.len(), deletes = changes.deletes.len()))]
+    #[tracing::instrument(skip(self, changes, meta), fields(scope = tracing::field::Empty, adds = changes.adds.len(), updates = changes.updates.len(), deletes = changes.deletes.len()))]
     async fn commit(
         &self,
         scope: &ContextUri,
@@ -1476,7 +1476,7 @@ impl VersionStore for SqliteVersionStore {
 
     // ---- 合并 / Diff ---------------------------------------------------------
 
-    #[tracing::instrument(skip(self), fields(scope = %scope, from = %from, into = %into, strategy = ?strategy))]
+    #[tracing::instrument(skip(self, from, into), fields(scope = tracing::field::Empty, from = tracing::field::Empty, into = tracing::field::Empty, strategy = ?strategy))]
     async fn merge(
         &self,
         scope: &ContextUri,
@@ -1639,7 +1639,7 @@ impl VersionStore for SqliteVersionStore {
 
     // ---- 历史改写 ------------------------------------------------------------
 
-    #[tracing::instrument(skip(self), fields(scope = %scope, commit = %commit.0, onto = %onto, strategy = ?strategy))]
+    #[tracing::instrument(skip(self, commit, onto), fields(scope = tracing::field::Empty, commit = tracing::field::Empty, onto = tracing::field::Empty, strategy = ?strategy))]
     async fn cherry_pick(
         &self,
         scope: &ContextUri,
@@ -1657,7 +1657,7 @@ impl VersionStore for SqliteVersionStore {
             .await
     }
 
-    #[tracing::instrument(skip(self), fields(scope = %scope, branch = %branch, onto = %onto, strategy = ?strategy))]
+    #[tracing::instrument(skip(self, branch, onto), fields(scope = tracing::field::Empty, branch = tracing::field::Empty, onto = tracing::field::Empty, strategy = ?strategy))]
     async fn rebase(
         &self,
         scope: &ContextUri,
@@ -1814,7 +1814,7 @@ impl VersionStore for SqliteVersionStore {
 
     // ---- GC / 语义标签 -------------------------------------------------------
 
-    #[tracing::instrument(skip(self, policy), fields(scope = %scope))]
+    #[tracing::instrument(skip(self, policy), fields(scope = tracing::field::Empty))]
     async fn gc(&self, scope: &ContextUri, policy: &GcPolicy) -> Result<GcReport> {
         let scope_key = Self::scope_key(scope);
         let cutoff = Utc::now() - chrono::Duration::days(policy.max_age_days);
@@ -1911,12 +1911,16 @@ impl VersionStore for SqliteVersionStore {
             match Program::compile(&expr) {
                 Ok(prog) => match TagName::parse(&name) {
                     Ok(name) => compiled.push((name, prog)),
-                    Err(e) => tracing::warn!(
-                        "evaluate_semantic_tags: skip invalid persisted tag {name}: {e}"
+                    Err(error) => tracing::warn!(
+                        error = ?agent_context_db_core::ErrorReport::from_error(&error),
+                        "evaluate_semantic_tags skipped invalid persisted tag"
                     ),
                 },
-                Err(e) => {
-                    tracing::warn!("evaluate_semantic_tags: skip tag {name} — invalid CEL: {e}");
+                Err(error) => {
+                    tracing::warn!(
+                        error = ?agent_context_db_core::ErrorReport::from_error(&error),
+                        "evaluate_semantic_tags skipped invalid CEL"
+                    );
                 }
             }
         }
@@ -1960,18 +1964,19 @@ impl VersionStore for SqliteVersionStore {
 
             for (tag_name, program) in &compiled {
                 let mut ctx = CelCtx::default();
-                if ctx.add_variable("commit", commit_json.clone()).is_err() {
-                    continue;
-                }
-                match program.execute(&ctx) {
-                    Ok(v) => {
-                        if matches!(v, cel_interpreter::Value::Bool(true)) {
-                            matched.push((tag_name.clone(), CommitId(id)));
-                        }
-                    }
-                    Err(_) => {
-                        // 求值失败（类型错误等）—— 静默跳过
-                    }
+                ctx.add_variable("commit", commit_json.clone())
+                    .map_err(|error| {
+                        VersionError::Storage(format!(
+                            "semantic tag {tag_name} context setup failed for commit {id}: {error}"
+                        ))
+                    })?;
+                let value = program.execute(&ctx).map_err(|error| {
+                    VersionError::Storage(format!(
+                        "semantic tag {tag_name} CEL evaluation failed for commit {id}: {error}"
+                    ))
+                })?;
+                if matches!(value, cel_interpreter::Value::Bool(true)) {
+                    matched.push((tag_name.clone(), CommitId(id)));
                 }
             }
         }
@@ -2202,9 +2207,6 @@ impl VersionStore for SqliteVersionStore {
                     )
                 })?;
                 detect_snapshot_contradictions(detector, &from_snap, &into_snap, threshold).await?
-            }
-            KnowledgeMergeStrategy::EntityAutoMerge | KnowledgeMergeStrategy::GraphMerge { .. } => {
-                Vec::new()
             }
         };
 

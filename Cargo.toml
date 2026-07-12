@@ -15,6 +15,7 @@ members = [
     "crates/context-db-knowledge-network",
     "crates/context-db-nats",
     "crates/context-db-llm-provider",
+    "crates/context-db-wasm",
 ]
 resolver = "3"
 
@@ -39,5 +40,6 @@ uwu_event_mesh = { git = "https://github.com/StLuFa/uwu_event_mesh.git" }
 uwu_nats_bridge = { git = "https://github.com/StLuFa/uwu_nats_bridge.git" }
 uwu_visual_script = { git = "https://github.com/StLuFa/uwu_visual_script.git", rev = "25e021618297f8a5453c7a649ed4d5b226cac35e" }
 uwu-crdt = { git = "https://github.com/StLuFa/uwu-crdt.git" }
+uwu_wasm = { git = "https://github.com/StLuFa/uwu_wasm.git" }
 cel-interpreter = "0.9"
 arc-swap = "1"

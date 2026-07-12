@@ -13,12 +13,14 @@ use agent_context_db_core::{
 };
 use async_trait::async_trait;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 use uwu_database::DbPool;
 
-use crate::graph::{GraphCentralityConfig, pagerank_score};
+use crate::graph::{
+    BatchWriteConfig, GraphCentralityConfig, incremental_pagerank_scores, pagerank_scores,
+};
 use crate::outbox::{
     IndexMutation, collection_from_entry, enqueue_sqlite, point_from_entry, upsert_mutation,
 };
@@ -28,6 +30,7 @@ pub struct SqliteContextStore {
     pool: SqlitePool,
     read_cache: Option<Arc<dyn agent_context_db_core::ReadCache>>,
     centrality_config: GraphCentralityConfig,
+    batch_config: BatchWriteConfig,
 }
 
 impl SqliteContextStore {
@@ -42,6 +45,7 @@ impl SqliteContextStore {
             pool,
             read_cache: None,
             centrality_config,
+            batch_config: BatchWriteConfig::default(),
         })
     }
 
@@ -50,12 +54,17 @@ impl SqliteContextStore {
         self
     }
 
+    pub fn with_batch_config(mut self, config: BatchWriteConfig) -> Self {
+        self.batch_config = config;
+        self
+    }
+
     fn sqlite_pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    fn storage_err(op: &str, error: impl std::fmt::Display) -> ContextError {
-        tracing::error!(op, error = %error, "sqlite storage operation failed");
+    fn storage_err(op: &str, error: impl std::error::Error + 'static) -> ContextError {
+        tracing::error!(op, error = ?agent_context_db_core::ErrorReport::from_error(&error), "sqlite storage operation failed");
         ContextError::Storage(format!("{op} failed: {error}"))
     }
 
@@ -72,6 +81,39 @@ impl SqliteContextStore {
 
     fn prefix_pattern(prefix: &str) -> String {
         format!("{}%", Self::escape_like(prefix))
+    }
+
+    /// Translate the public glob syntax to a SQL LIKE pattern while preserving literal LIKE
+    /// metacharacters. `*` and `?` are the only glob metacharacters supported by FindPattern.
+    fn glob_pattern(glob: &str) -> String {
+        let mut pattern = String::with_capacity(glob.len());
+        for ch in glob.chars() {
+            match ch {
+                '*' => pattern.push('%'),
+                '?' => pattern.push('_'),
+                '\\' | '%' | '_' => {
+                    pattern.push('\\');
+                    pattern.push(ch);
+                }
+                _ => pattern.push(ch),
+            }
+        }
+        pattern
+    }
+
+    fn version_to_sql(version: MvccVersion) -> Result<i64> {
+        i64::try_from(version.0).map_err(|_| {
+            ContextError::VersionConflict(format!(
+                "version {} exceeds the SQLite INTEGER range",
+                version.0
+            ))
+        })
+    }
+
+    fn version_from_sql(version: i64) -> Result<MvccVersion> {
+        u64::try_from(version).map(MvccVersion).map_err(|_| {
+            ContextError::Storage(format!("invalid negative SQLite version {version}"))
+        })
     }
 
     async fn write_in_tx(
@@ -130,7 +172,8 @@ impl SqliteContextStore {
         .await
         .map_err(|e| Self::storage_err("write entry", e))?;
 
-        entry.mvcc_version = MvccVersion(mvcc as u64);
+        let version = Self::version_from_sql(mvcc)?;
+        entry.mvcc_version = version;
         let entry_json = serde_json::to_string(&entry)?;
         sqlx::query("UPDATE context_entries SET entry_json = ? WHERE uri = ?")
             .bind(&entry_json)
@@ -151,7 +194,22 @@ impl SqliteContextStore {
         .await
         .map_err(|e| Self::storage_err("write version", e))?;
 
-        Ok(MvccVersion(mvcc as u64))
+        Ok(version)
+    }
+
+    async fn bump_graph_revision(
+        tx: &mut Transaction<'_, Sqlite>,
+        scope: &str,
+        operation: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<u64> {
+        let revision: i64 = sqlx::query_scalar("INSERT INTO context_graph_revisions(scope, revision) VALUES (?, 1) ON CONFLICT(scope) DO UPDATE SET revision=revision+1 RETURNING revision")
+            .bind(scope).fetch_one(&mut **tx).await.map_err(|e| Self::storage_err("bump graph revision", e))?;
+        sqlx::query("INSERT INTO context_graph_mutations(scope, revision, operation, from_uri, to_uri, created_at) VALUES (?,?,?,?,?,?)")
+            .bind(scope).bind(revision).bind(operation).bind(from).bind(to).bind(chrono::Utc::now().to_rfc3339())
+            .execute(&mut **tx).await.map_err(|e| Self::storage_err("log graph mutation", e))?;
+        u64::try_from(revision).map_err(|_| ContextError::Storage("negative graph revision".into()))
     }
 
     async fn load_entry(&self, uri: &ContextUri) -> Result<ContextEntry> {
@@ -213,6 +271,8 @@ pub async fn migrate_sqlite(pool: &DbPool) -> Result<()> {
         r#"CREATE TABLE IF NOT EXISTS context_index_outbox (
             id TEXT PRIMARY KEY,
             mutation_json TEXT NOT NULL,
+            uri TEXT,
+            mvcc_version INTEGER,
             status TEXT NOT NULL CHECK (status IN ('pending','processing','done','failed','dead')),
             attempts INTEGER NOT NULL DEFAULT 0,
             available_at TEXT NOT NULL,
@@ -223,6 +283,9 @@ pub async fn migrate_sqlite(pool: &DbPool) -> Result<()> {
             finished_at TEXT
         )"#,
         "CREATE INDEX IF NOT EXISTS idx_context_index_outbox_ready ON context_index_outbox (status, available_at, created_at)",
+        r#"CREATE TABLE IF NOT EXISTS context_graph_revisions (scope TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision >= 0))"#,
+        r#"CREATE TABLE IF NOT EXISTS context_graph_mutations (scope TEXT NOT NULL, revision INTEGER NOT NULL, operation TEXT NOT NULL, from_uri TEXT, to_uri TEXT, created_at TEXT NOT NULL, PRIMARY KEY(scope, revision))"#,
+        r#"CREATE TABLE IF NOT EXISTS context_graph_centrality (scope TEXT NOT NULL, revision INTEGER NOT NULL, algorithm_config TEXT NOT NULL, uri TEXT NOT NULL, score REAL NOT NULL, PRIMARY KEY(scope, revision, algorithm_config, uri))"#,
         r#"CREATE TABLE IF NOT EXISTS context_blobs (
             content_hash TEXT PRIMARY KEY,
             data BLOB NOT NULL,
@@ -312,12 +375,18 @@ impl ContentRepo for SqliteContextStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::storage_err("delete versions", e))?;
-        sqlx::query("DELETE FROM context_relations WHERE from_uri = ? OR to_uri = ?")
-            .bind(uri.to_string())
-            .bind(uri.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::storage_err("delete relations", e))?;
+        let graph_changed =
+            sqlx::query("DELETE FROM context_relations WHERE from_uri = ? OR to_uri = ?")
+                .bind(uri.to_string())
+                .bind(uri.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::storage_err("delete relations", e))?
+                .rows_affected();
+        if graph_changed > 0 {
+            Self::bump_graph_revision(&mut tx, uri.tenant(), "delete", Some(uri.as_str()), None)
+                .await?;
+        }
         tx.commit()
             .await
             .map_err(|e| Self::storage_err("commit delete", e))?;
@@ -395,6 +464,7 @@ impl ContentRepo for SqliteContextStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::storage_err("remove renamed relations", e))?;
+        let graph_changed = !relations.is_empty();
         for (edge_from, edge_to, kind, created_at) in relations {
             sqlx::query("INSERT OR IGNORE INTO context_relations (from_uri, to_uri, relation_kind, created_at) VALUES (?, ?, ?, ?)")
                 .bind(if edge_from == from.as_str() { to.as_str() } else { &edge_from })
@@ -404,6 +474,16 @@ impl ContentRepo for SqliteContextStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Self::storage_err("restore renamed relation", e))?;
+        }
+        if graph_changed {
+            Self::bump_graph_revision(
+                &mut tx,
+                from.tenant(),
+                "rename",
+                Some(from.as_str()),
+                Some(to.as_str()),
+            )
+            .await?;
         }
         enqueue_sqlite(
             &mut tx,
@@ -434,12 +514,55 @@ impl ContentRepo for SqliteContextStore {
             .await
             .map_err(|e| Self::storage_err("begin batch write", e))?;
         let mut versions = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let version = Self::write_in_tx(&mut tx, entry).await?;
-            if let Some(mutation) = upsert_mutation(entry, version)? {
-                enqueue_sqlite(&mut tx, &mutation).await?;
+        for chunk in self.batch_config.chunks(entries)? {
+            let uris = chunk
+                .iter()
+                .map(|entry| entry.uri.to_string())
+                .collect::<Vec<_>>();
+            let placeholders = std::iter::repeat_n("?", uris.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let version_sql = format!(
+                "SELECT uri, mvcc_version FROM context_entries WHERE uri IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&version_sql);
+            for uri in &uris {
+                query = query.bind(uri);
             }
-            versions.push(version);
+            let base_versions = query
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| Self::storage_err("read batch versions", e))?
+                .into_iter()
+                .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+                .collect::<std::result::Result<HashMap<String, i64>, sqlx::Error>>()
+                .map_err(|e| Self::storage_err("decode batch versions", e))?;
+            let (rows, chunk_versions) = crate::graph::prepare_batch_chunk(chunk, &base_versions)?;
+            let json = serde_json::to_string(&rows)?;
+            sqlx::query(r#"
+                WITH input AS (
+                    SELECT * FROM json_each(?) AS j
+                ), rows AS (
+                    SELECT json_extract(value,'$.uri') uri, json_extract(value,'$.tenant_id') tenant_id,
+                           json_extract(value,'$.l0') l0, json_extract(value,'$.l1') l1,
+                           json_extract(value,'$.l2') l2, json_extract(value,'$.content_type') content_type,
+                           json_extract(value,'$.state_scope') state_scope, json_extract(value,'$.tags') tags,
+                           json_extract(value,'$.custom') custom, json_extract(value,'$.entry') entry,
+                           json_extract(value,'$.version') version, json_extract(value,'$.created_at') created_at,
+                           json_extract(value,'$.updated_at') updated_at
+                    FROM input WHERE json_extract(value,'$.is_current')
+                )
+                INSERT INTO context_entries (uri,tenant_id,l0_abstract,l1_overview,l2_full_text,content_type,state_scope,tags_json,custom_json,entry_json,mvcc_version,created_at,updated_at)
+                SELECT uri,tenant_id,l0,l1,l2,content_type,state_scope,json(tags),json(custom),json(entry),version,created_at,updated_at FROM rows WHERE true
+                ON CONFLICT(uri) DO UPDATE SET tenant_id=excluded.tenant_id,l0_abstract=excluded.l0_abstract,l1_overview=excluded.l1_overview,l2_full_text=excluded.l2_full_text,content_type=excluded.content_type,state_scope=excluded.state_scope,tags_json=excluded.tags_json,custom_json=excluded.custom_json,entry_json=excluded.entry_json,mvcc_version=excluded.mvcc_version,updated_at=excluded.updated_at
+            "#).bind(&json).execute(&mut *tx).await.map_err(|e| Self::storage_err("write batch current", e))?;
+            sqlx::query(r#"INSERT INTO context_versions(uri,mvcc_version,l0_abstract,entry_json,created_at)
+                SELECT json_extract(value,'$.uri'),json_extract(value,'$.version'),json_extract(value,'$.l0'),json(json_extract(value,'$.entry')),json_extract(value,'$.updated_at') FROM json_each(?)"#)
+                .bind(&json).execute(&mut *tx).await.map_err(|e| Self::storage_err("write batch history", e))?;
+            sqlx::query(r#"INSERT INTO context_index_outbox(id,mutation_json,uri,mvcc_version,status,attempts,available_at,created_at,updated_at)
+                SELECT json_extract(value,'$.outbox_id'),json(json_extract(value,'$.mutation')),json_extract(value,'$.uri'),json_extract(value,'$.version'),'pending',0,json_extract(value,'$.updated_at'),json_extract(value,'$.updated_at'),json_extract(value,'$.updated_at') FROM json_each(?) WHERE json_extract(value,'$.mutation') IS NOT NULL ORDER BY json_extract(value,'$.ordinal')"#)
+                .bind(&json).execute(&mut *tx).await.map_err(|e| Self::storage_err("write batch outbox", e))?;
+            versions.extend(chunk_versions);
         }
         tx.commit()
             .await
@@ -504,14 +627,24 @@ impl FsOps for SqliteContextStore {
             .unwrap_or_default();
         let limit = i64::try_from(page.effective_limit() + 1)
             .map_err(|_| ContextError::Storage("page limit exceeds SQLite INTEGER".into()))?;
-        let rows: Vec<String> = if let Some(kind) = pattern.content_type {
-            sqlx::query_scalar("SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND content_type = ? AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?")
-                .bind(Self::prefix_pattern(&scope)).bind(kind.as_path_segment())
-                .bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit).fetch_all(self.sqlite_pool()).await
-        } else {
-            sqlx::query_scalar("SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?")
-                .bind(Self::prefix_pattern(&scope)).bind(page.after.as_deref()).bind(page.after.as_deref()).bind(limit).fetch_all(self.sqlite_pool()).await
-        }.map_err(|e| Self::storage_err("find", e))?;
+        let name_pattern = pattern
+            .name_glob
+            .as_deref()
+            .map(|glob| format!("%/{}", Self::glob_pattern(glob)));
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT uri FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND (? IS NULL OR content_type = ?) AND (? IS NULL OR uri LIKE ? ESCAPE '\\') AND (? IS NULL OR uri > ?) ORDER BY uri LIMIT ?",
+        )
+        .bind(Self::prefix_pattern(&scope))
+        .bind(pattern.content_type.map(|kind| kind.as_path_segment()))
+        .bind(pattern.content_type.map(|kind| kind.as_path_segment()))
+        .bind(name_pattern.as_deref())
+        .bind(name_pattern.as_deref())
+        .bind(page.after.as_deref())
+        .bind(page.after.as_deref())
+        .bind(limit)
+        .fetch_all(self.sqlite_pool())
+        .await
+        .map_err(|e| Self::storage_err("find", e))?;
         let has_more = rows.len() > page.effective_limit();
         let items = rows
             .into_iter()
@@ -525,13 +658,13 @@ impl FsOps for SqliteContextStore {
     }
 
     async fn grep(&self, pattern: &str, scope: &ContextUri) -> Result<Vec<GrepHit>> {
-        let lowered = pattern.to_lowercase();
+        let folded_pattern = pattern.to_lowercase();
+        // SQLite's built-in lower() is ASCII-only. Fetch the URI-scoped projection and apply the
+        // same Unicode normalization to both operands in Rust to avoid SQL-side false negatives.
         let rows = sqlx::query(
-            "SELECT uri, l0_abstract, l1_overview FROM context_entries WHERE uri LIKE ? ESCAPE '\\' AND (instr(lower(l0_abstract), ?) > 0 OR instr(lower(coalesce(l1_overview, '')), ?) > 0) ORDER BY uri",
+            "SELECT uri, l0_abstract, l1_overview FROM context_entries WHERE uri LIKE ? ESCAPE '\\' ORDER BY uri",
         )
         .bind(Self::prefix_pattern(scope.as_str()))
-        .bind(&lowered)
-        .bind(&lowered)
         .fetch_all(self.sqlite_pool())
         .await
         .map_err(|e| Self::storage_err("grep", e))?;
@@ -546,18 +679,20 @@ impl FsOps for SqliteContextStore {
                 let l1: Option<String> = row
                     .try_get(2)
                     .map_err(|e| Self::storage_err("grep row", e))?;
-                let line = if l0.to_lowercase().contains(&lowered) {
-                    l0
+                let line = if l0.to_lowercase().contains(&folded_pattern) {
+                    Some(l0)
                 } else {
-                    l1.unwrap_or_default()
+                    l1.filter(|overview| overview.to_lowercase().contains(&folded_pattern))
                 };
-                Ok(GrepHit {
-                    uri: ContextUri::parse(uri)?,
+                let uri = ContextUri::parse(uri)?;
+                Ok(line.map(|line| GrepHit {
+                    uri,
                     line,
                     level: ContentLevel::L0,
-                })
+                }))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()
+            .map(|hits| hits.into_iter().flatten().collect())
     }
 
     async fn tree(
@@ -671,7 +806,7 @@ impl VersionOps for SqliteContextStore {
                     .map_err(|e| Self::storage_err("version timestamp", e))?
                     .with_timezone(&chrono::Utc);
                 Ok(VersionEntry {
-                    version: MvccVersion(version as u64),
+                    version: Self::version_from_sql(version)?,
                     message,
                     ts,
                 })
@@ -693,7 +828,7 @@ impl VersionOps for SqliteContextStore {
             "SELECT entry_json FROM context_versions WHERE uri = ? AND mvcc_version = ?",
         )
         .bind(uri.to_string())
-        .bind(to.0 as i64)
+        .bind(Self::version_to_sql(to)?)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| Self::storage_err("rollback read", e))?;
@@ -712,7 +847,10 @@ impl VersionOps for SqliteContextStore {
         if exists == 0 {
             return Err(ContextError::NotFound(uri.to_string()));
         }
-        Self::write_in_tx(&mut tx, &entry).await?;
+        let version = Self::write_in_tx(&mut tx, &entry).await?;
+        if let Some(mutation) = upsert_mutation(&entry, version)? {
+            enqueue_sqlite(&mut tx, &mutation).await?;
+        }
         tx.commit()
             .await
             .map_err(|e| Self::storage_err("commit rollback", e))?;
@@ -726,23 +864,25 @@ impl VersionOps for SqliteContextStore {
         async fn snapshot(
             pool: &SqlitePool,
             uri: &ContextUri,
-            version: MvccVersion,
+            version: i64,
         ) -> std::result::Result<Option<String>, sqlx::Error> {
             sqlx::query_scalar(
                 "SELECT entry_json FROM context_versions WHERE uri = ? AND mvcc_version = ?",
             )
             .bind(uri.to_string())
-            .bind(version.0 as i64)
+            .bind(version)
             .fetch_optional(pool)
             .await
         }
-        let left = snapshot(self.sqlite_pool(), uri, a)
+        let a_version = Self::version_to_sql(a)?;
+        let b_version = Self::version_to_sql(b)?;
+        let left = snapshot(self.sqlite_pool(), uri, a_version)
             .await
             .map_err(|e| Self::storage_err("diff a", e))?
             .ok_or_else(|| {
                 ContextError::VersionConflict(format!("no version {} for {uri}", a.0))
             })?;
-        let right = snapshot(self.sqlite_pool(), uri, b)
+        let right = snapshot(self.sqlite_pool(), uri, b_version)
             .await
             .map_err(|e| Self::storage_err("diff b", e))?
             .ok_or_else(|| {
@@ -919,19 +1059,57 @@ impl GraphStore for SqliteContextStore {
         to: &ContextUri,
         kind: GraphRelation,
     ) -> Result<()> {
-        sqlx::query("INSERT OR IGNORE INTO context_relations (from_uri, to_uri, relation_kind, created_at) VALUES (?, ?, ?, ?)")
+        let mut tx = self
+            .sqlite_pool()
+            .begin()
+            .await
+            .map_err(|e| Self::storage_err("begin add edge", e))?;
+        let changed = sqlx::query("INSERT OR IGNORE INTO context_relations (from_uri, to_uri, relation_kind, created_at) VALUES (?, ?, ?, ?)")
             .bind(from.to_string()).bind(to.to_string()).bind(format!("{kind:?}"))
-            .bind(chrono::Utc::now().to_rfc3339()).execute(self.sqlite_pool()).await
-            .map_err(|e| Self::storage_err("add edge", e))?;
+            .bind(chrono::Utc::now().to_rfc3339()).execute(&mut *tx).await
+            .map_err(|e| Self::storage_err("add edge", e))?.rows_affected();
+        if changed > 0 {
+            Self::bump_graph_revision(
+                &mut tx,
+                from.tenant(),
+                "add",
+                Some(from.as_str()),
+                Some(to.as_str()),
+            )
+            .await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::storage_err("commit add edge", e))?;
         Ok(())
     }
     async fn remove_edge(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
-        sqlx::query("DELETE FROM context_relations WHERE from_uri = ? AND to_uri = ?")
-            .bind(from.to_string())
-            .bind(to.to_string())
-            .execute(self.sqlite_pool())
+        let mut tx = self
+            .sqlite_pool()
+            .begin()
             .await
-            .map_err(|e| Self::storage_err("remove edge", e))?;
+            .map_err(|e| Self::storage_err("begin remove edge", e))?;
+        let changed =
+            sqlx::query("DELETE FROM context_relations WHERE from_uri = ? AND to_uri = ?")
+                .bind(from.to_string())
+                .bind(to.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::storage_err("remove edge", e))?
+                .rows_affected();
+        if changed > 0 {
+            Self::bump_graph_revision(
+                &mut tx,
+                from.tenant(),
+                "remove",
+                Some(from.as_str()),
+                Some(to.as_str()),
+            )
+            .await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::storage_err("commit remove edge", e))?;
         Ok(())
     }
     async fn outgoing_neighbors(
@@ -997,64 +1175,119 @@ impl GraphStore for SqliteContextStore {
     }
     async fn centrality(&self, uri: &ContextUri) -> Result<f32> {
         let config = self.centrality_config;
-        let mut nodes = BTreeSet::from([uri.to_string()]);
-        let mut frontier = vec![uri.to_string()];
-        for _ in 0..config.max_hops() {
-            if frontier.is_empty() || nodes.len() >= config.max_nodes() {
-                break;
-            }
-            let placeholders = std::iter::repeat_n("?", frontier.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT to_uri AS uri FROM context_relations WHERE from_uri IN ({placeholders}) UNION SELECT from_uri AS uri FROM context_relations WHERE to_uri IN ({placeholders}) ORDER BY uri"
-            );
-            let mut query = sqlx::query_scalar::<_, String>(&sql);
-            for value in &frontier {
-                query = query.bind(value);
-            }
-            for value in &frontier {
-                query = query.bind(value);
-            }
-            let rows = query
-                .fetch_all(self.sqlite_pool())
-                .await
-                .map_err(|e| Self::storage_err("centrality frontier", e))?;
-            frontier.clear();
-            for node in rows {
-                if nodes.len() >= config.max_nodes() {
-                    break;
-                }
-                if nodes.insert(node.clone()) {
-                    frontier.push(node);
-                }
-            }
-        }
-        let node_list = nodes.into_iter().collect::<Vec<_>>();
-        if node_list.len() <= 1 {
-            return Ok(0.0);
-        }
-        let rows = sqlx::query("SELECT from_uri, to_uri FROM context_relations")
-            .fetch_all(self.sqlite_pool())
-            .await
-            .map_err(|e| Self::storage_err("centrality edges", e))?;
-        let node_set = node_list.iter().cloned().collect::<HashSet<_>>();
+        let scope = uri.tenant();
+        let rows = sqlx::query(
+            "SELECT from_uri, to_uri FROM context_relations WHERE from_uri LIKE ? OR to_uri LIKE ? ORDER BY from_uri, to_uri",
+        )
+        .bind(format!("uwu://{scope}/%"))
+        .bind(format!("uwu://{scope}/%"))
+        .fetch_all(self.sqlite_pool())
+        .await
+        .map_err(|e| Self::storage_err("centrality edges", e))?;
         let edges = rows
             .into_iter()
             .map(|row| {
-                let from = row
-                    .try_get::<String, _>(0)
-                    .map_err(|e| Self::storage_err("centrality edge from_uri", e))?;
-                let to = row
-                    .try_get::<String, _>(1)
-                    .map_err(|e| Self::storage_err("centrality edge to_uri", e))?;
-                Ok((from, to))
+                Ok((
+                    row.try_get::<String, _>(0)
+                        .map_err(|e| Self::storage_err("centrality edge from_uri", e))?,
+                    row.try_get::<String, _>(1)
+                        .map_err(|e| Self::storage_err("centrality edge to_uri", e))?,
+                ))
             })
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>>>()?;
+        let node_list = edges
+            .iter()
+            .flat_map(|(from, to)| [from.clone(), to.clone()])
+            .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter(|(from, to)| node_set.contains(from) && node_set.contains(to))
             .collect::<Vec<_>>();
-        Ok(pagerank_score(uri.as_str(), &node_list, &edges, config))
+        if !node_list.iter().any(|node| node == uri.as_str()) {
+            return Ok(0.0);
+        }
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT revision FROM context_graph_revisions WHERE scope = ?), 0)",
+        )
+        .bind(scope)
+        .fetch_one(self.sqlite_pool())
+        .await
+        .map_err(|e| Self::storage_err("centrality revision", e))?;
+        let cache_key = config.cache_key();
+        if let Some(score) = sqlx::query_scalar::<_, f32>(
+            "SELECT score FROM context_graph_centrality WHERE scope = ? AND revision = ? AND algorithm_config = ? AND uri = ?",
+        )
+        .bind(scope)
+        .bind(revision)
+        .bind(&cache_key)
+        .bind(uri.as_str())
+        .fetch_optional(self.sqlite_pool())
+        .await
+        .map_err(|e| Self::storage_err("read centrality cache", e))?
+        {
+            return Ok(score);
+        }
+        let previous_revision: Option<i64> = sqlx::query_scalar(
+            "SELECT max(revision) FROM context_graph_centrality WHERE scope = ? AND algorithm_config = ? AND revision < ?",
+        )
+        .bind(scope)
+        .bind(&cache_key)
+        .bind(revision)
+        .fetch_one(self.sqlite_pool())
+        .await
+        .map_err(|e| Self::storage_err("read previous centrality revision", e))?;
+        let scores = if let Some(previous_revision) = previous_revision {
+            let previous = sqlx::query_as::<_, (String, f32)>(
+                "SELECT uri, score FROM context_graph_centrality WHERE scope = ? AND revision = ? AND algorithm_config = ?",
+            )
+            .bind(scope)
+            .bind(previous_revision)
+            .bind(&cache_key)
+            .fetch_all(self.sqlite_pool())
+            .await
+            .map_err(|e| Self::storage_err("read previous centrality snapshot", e))?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            let dirty_seeds = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT from_uri, to_uri FROM context_graph_mutations WHERE scope = ? AND revision > ? AND revision <= ?",
+            )
+            .bind(scope)
+            .bind(previous_revision)
+            .bind(revision)
+            .fetch_all(self.sqlite_pool())
+            .await
+            .map_err(|e| Self::storage_err("read dirty graph nodes", e))?
+            .into_iter()
+            .flat_map(|(from, to)| from.into_iter().chain(to))
+            .collect::<HashSet<_>>();
+            incremental_pagerank_scores(&node_list, &edges, &previous, &dirty_seeds, config)
+                .unwrap_or_else(|| pagerank_scores(&node_list, &edges, config))
+        } else {
+            pagerank_scores(&node_list, &edges, config)
+        };
+        let mut tx = self
+            .sqlite_pool()
+            .begin()
+            .await
+            .map_err(|e| Self::storage_err("begin centrality cache", e))?;
+        for (node, score) in &scores {
+            sqlx::query("INSERT OR REPLACE INTO context_graph_centrality(scope, revision, algorithm_config, uri, score) VALUES (?,?,?,?,?)")
+                .bind(scope).bind(revision).bind(&cache_key).bind(node).bind(score)
+                .execute(&mut *tx).await.map_err(|e| Self::storage_err("write centrality cache", e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::storage_err("commit centrality cache", e))?;
+        Ok(scores.get(uri.as_str()).copied().unwrap_or(0.0))
+    }
+
+    async fn graph_revision(&self, scope: &ContextUri) -> Result<u64> {
+        let revision: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM context_graph_revisions WHERE scope = ?")
+                .bind(scope.tenant())
+                .fetch_optional(self.sqlite_pool())
+                .await
+                .map_err(|e| Self::storage_err("read graph revision", e))?;
+        u64::try_from(revision.unwrap_or(0))
+            .map_err(|_| ContextError::Storage("negative graph revision".into()))
     }
 }
 
@@ -1249,6 +1482,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_pooled_connection_enforces_foreign_keys() {
+        let cfg = RuntimeConfig {
+            deploy: DeployConfig::default(),
+            database: DbConfig {
+                backend: SqlBackend::Sqlite,
+                url: "sqlite::memory:".into(),
+                max_connections: 4,
+                min_connections: 4,
+                acquire_timeout_secs: 5,
+                idle_timeout_secs: 60,
+                max_lifetime_secs: 300,
+                test_before_acquire: false,
+                statement_cache_capacity: 100,
+                application_name: None,
+            },
+            cache: CacheConfig {
+                backend: CacheBackend::None,
+                url: None,
+                capacity: 0,
+            },
+            vector: VectorConfig {
+                backend: VectorBackend::Memory,
+                url: None,
+                api_key: None,
+            },
+        };
+        let db = uwu_database::Database::connect(&cfg).await.unwrap();
+        let pool = db.pool.as_sqlite().unwrap();
+        let mut connections = Vec::new();
+        for _ in 0..4 {
+            connections.push(pool.acquire().await.unwrap());
+        }
+        for connection in &mut connections {
+            let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            assert_eq!(enabled, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn write_read_and_mvcc_are_atomic() {
         let store = store().await;
         let mut value = entry("uwu://tenant/agent/a/memory/fact/sqlite/one", "first");
@@ -1386,6 +1661,47 @@ mod tests {
             ContentRepo::rename(&store, &wildcard_neighbor.uri, &cross_tenant).await,
             Err(ContextError::PermissionDenied(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn graph_revision_cache_and_edge_mutations_follow_contract() {
+        let store = store().await;
+        let a = entry("uwu://tenant/agent/a/memory/fact/graph/a", "a");
+        let b = entry("uwu://tenant/agent/a/memory/fact/graph/b", "b");
+        let c = entry("uwu://tenant/agent/a/memory/fact/graph/c", "c");
+        ContentRepo::batch_write(&store, &[a.clone(), b.clone(), c.clone()])
+            .await
+            .unwrap();
+        store
+            .add_edge(&a.uri, &b.uri, GraphRelation::DerivedFrom)
+            .await
+            .unwrap();
+        store
+            .add_edge(&b.uri, &c.uri, GraphRelation::DerivedFrom)
+            .await
+            .unwrap();
+        assert_eq!(store.graph_revision(&a.uri).await.unwrap(), 2);
+        let first = store.centrality(&b.uri).await.unwrap();
+        assert_eq!(first, store.centrality(&b.uri).await.unwrap());
+        let snapshots: i64 =
+            sqlx::query_scalar("SELECT count(DISTINCT revision) FROM context_graph_centrality")
+                .fetch_one(store.sqlite_pool())
+                .await
+                .unwrap();
+        assert_eq!(snapshots, 1);
+
+        let renamed = ContextUri::parse("uwu://tenant/agent/a/memory/fact/graph/b2").unwrap();
+        ContentRepo::rename(&store, &b.uri, &renamed).await.unwrap();
+        assert_eq!(store.graph_revision(&a.uri).await.unwrap(), 3);
+        assert!(store.centrality(&renamed).await.unwrap() > 0.0);
+        ContentRepo::delete(&store, &renamed).await.unwrap();
+        assert_eq!(store.graph_revision(&a.uri).await.unwrap(), 4);
+        let mutations: Vec<String> =
+            sqlx::query_scalar("SELECT operation FROM context_graph_mutations ORDER BY revision")
+                .fetch_all(store.sqlite_pool())
+                .await
+                .unwrap();
+        assert_eq!(mutations, ["add", "add", "rename", "delete"]);
     }
 
     #[tokio::test]

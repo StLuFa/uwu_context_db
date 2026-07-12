@@ -344,6 +344,24 @@ impl QueryPlanConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanCacheConfig {
+    pub capacity: usize,
+}
+
+impl Default for PlanCacheConfig {
+    fn default() -> Self {
+        Self { capacity: 256 }
+    }
+}
+
+impl PlanCacheConfig {
+    pub fn validate(self) -> ConfigResult<Self> {
+        nonzero("plan cache", &[self.capacity])?;
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TokenBudgetConfig {
     pub l0_floor: usize,

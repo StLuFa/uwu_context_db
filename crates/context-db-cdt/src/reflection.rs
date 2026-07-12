@@ -12,7 +12,6 @@ use agent_context_db_core::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// 语义梯度 — 失败轨迹的可操作改进建议。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,10 +57,10 @@ pub struct ReflectionWritebackConfig {
 }
 
 impl ReflectionWritebackConfig {
-    pub fn for_agent(agent_scope: impl Into<String>) -> Self {
+    pub fn for_agent(agent_scope: impl Into<String>, tenant: TenantId) -> Self {
         Self {
             agent_scope: agent_scope.into(),
-            tenant: TenantId(Uuid::new_v4()),
+            tenant,
             min_priority: 0.35,
         }
     }

@@ -32,8 +32,8 @@ pub mod theory_of_mind;
 pub use associative::AssociativeExpander;
 pub use budget::{BudgetLoadPlan, LevelAllocation, allocate_hit_levels, load_hits_within_budget};
 pub use config::{
-    GraphRagConfig, InnovationConfig, QueryPlanConfig, RagSynthesisConfig, RetrieveConfigError,
-    TokenBudgetConfig,
+    GraphRagConfig, InnovationConfig, PlanCacheConfig, QueryPlanConfig, RagSynthesisConfig,
+    RetrieveConfigError, TokenBudgetConfig,
 };
 pub use graph_rag::{
     GraphRagCommunity, GraphRagEngine, GraphRagIndex, GraphRagIndexConfig, GraphRagIndexStats,
@@ -133,7 +133,7 @@ pub struct RetrievalTrace {
 #[derive(Debug, Clone)]
 pub enum TraceStep {
     IntentAnalysis {
-        raw: String,
+        query: agent_context_db_core::ObservedField,
         num_queries: usize,
         decision: Option<Box<IntentDecision>>,
     },

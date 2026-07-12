@@ -14,6 +14,37 @@ pub struct RouteOutcome {
     pub observed_at: DateTime<Utc>,
 }
 
+impl RouteOutcome {
+    pub fn into_reaction(self, execution_id: impl Into<String>) -> agent_context_db_core::Reaction {
+        let latency_score = (1.0 - self.latency_ms as f32 / 2_000.0).clamp(0.0, 1.0);
+        let outcome = (self.success as u8 as f32 * 0.5
+            + self.avg_score.clamp(0.0, 1.0) * 0.3
+            + latency_score * 0.2)
+            .clamp(0.0, 1.0);
+        agent_context_db_core::Reaction {
+            id: format!(
+                "route:{}:{}",
+                self.peer,
+                self.observed_at.timestamp_micros()
+            ),
+            subject_id: self.peer.to_string(),
+            execution_id: execution_id.into(),
+            outcome,
+            predicted_outcome: None,
+            observed_at: self.observed_at,
+            attributions: vec![agent_context_db_core::CausalAttribution {
+                cause_id: "route_peer".into(),
+                credit: 1.0,
+                confidence: self.avg_score.clamp(0.0, 1.0),
+            }],
+            traits: HashMap::from([
+                ("route_reliability".into(), self.success as u8 as f32),
+                ("route_latency".into(), latency_score),
+            ]),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteLearningState {
     pub attempts: u64,

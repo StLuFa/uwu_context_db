@@ -1019,11 +1019,7 @@ impl VersionStore for MemoryVersionStore {
     async fn impact_analysis(&self, commit: &CommitId) -> Result<ImpactAnalysis> {
         let commits = self.commits.lock();
         let mut recent = commits.iter().collect::<Vec<_>>();
-<<<<<<< Updated upstream
-        recent.sort_by(|(_, left), (_, right)| right.timestamp.cmp(&left.timestamp));
-=======
         recent.sort_by_key(|(_, commit)| std::cmp::Reverse(commit.timestamp));
->>>>>>> Stashed changes
         let mut downstream = Vec::new();
         let target = commit.clone();
         for (cid, candidate) in recent.into_iter().take(self.analysis_config.max_commits) {
@@ -1087,11 +1083,8 @@ impl VersionStore for MemoryVersionStore {
 
     /// 语义级分支合并 —— 基于 uwu-crdt `LwwMap` 的 CRDT 合并。
     ///
-    /// 策略语义：
-    /// - `EntityAutoMerge`：纯 LWW，冲突时高时钟胜、tie-break 用分支名
-    /// - `ContradictionDetection { threshold }`：先检查两侧修改的 URI Jaccard 相似度，
-    ///   低于 threshold 的记为 conflict，但仍 LWW 合并（策略给上层决定丢弃/重做）
-    /// - `GraphMerge`：暂等价 EntityAutoMerge（关系边合并留给 GraphStore 层）
+    /// 策略语义：`ContradictionDetection { threshold }` 先检查两侧修改的 URI，
+    /// 将检测到的语义矛盾记为 conflict，再执行确定性的 LWW 合并。
     ///
     /// 时钟：以 commit 的 timestamp（Unix seconds）作为 LwwMap clock，
     /// tie-break node_id 用分支名，保证同 clock 时确定性可复现。
@@ -1170,9 +1163,6 @@ impl VersionStore for MemoryVersionStore {
                     )
                 })?;
                 detect_snapshot_contradictions(detector, &from_snap, &into_snap, threshold).await?
-            }
-            KnowledgeMergeStrategy::EntityAutoMerge | KnowledgeMergeStrategy::GraphMerge { .. } => {
-                Vec::new()
             }
         };
 

@@ -96,42 +96,64 @@ pub fn allocate_hit_levels(
         .collect())
 }
 
+#[derive(Clone, Copy)]
+enum Predecessor {
+    Carry,
+    Choice {
+        previous_budget: usize,
+        index: usize,
+    },
+}
+
 fn select_choices(choices_by_hit: &[Vec<Choice>], budget: usize) -> Vec<Choice> {
-    let mut dp = vec![0.0f32; budget + 1];
-    let mut paths: Vec<Vec<Choice>> = vec![Vec::new(); budget + 1];
+    let mut scores = vec![0.0f32; budget + 1];
+    let mut predecessors = Vec::with_capacity(choices_by_hit.len());
 
     for choices in choices_by_hit {
-        let mut next = dp.clone();
-        let mut next_paths = paths.clone();
+        let mut next = scores.clone();
+        let mut layer = vec![Predecessor::Carry; budget + 1];
 
-        for used in 0..=budget {
-            for choice in choices {
+        for (used, score) in scores.iter().copied().enumerate() {
+            for (index, choice) in choices.iter().enumerate() {
                 if choice.cost == 0 || used + choice.cost > budget {
                     continue;
                 }
-                let value = dp[used] + choice.value;
+                let value = score + choice.value;
                 let target = used + choice.cost;
                 if value > next[target] {
                     next[target] = value;
-                    let mut path = paths[used].clone();
-                    path.push(choice.clone());
-                    next_paths[target] = path;
+                    layer[target] = Predecessor::Choice {
+                        previous_budget: used,
+                        index,
+                    };
                 }
             }
         }
 
-        dp = next;
-        paths = next_paths;
+        scores = next;
+        predecessors.push(layer);
     }
 
-    let best_budget = (0..=budget)
+    let mut current_budget = (0..=budget)
         .max_by(|a, b| {
-            dp[*a]
-                .partial_cmp(&dp[*b])
+            scores[*a]
+                .partial_cmp(&scores[*b])
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or(0);
-    paths.swap_remove(best_budget)
+    let mut selected = Vec::new();
+    for (hit_index, layer) in predecessors.iter().enumerate().rev() {
+        if let Predecessor::Choice {
+            previous_budget,
+            index,
+        } = layer[current_budget]
+        {
+            selected.push(choices_by_hit[hit_index][index].clone());
+            current_budget = previous_budget;
+        }
+    }
+    selected.reverse();
+    selected
 }
 
 fn choices_for_hit(
@@ -279,6 +301,91 @@ mod tests {
             metadata,
             created_at: None,
             updated_at: None,
+        }
+    }
+
+    fn select_choices_with_full_paths(
+        choices_by_hit: &[Vec<Choice>],
+        budget: usize,
+    ) -> Vec<Choice> {
+        let mut scores = vec![0.0f32; budget + 1];
+        let mut paths = vec![Vec::new(); budget + 1];
+        for choices in choices_by_hit {
+            let mut next = scores.clone();
+            let mut next_paths = paths.clone();
+            for used in 0..=budget {
+                for choice in choices {
+                    if choice.cost == 0 || used + choice.cost > budget {
+                        continue;
+                    }
+                    let target = used + choice.cost;
+                    let value = scores[used] + choice.value;
+                    if value > next[target] {
+                        next[target] = value;
+                        next_paths[target] = paths[used].clone();
+                        next_paths[target].push(choice.clone());
+                    }
+                }
+            }
+            scores = next;
+            paths = next_paths;
+        }
+        let best = (0..=budget)
+            .max_by(|a, b| {
+                scores[*a]
+                    .partial_cmp(&scores[*b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
+        paths.swap_remove(best)
+    }
+
+    #[test]
+    fn predecessor_dp_is_equivalent_to_full_path_dp() {
+        let hits = [
+            hit(
+                "uwu://t/agent/a/fact/a",
+                0.91,
+                "a",
+                "a dense",
+                "a full text",
+            ),
+            hit(
+                "uwu://t/agent/a/fact/b",
+                0.73,
+                "b",
+                "b dense",
+                "b full text",
+            ),
+            hit(
+                "uwu://t/agent/a/fact/c",
+                0.52,
+                "c",
+                "c dense",
+                "c full text",
+            ),
+        ];
+        let config = TokenBudgetConfig {
+            l0_floor: 1,
+            l1_floor: 3,
+            l2_floor: 5,
+        };
+        let choices = hits
+            .iter()
+            .enumerate()
+            .map(|(index, hit)| choices_for_hit(index, hit, 12, config).unwrap())
+            .collect::<Vec<_>>();
+
+        for budget in 0..=12 {
+            let actual = select_choices(&choices, budget);
+            let expected = select_choices_with_full_paths(&choices, budget);
+            let signature = |selected: &[Choice]| {
+                selected
+                    .iter()
+                    .map(|choice| (choice.hit_index, choice.level, choice.cost))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(signature(&actual), signature(&expected), "budget={budget}");
         }
     }
 

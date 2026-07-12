@@ -10,7 +10,10 @@
 
 use crate::embedding_cache::EmbeddingCache;
 use crate::read_cache::ReadCache;
-use crate::{ContentLevel, ContentPayload, ContextUri, Result};
+use crate::{
+    ContentLevel, ContentPayload, ContextUri, EmbeddingSpaceId, EncodedEmbedding, Result,
+    embedding_content_hash,
+};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -199,42 +202,40 @@ impl RedisEmbeddingCache {
 
 #[async_trait]
 impl EmbeddingCache for RedisEmbeddingCache {
-    async fn get(&self, content_hash: &str) -> Option<Vec<f32>> {
-        let key = self.cache_key(content_hash);
+    async fn get(&self, space: &EmbeddingSpaceId, content: &[u8]) -> Option<EncodedEmbedding> {
+        let key = self.cache_key(&embedding_content_hash(space, content));
         let mut conn = self.conn().await.ok()?;
         let data: Option<Vec<u8>> = redis::cmd("GET")
             .arg(&key)
             .query_async(&mut conn)
             .await
             .ok()?;
-        serde_json::from_slice(&data?).ok()
+        serde_json::from_slice::<EncodedEmbedding>(&data?)
+            .ok()
+            .filter(|embedding| embedding.space == *space)
     }
 
-    async fn put(&self, content_hash: &str, embedding: Vec<f32>, ttl: Duration) {
+    async fn put(&self, content: &[u8], embedding: EncodedEmbedding, ttl: Duration) {
         let effective = if ttl.is_zero() { self.default_ttl } else { ttl };
         if let Ok(data) = serde_json::to_vec(&embedding) {
             if let Ok(mut conn) = self.conn().await {
-                let key = self.cache_key(content_hash);
+                let key = self.cache_key(&embedding_content_hash(&embedding.space, content));
                 let ttl_secs = effective.as_secs().max(1);
-                let _: () = redis::cmd("SETEX")
+                let _: redis::RedisResult<()> = redis::cmd("SETEX")
                     .arg(&key)
                     .arg(ttl_secs)
                     .arg(&data)
                     .query_async(&mut conn)
-                    .await
-                    .unwrap_or(());
+                    .await;
             }
         }
     }
 
-    async fn invalidate(&self, content_hash: &str) {
+    async fn invalidate(&self, space: &EmbeddingSpaceId, content: &[u8]) {
         if let Ok(mut conn) = self.conn().await {
-            let key = self.cache_key(content_hash);
-            let _: () = redis::cmd("DEL")
-                .arg(&key)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or(());
+            let key = self.cache_key(&embedding_content_hash(space, content));
+            let _: redis::RedisResult<()> =
+                redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
         }
     }
 }

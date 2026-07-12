@@ -20,13 +20,18 @@ pub mod embedding_migration;
 pub mod error;
 pub mod event;
 pub mod event_store;
+pub mod execution;
 pub mod lifecycle;
 pub mod llm;
 pub mod lsh;
 pub mod model;
+pub mod multimodal;
 pub mod observability;
 pub mod pack;
+pub mod policy;
+pub mod policy_llm;
 pub mod prompt;
+pub mod reaction;
 pub mod read_cache;
 #[cfg(feature = "redis-backend")]
 pub mod redis_backend;
@@ -42,8 +47,10 @@ pub mod zerocopy;
 
 pub use embedding_cache::{EmbeddingCache, MemoryEmbeddingCache, embedding_content_hash};
 pub use embedding_migration::{
-    EmbeddingMigrationAction, EmbeddingMigrationExecutor, EmbeddingMigrationPhase,
-    EmbeddingMigrationPlan, EmbeddingMigrationReport, EmbeddingModelVersion,
+    AtomicCutover, EmbeddingMigrationPhase, EmbeddingMigrationReport, EmbeddingMigrationState,
+    FileMigrationStateStore, MigrationEvaluationGate, MigrationItem, MigrationStateStore,
+    ModalityCollections, MultimodalMigrationExecutor, PairedRetrievalMetrics, RetrievalPair,
+    evaluate_paired_retrieval,
 };
 pub use error::{ContextError, Result};
 pub use event::{
@@ -57,6 +64,7 @@ pub use event_store::{
     ReplayFilter, ReplayId, SegmentedStore, SegmentedStoreOptions, SerializedEnvelope,
     Subscription, Topic, TopicPattern, TypeRegistry, TypedSubscription,
 };
+pub use execution::{ExecutionContext, ExecutionKind, ExecutionRequest, ExecutionResponse};
 pub use lifecycle::{
     AccessEvent, AccessOutcome, EbbinghausModel, ForgettingModel, ImportanceScore,
     ImportanceWeights, LifecycleAction, LifecycleEngine, LifecycleRule, TokenBudget,
@@ -73,18 +81,32 @@ pub use model::{
     HalfLife, LineageEntry, MediaType, MvccVersion, SchemaRef, StateScope, TenantId, TreeNode,
     ValidityRecord, VersionEntry,
 };
+pub use multimodal::{
+    DerivedEmbedding, EmbeddingInput, EmbeddingNormalization, EmbeddingSpaceId, EncodedEmbedding,
+    EncoderCapabilities, LlmTextEncoder, Modality, MultimodalEncoder,
+};
 pub use observability::{
-    MetricsExporter, MetricsExporterConfig, ProvenanceEdge, ProvenanceGraph, ProvenanceNode,
-    ProvenanceRelationType, QualityDimension, QualityScore, QualityScorer,
-    install_metrics_exporter, install_metrics_recorder,
+    DeterministicSampler, DiagnosticGrant, ErrorKind, ErrorReport, FingerprintKey, MetricsExporter,
+    MetricsExporterConfig, ObservabilityPolicy, ObservedField, ProvenanceEdge, ProvenanceGraph,
+    ProvenanceNode, ProvenanceRelationType, QualityDimension, QualityScore, QualityScorer,
+    SamplingConfig, SensitiveClass, install_metrics_exporter, install_metrics_recorder,
 };
 pub use pack::{
     AclProtectedStore, AclRule, ContextPack, PackMeta, PackSignature, PackTrustPolicy, PathAcl,
     Permissions, Principal,
 };
+pub use policy::{
+    ExecutionGate, GatedExecutor, PolicyAudit, PolicyDecision, PolicyEffect, PolicyError,
+    PolicyPriority, PolicyRule, PolicySource, PolicyStrength, RuleExecutionGate,
+};
+pub use policy_llm::PolicyEnforcedLlmClient;
 pub use prompt::{
     LlmTaskKind, OptimizedPrompt, PromptCacheMode, PromptCompressionMode, PromptOptimization,
     optimize_prompt,
+};
+pub use reaction::{
+    CalibrationMetrics, CausalAttribution, MemoryReactionStore, OnlinePolicyUpdater,
+    OnlineUpdateConfig, Reaction, ReactionSink, TraitEstimate, emit_and_update,
 };
 pub use read_cache::{MemoryReadCache, ReadCache};
 pub use similarity::{
@@ -97,7 +119,7 @@ pub use store::{
 };
 pub use tokenizer::{count_tokens, count_tokens_with_floor};
 pub use uri::{AsOfTime, ContextUri, QueryParams, SCHEME, UriCategory};
-pub use vector::{IndexHit, IndexPoint, IndexVector, VectorIndex};
+pub use vector::{IndexHit, IndexPoint, IndexVector, SpaceCheckedVectorIndex, VectorIndex};
 pub use watch::{
     ChangeEvent, ChangeKind, WatchCheckpoint, WatchHub, WatchOptions, WatchSource, WatchStream,
     WatchableStore,

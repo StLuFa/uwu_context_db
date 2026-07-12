@@ -4,8 +4,82 @@
 //! `RedisReadCache`）。本 wrapper 只提供便捷 API 与默认 TTL 语义。
 
 use agent_context_db_core::{ContentLevel, ContentPayload, ContextUri, ReadCache};
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Thread-safe callers wrap this bounded LRU in their local mutex. Cache operations are
+/// synchronous and never span I/O or an await point.
+pub(crate) struct BoundedLruCache<K, V> {
+    capacity: usize,
+    entries: HashMap<K, V>,
+    recency: VecDeque<K>,
+}
+
+impl<K: Eq + Hash + Clone, V> BoundedLruCache<K, V> {
+    pub(crate) fn new(capacity: usize) -> Self {
+        debug_assert!(capacity > 0);
+        Self {
+            capacity,
+            entries: HashMap::with_capacity(capacity),
+            recency: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn get(&mut self, key: &K) -> Option<&V> {
+        if self.entries.contains_key(key) {
+            self.touch(key);
+        }
+        self.entries.get(key)
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), value);
+            self.touch(&key);
+            return;
+        }
+        if self.entries.len() == self.capacity
+            && let Some(evicted) = self.recency.pop_front()
+        {
+            self.entries.remove(&evicted);
+        }
+        self.recency.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+
+    fn touch(&mut self, key: &K) {
+        if let Some(position) = self.recency.iter().position(|candidate| candidate == key) {
+            self.recency.remove(position);
+        }
+        self.recency.push_back(key.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::BoundedLruCache;
+
+    #[test]
+    fn bounded_lru_reuses_recent_entries_and_evicts_oldest() {
+        let mut cache = BoundedLruCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        assert_eq!(cache.get(&"a"), Some(&1));
+        cache.insert("c", 3);
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&"a"), Some(&1));
+        assert_eq!(cache.get(&"b"), None);
+        assert_eq!(cache.get(&"c"), Some(&3));
+    }
+}
 
 /// 带防护的检索缓存包装器。
 pub struct RetrievalCache {

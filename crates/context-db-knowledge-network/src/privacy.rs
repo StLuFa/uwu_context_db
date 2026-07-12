@@ -243,8 +243,8 @@ impl Drop for PrivacyReservationGuard {
         let ledger = Arc::clone(&self.ledger);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Err(error) = ledger.refund(&receipt).await {
-                    tracing::error!(operation = "privacy_refund_on_drop", receipt_id = %receipt.id, %error, "privacy reservation refund failed during drop");
+                if let Err(_error) = ledger.refund(&receipt).await {
+                    tracing::error!(operation = "privacy_refund_on_drop", error = ?agent_context_db_core::ErrorReport::new(agent_context_db_core::ErrorKind::Downstream, false, None), "privacy reservation refund failed during drop");
                 }
             });
         }

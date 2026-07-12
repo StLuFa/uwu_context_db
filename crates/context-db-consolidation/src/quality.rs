@@ -542,6 +542,8 @@ fn mesh_opts_for(dimension: QualityBeliefDimension, priority: f32) -> MeshDiscov
         fetch_peers: if priority > 0.68 { 10 } else { 6 },
         final_top_k: if priority > 0.68 { 32 } else { 16 },
         deadline_ms: if priority > 0.68 { 1800 } else { 1000 },
+        peer_timeout_ms: 250,
+        max_concurrency: 8,
     }
 }
 

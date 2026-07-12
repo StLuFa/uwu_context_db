@@ -47,31 +47,62 @@ pub struct WatchOptions {
 pub struct WatchStream {
     rx: broadcast::Receiver<ChangeEvent>,
     backlog: std::collections::VecDeque<ChangeEvent>,
+    history: Arc<parking_lot::Mutex<std::collections::VecDeque<ChangeEvent>>>,
+    last_checkpoint: WatchCheckpoint,
     prefix: Option<String>,
 }
 
 impl WatchStream {
     pub async fn recv(&mut self) -> Result<ChangeEvent> {
         loop {
-            if let Some(event) = self.backlog.pop_front()
-                && self.matches(&event)
-            {
-                return Ok(event);
+            if let Some(event) = self.backlog.pop_front() {
+                self.last_checkpoint = event.checkpoint;
+                if self.matches(&event) {
+                    return Ok(event);
+                }
+                continue;
             }
 
             match self.rx.recv().await {
-                Ok(event) if self.matches(&event) => return Ok(event),
-                Ok(_) => continue,
+                Ok(event) => {
+                    if event.checkpoint <= self.last_checkpoint {
+                        continue;
+                    }
+                    self.last_checkpoint = event.checkpoint;
+                    if self.matches(&event) {
+                        return Ok(event);
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Err(ContextError::Storage(format!(
-                        "watch stream lagged by {skipped} events"
-                    )));
+                    self.recover_lag(skipped)?;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(ContextError::Storage("watch stream closed".into()));
                 }
             }
         }
+    }
+
+    fn recover_lag(&mut self, skipped: u64) -> Result<()> {
+        let history = self.history.lock();
+        let expected = self.last_checkpoint.0.saturating_add(1);
+        let Some(oldest) = history.front().map(|event| event.checkpoint.0) else {
+            return Err(ContextError::Storage(format!(
+                "watch stream lagged by {skipped} events and retained history is empty"
+            )));
+        };
+        if expected < oldest {
+            return Err(ContextError::Storage(format!(
+                "watch checkpoint {expected} is outside retained history starting at {oldest}"
+            )));
+        }
+        self.backlog.extend(
+            history
+                .iter()
+                .filter(|event| event.checkpoint.0 >= expected)
+                .cloned(),
+        );
+        Ok(())
     }
 
     fn matches(&self, event: &ChangeEvent) -> bool {
@@ -109,7 +140,7 @@ impl WatchDelivery {
 pub struct WatchHub {
     next: AtomicU64,
     tx: broadcast::Sender<ChangeEvent>,
-    history: parking_lot::Mutex<Vec<ChangeEvent>>,
+    history: Arc<parking_lot::Mutex<std::collections::VecDeque<ChangeEvent>>>,
     history_capacity: usize,
 }
 
@@ -120,7 +151,9 @@ impl WatchHub {
         Self {
             next: AtomicU64::new(1),
             tx,
-            history: parking_lot::Mutex::new(Vec::with_capacity(capacity)),
+            history: Arc::new(parking_lot::Mutex::new(
+                std::collections::VecDeque::with_capacity(capacity),
+            )),
             history_capacity: capacity,
         }
     }
@@ -136,10 +169,9 @@ impl WatchHub {
         let event = ChangeEvent::new(checkpoint, kind, uri, to_uri, version);
         {
             let mut history = self.history.lock();
-            history.push(event.clone());
-            if history.len() > self.history_capacity {
-                let overflow = history.len() - self.history_capacity;
-                history.drain(0..overflow);
+            history.push_back(event.clone());
+            while history.len() > self.history_capacity {
+                history.pop_front();
             }
         }
         let live_receivers = self.tx.send(event.clone()).unwrap_or(0);
@@ -153,6 +185,9 @@ impl WatchHub {
 impl WatchSource for WatchHub {
     fn watch(&self, options: WatchOptions) -> WatchStream {
         let from = options.from_checkpoint.unwrap_or(WatchCheckpoint(0));
+        // Subscribe before taking the history snapshot. Events emitted during snapshot creation are
+        // then present in the live receiver and are deduplicated by `last_checkpoint`.
+        let rx = self.tx.subscribe();
         let backlog = if options.include_current || options.from_checkpoint.is_some() {
             self.history
                 .lock()
@@ -164,8 +199,10 @@ impl WatchSource for WatchHub {
             std::collections::VecDeque::new()
         };
         WatchStream {
-            rx: self.tx.subscribe(),
+            rx,
             backlog,
+            history: self.history.clone(),
+            last_checkpoint: from,
             prefix: options.prefix,
         }
     }

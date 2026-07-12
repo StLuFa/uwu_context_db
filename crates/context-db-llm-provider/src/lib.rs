@@ -6,8 +6,10 @@
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
 use agent_context_db_core::{
-    CachingLlmClient, CascadeLlmClient, CascadeLlmConfig, EmbeddingVector, JsonSchema, LlmClient,
-    LlmError, LlmOpts, PromptCacheMode, PromptOptimizingLlmClient,
+    CachingLlmClient, CascadeLlmClient, CascadeLlmConfig, ContextError, EmbeddingInput,
+    EmbeddingSpaceId, EmbeddingVector, EncodedEmbedding, EncoderCapabilities, ExecutionContext,
+    ExecutionGate, JsonSchema, LlmClient, LlmError, LlmOpts, Modality, MultimodalEncoder,
+    PolicyEnforcedLlmClient, PromptCacheMode, PromptOptimizingLlmClient,
     config::{LlmConfig, UwuConfig},
 };
 use async_trait::async_trait;
@@ -28,6 +30,135 @@ const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 const OPENAI_EMBEDDINGS_PATH: &str = "/v1/embeddings";
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultimodalProviderConfig {
+    pub endpoint: String,
+    pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub space: EmbeddingSpaceId,
+    pub modalities: std::collections::BTreeSet<Modality>,
+    pub max_batch_size: usize,
+    pub timeout_secs: Option<u64>,
+}
+
+/// JSON HTTP provider. Binary image/audio inputs are base64 encoded from their actual bytes and retain MIME type.
+pub struct HttpMultimodalEncoder {
+    config: MultimodalProviderConfig,
+    client: Client,
+}
+impl HttpMultimodalEncoder {
+    pub fn new(config: MultimodalProviderConfig) -> Result<Self, LlmError> {
+        config
+            .space
+            .validate()
+            .map_err(|e| LlmError::Provider(e.to_string()))?;
+        Url::parse(&config.endpoint)
+            .map_err(|e| LlmError::Provider(format!("invalid multimodal endpoint: {e}")))?;
+        if config.max_batch_size == 0 || config.modalities.is_empty() {
+            return Err(LlmError::Provider(
+                "multimodal capabilities must be non-empty".into(),
+            ));
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs.unwrap_or(60)))
+            .redirect(Policy::none())
+            .build()
+            .map_err(|e| LlmError::Provider(e.to_string()))?;
+        Ok(Self { config, client })
+    }
+}
+#[async_trait]
+impl MultimodalEncoder for HttpMultimodalEncoder {
+    fn space(&self) -> &EmbeddingSpaceId {
+        &self.config.space
+    }
+    fn capabilities(&self) -> EncoderCapabilities {
+        EncoderCapabilities {
+            modalities: self.config.modalities.clone(),
+            batch: self.config.max_batch_size > 1,
+            max_batch_size: self.config.max_batch_size,
+        }
+    }
+    async fn encode_batch(
+        &self,
+        inputs: &[EmbeddingInput],
+    ) -> agent_context_db_core::Result<Vec<EncodedEmbedding>> {
+        use base64::Engine as _;
+        if inputs.is_empty() || inputs.len() > self.config.max_batch_size {
+            return Err(ContextError::Unsupported(
+                "invalid multimodal batch size".into(),
+            ));
+        }
+        for input in inputs {
+            input.validate()?;
+            if !self.config.modalities.contains(&input.modality()) {
+                return Err(ContextError::Unsupported(format!(
+                    "unsupported modality: {:?}",
+                    input.modality()
+                )));
+            }
+        }
+        let encoded: Vec<Value> = inputs.iter().map(|i| match i {
+            EmbeddingInput::Text { text } => json!({"modality":"text","text":text}),
+            EmbeddingInput::Image { bytes, mime_type } => json!({"modality":"image","mime_type":mime_type,"data_base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+            EmbeddingInput::Audio { bytes, mime_type } => json!({"modality":"audio","mime_type":mime_type,"data_base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+        }).collect();
+        let mut request = self
+            .client
+            .post(&self.config.endpoint)
+            .json(&json!({"space":self.config.space,"inputs":encoded}));
+        if let Some(token) = &self.config.bearer_token {
+            request = request.bearer_auth(token);
+        }
+        for (name, value) in &self.config.headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ContextError::Unsupported(format!("multimodal request failed: {e}")))?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| ContextError::Unsupported(format!("invalid multimodal JSON: {e}")))?;
+        if !status.is_success() {
+            return Err(ContextError::Unsupported(format!(
+                "multimodal HTTP {status}: {body}"
+            )));
+        }
+        let items = body
+            .get("embeddings")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ContextError::Unsupported("missing embeddings array".into()))?;
+        if items.len() != inputs.len() {
+            return Err(ContextError::Unsupported(
+                "multimodal result count mismatch".into(),
+            ));
+        }
+        items
+            .iter()
+            .map(|item| {
+                let space: EmbeddingSpaceId =
+                    serde_json::from_value(item.get("space").cloned().ok_or_else(|| {
+                        ContextError::Unsupported("missing response space".into())
+                    })?)?;
+                if space != self.config.space {
+                    return Err(ContextError::Unsupported(
+                        "provider returned wrong embedding space".into(),
+                    ));
+                }
+                let values: Vec<f32> =
+                    serde_json::from_value(item.get("values").cloned().ok_or_else(|| {
+                        ContextError::Unsupported("missing embedding values".into())
+                    })?)?;
+                EncodedEmbedding::new(space, values)
+            })
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +246,19 @@ pub fn from_uwu_config(config: &UwuConfig) -> Result<Arc<dyn LlmClient>, LlmErro
 }
 
 pub fn from_llm_config(config: &LlmConfig) -> Result<Arc<dyn LlmClient>, LlmError> {
+    build_client_chain(config)
+}
+
+pub fn from_llm_config_with_policy(
+    config: &LlmConfig,
+    gate: Arc<dyn ExecutionGate>,
+    context: impl Fn(&str) -> ExecutionContext + Send + Sync + 'static,
+) -> Result<Arc<dyn LlmClient>, LlmError> {
+    let inner = build_client_chain(config)?;
+    Ok(Arc::new(PolicyEnforcedLlmClient::new(inner, gate, context)))
+}
+
+fn build_client_chain(config: &LlmConfig) -> Result<Arc<dyn LlmClient>, LlmError> {
     let provider_config = LlmProviderConfig::from_llm_config(config)?;
     let route_config = cascade_config_from_provider(&provider_config);
     let inner: Arc<dyn LlmClient> = match provider_config.provider {
@@ -826,6 +970,99 @@ fn extract_embeddings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_context_db_core::EmbeddingNormalization;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn multimodal_space() -> EmbeddingSpaceId {
+        EmbeddingSpaceId {
+            model: "clip".into(),
+            checkpoint: "v1".into(),
+            preprocess: "native-bytes-v1".into(),
+            dim: 2,
+            normalization: EmbeddingNormalization::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn multimodal_encoder_sends_actual_bytes_and_mime_types() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let space = multimodal_space();
+        let response_space = space.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")?
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .unwrap();
+                if request.len() >= header_end + 4 + length {
+                    break;
+                }
+            }
+            let body_start = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let body: Value = serde_json::from_slice(&request[body_start..]).unwrap();
+            assert_eq!(body["inputs"][0]["mime_type"], "image/png");
+            assert_eq!(body["inputs"][0]["data_base64"], "AAEC/w==");
+            assert_eq!(body["inputs"][1]["mime_type"], "audio/wav");
+            assert_eq!(body["inputs"][1]["data_base64"], "EBE=");
+            let payload = json!({"embeddings":[
+                {"space":response_space,"values":[1.0,0.0]},
+                {"space":response_space,"values":[0.0,1.0]}
+            ]})
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let encoder = HttpMultimodalEncoder::new(MultimodalProviderConfig {
+            endpoint: format!("http://{address}/encode"),
+            bearer_token: None,
+            headers: BTreeMap::new(),
+            space: space.clone(),
+            modalities: [Modality::Image, Modality::Audio].into_iter().collect(),
+            max_batch_size: 2,
+            timeout_secs: Some(5),
+        })
+        .unwrap();
+        let embeddings = encoder
+            .encode_batch(&[
+                EmbeddingInput::Image {
+                    bytes: vec![0, 1, 2, 255],
+                    mime_type: "image/png".into(),
+                },
+                EmbeddingInput::Audio {
+                    bytes: vec![16, 17],
+                    mime_type: "audio/wav".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(embeddings.len(), 2);
+        assert!(embeddings.iter().all(|embedding| embedding.space == space));
+        server.await.unwrap();
+    }
 
     #[test]
     fn openai_messages_marks_cacheable_prefix() {

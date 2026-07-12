@@ -291,17 +291,19 @@ impl MultiPerspectiveConsolidator {
             evidence.len()
         );
 
-        // 基于证据数量和内容长度估算置信度
-        let confidence = if evidence.is_empty() {
-            0.1
-        } else {
-            (evidence.len() as f32 / 5.0).min(1.0) * 0.7
-                + content_summaries
-                    .iter()
-                    .map(|s| (s.len() as f32 / 500.0).min(1.0))
-                    .sum::<f32>()
-                    / evidence.len().max(1) as f32
-                    * 0.3
+        // 本地模式只能证明证据覆盖度，不能从文本长度推断真实性。
+        // 重复 URI 不增加支持度；缺少独立证据时置信度保持保守。
+        let independent_evidence = evidence
+            .iter()
+            .map(|entry| entry.uri.to_string())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let confidence = match independent_evidence {
+            0 => 0.1,
+            1 => 0.25,
+            2 => 0.4,
+            3 => 0.52,
+            _ => 0.6,
         };
 
         // 发现知识缺口

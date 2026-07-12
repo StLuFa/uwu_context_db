@@ -257,12 +257,12 @@ impl DedupStore {
                     if let Some(bytes) = compressed {
                         let key = Self::blob_key(&hash_c);
                         if let Err(error) = cache.set(&key, &bytes, None).await {
-                            tracing::warn!(operation = "dedup_cache_set_blob", %key, %error, "best-effort dedup persistence failed");
+                            tracing::warn!(operation = "dedup_cache_set_blob", error = ?agent_context_db_core::ErrorReport::from_error(&error), "best-effort dedup persistence failed");
                         }
                     }
                     let key = Self::idx_key(&uri_c);
                     if let Err(error) = cache.set(&key, hash_c.as_bytes(), None).await {
-                        tracing::warn!(operation = "dedup_cache_set_index", %key, %error, "best-effort dedup persistence failed");
+                        tracing::warn!(operation = "dedup_cache_set_index", error = ?agent_context_db_core::ErrorReport::from_error(&error), "best-effort dedup persistence failed");
                     }
                 });
             }

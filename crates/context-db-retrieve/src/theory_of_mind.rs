@@ -36,6 +36,37 @@ pub struct TomObservation {
     pub observed_at: DateTime<Utc>,
 }
 
+impl TomObservation {
+    /// Converts an observation into the cross-domain reaction schema.
+    pub fn into_reaction(self, execution_id: impl Into<String>) -> agent_context_db_core::Reaction {
+        let outcome = match self.kind {
+            TomObservationKind::TrustSignal => parse_signed_score(&self.value)
+                .map(|v| (v + 1.0) * 0.5)
+                .unwrap_or(self.confidence),
+            TomObservationKind::KnowledgeGap => 0.0,
+            _ => self.confidence,
+        };
+        agent_context_db_core::Reaction {
+            id: format!(
+                "tom:{}:{}",
+                self.subject_id,
+                self.observed_at.timestamp_micros()
+            ),
+            subject_id: self.subject_id,
+            execution_id: execution_id.into(),
+            outcome,
+            predicted_outcome: Some(self.confidence),
+            observed_at: self.observed_at,
+            attributions: vec![agent_context_db_core::CausalAttribution {
+                cause_id: self.key.clone(),
+                credit: 1.0,
+                confidence: self.confidence,
+            }],
+            traits: std::collections::HashMap::from([(self.key, outcome)]),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeliefFacet {
     pub key: String,
@@ -72,6 +103,16 @@ impl TheoryOfMindModel {
     }
 
     pub fn apply_observation(&mut self, observation: TomObservation) {
+        self.apply_observation_with_reaction(observation, None, "theory-of-mind");
+    }
+
+    pub fn apply_observation_with_reaction(
+        &mut self,
+        observation: TomObservation,
+        sink: Option<&dyn agent_context_db_core::ReactionSink>,
+        execution_id: &str,
+    ) {
+        let reaction = sink.map(|_| observation.clone().into_reaction(execution_id));
         self.decay_to(observation.observed_at);
         let confidence = observation.confidence.clamp(0.0, 1.0);
         match observation.kind {
@@ -121,6 +162,9 @@ impl TheoryOfMindModel {
             }
         }
         self.updated_at = observation.observed_at;
+        if let (Some(sink), Some(reaction)) = (sink, reaction) {
+            sink.emit(reaction);
+        }
     }
 
     pub fn apply_observations(&mut self, observations: impl IntoIterator<Item = TomObservation>) {

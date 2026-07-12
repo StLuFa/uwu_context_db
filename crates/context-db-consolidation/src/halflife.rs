@@ -17,7 +17,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct HalfLifePrediction {
     pub half_life: HalfLife,
-    pub confidence: f32,
+    /// Uncalibrated rule/LLM signal strength. This is not a statistical confidence
+    /// and must not be interpreted as a probability of correctness.
+    pub heuristic_score: f32,
     pub reasoning: String,
 }
 
@@ -29,7 +31,7 @@ pub struct HalfLifePredictor {
 #[derive(Debug, Deserialize)]
 struct LlmHalfLifeResponse {
     half_life: HalfLife,
-    confidence: f32,
+    heuristic_score: f32,
     reasoning: String,
 }
 
@@ -56,7 +58,7 @@ Consider these factors:
 
 Return a JSON object with these fields:
 {{"half_life": {{"kind":"finite","days":<positive number>}} or {{"kind":"infinite"}},
-  "confidence": <0.0-1.0>,
+  "heuristic_score": <0.0-1.0 signal-strength score; not a probability or calibrated confidence>,
   "reasoning": "<one sentence explaining the decision>"}}"#
         );
 
@@ -77,8 +79,8 @@ Return a JSON object with these fields:
                     if let Some(half_life) = half_life {
                         return HalfLifePrediction {
                             half_life,
-                            confidence: if parsed.confidence.is_finite() {
-                                parsed.confidence.clamp(0.0, 1.0)
+                            heuristic_score: if parsed.heuristic_score.is_finite() {
+                                parsed.heuristic_score.clamp(0.0, 1.0)
                             } else {
                                 0.0
                             },
@@ -190,7 +192,8 @@ Return a JSON object with these fields:
         }
 
         let half_life_days = days.clamp(14.0, 730.0);
-        let confidence = (0.34 + signal_count as f32 * 0.075).min(0.74);
+        // Rule coverage only: no labelled outcomes or calibration back this value.
+        let heuristic_score = (0.34 + signal_count as f32 * 0.075).min(0.74);
         let reasoning = if reasons.is_empty() {
             "no strong decay signals; using medium-term review horizon".to_string()
         } else {
@@ -201,7 +204,7 @@ Return a JSON object with these fields:
             half_life: HalfLife::Finite {
                 days: half_life_days,
             },
-            confidence,
+            heuristic_score,
             reasoning,
         }
     }

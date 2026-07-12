@@ -17,7 +17,6 @@ use agent_context_db_core::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CdtConsolidationSignal {
@@ -64,8 +63,8 @@ impl CdtConsolidationBridge {
         }
     }
 
-    pub fn for_agent(agent_scope: impl Into<String>) -> Self {
-        Self::new(agent_scope, TenantId(Uuid::new_v4()))
+    pub fn for_agent(agent_scope: impl Into<String>, tenant: TenantId) -> Self {
+        Self::new(agent_scope, tenant)
     }
 
     pub fn product_from_gradient(&self, gradient: &CognitiveGradient) -> ConsolidationProduct {
@@ -427,7 +426,8 @@ mod tests {
 
     #[test]
     fn gradient_becomes_consolidation_product_and_entry() {
-        let bridge = CdtConsolidationBridge::for_agent("t/agent/cdt");
+        let bridge =
+            CdtConsolidationBridge::for_agent("t/agent/cdt", TenantId(uuid::Uuid::new_v4()));
         let gradient = CognitiveGradient {
             source_uri: uri("uwu://t/agent/cdt/skill/test"),
             epistemic_type: ContentType::Skill,
@@ -468,7 +468,8 @@ mod tests {
 
     #[test]
     fn hypothesis_outcome_survives_round_trip() {
-        let bridge = CdtConsolidationBridge::for_agent("t/agent/cdt");
+        let bridge =
+            CdtConsolidationBridge::for_agent("t/agent/cdt", TenantId(uuid::Uuid::new_v4()));
         let gradient = CognitiveGradient {
             source_uri: uri("uwu://t/agent/cdt/hypothesis/test"),
             epistemic_type: ContentType::Hypothesis,

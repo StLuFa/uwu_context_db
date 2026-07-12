@@ -101,12 +101,37 @@ pub fn point_from_entry(entry: &ContextEntry) -> Result<Option<IndexPoint>> {
     }))
 }
 
+fn mutation_order(mutation: &IndexMutation) -> (String, Option<i64>) {
+    match mutation {
+        IndexMutation::Upsert { point, .. } => (
+            point.uri.to_string(),
+            point
+                .payload
+                .get("mvcc_version")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| i64::try_from(v).ok()),
+        ),
+        IndexMutation::Delete { uri, .. } => (uri.to_string(), None),
+        IndexMutation::Rename { point, from, .. } => (
+            point
+                .as_ref()
+                .map_or_else(|| from.to_string(), |p| p.uri.to_string()),
+            point
+                .as_ref()
+                .and_then(|p| p.payload.get("mvcc_version"))
+                .and_then(|v| v.as_u64())
+                .and_then(|v| i64::try_from(v).ok()),
+        ),
+    }
+}
+
 pub async fn enqueue_pg(
     tx: &mut Transaction<'_, Postgres>,
     mutation: &IndexMutation,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO context_index_outbox (id, mutation_json, status, attempts, available_at, created_at, updated_at) VALUES ($1,$2,'pending',0,now(),now(),now())")
-        .bind(Uuid::now_v7()).bind(serde_json::to_value(mutation)?)
+    let (uri, version) = mutation_order(mutation);
+    sqlx::query("INSERT INTO context_index_outbox (id, mutation_json, uri, mvcc_version, status, attempts, available_at, created_at, updated_at) VALUES ($1,$2,$3,$4,'pending',0,now(),now(),now())")
+        .bind(Uuid::now_v7()).bind(serde_json::to_value(mutation)?).bind(uri).bind(version)
         .execute(&mut **tx).await.map_err(|e| ContextError::Storage(format!("enqueue index outbox: {e}")))?;
     Ok(())
 }
@@ -116,8 +141,9 @@ pub async fn enqueue_sqlite(
     mutation: &IndexMutation,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO context_index_outbox (id, mutation_json, status, attempts, available_at, created_at, updated_at) VALUES (?,?,'pending',0,?,?,?)")
-        .bind(Uuid::now_v7().to_string()).bind(serde_json::to_string(mutation)?).bind(&now).bind(&now).bind(&now)
+    let (uri, version) = mutation_order(mutation);
+    sqlx::query("INSERT INTO context_index_outbox (id, mutation_json, uri, mvcc_version, status, attempts, available_at, created_at, updated_at) VALUES (?,?,?,?,'pending',0,?,?,?)")
+        .bind(Uuid::now_v7().to_string()).bind(serde_json::to_string(mutation)?).bind(uri).bind(version).bind(&now).bind(&now).bind(&now)
         .execute(&mut **tx).await.map_err(|e| ContextError::Storage(format!("enqueue index outbox: {e}")))?;
     Ok(())
 }
@@ -161,7 +187,7 @@ impl OutboxRuntime {
 impl Drop for OutboxRuntime {
     fn drop(&mut self) {
         if let Err(error) = self.stop.send(true) {
-            tracing::warn!(%error, "failed to signal outbox worker during drop");
+            tracing::warn!(error = ?agent_context_db_core::ErrorReport::from_error(&error), "failed to signal outbox worker during drop");
         }
         if let Some(task) = self.task.take() {
             task.abort();
@@ -181,9 +207,9 @@ pub fn start_worker(
         loop {
             tokio::select! {
                 _ = stopped.changed() => if *stopped.borrow() { break },
-                _ = reconcile.tick() => { if let Err(e) = reconcile_all(&pool).await { tracing::error!(error=%e, "index reconciliation failed"); } },
+                _ = reconcile.tick() => { if let Err(e) = reconcile_all(&pool).await { tracing::error!(error = ?agent_context_db_core::ErrorReport::from_error(&e), "index reconciliation failed"); } },
                 _ = tokio::time::sleep(config.poll_interval) => {
-                    if let Err(e) = process_batch(&pool, index.as_ref(), &config).await { tracing::error!(error=%e, "index outbox batch failed"); }
+                    if let Err(e) = process_batch(&pool, index.as_ref(), &config).await { tracing::error!(error = ?agent_context_db_core::ErrorReport::from_error(&e), "index outbox batch failed"); }
                 }
             }
         }
@@ -234,7 +260,7 @@ async fn claim(pool: &DbPool, cfg: &OutboxConfig) -> Result<Vec<(String, IndexMu
                 .as_postgres()
                 .map_err(|e| ContextError::Storage(e.to_string()))?;
             let mut tx = pg.begin().await.map_err(err)?;
-            let rows: Vec<(Uuid,serde_json::Value,i32)>=sqlx::query_as("WITH picked AS (SELECT id FROM context_index_outbox WHERE (status IN ('pending','failed') AND available_at <= now()) OR (status='processing' AND lease_until < now()) ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE context_index_outbox o SET status='processing', lease_until=now()+($2 * interval '1 second'), attempts=attempts+1, updated_at=now() FROM picked WHERE o.id=picked.id RETURNING o.id,o.mutation_json,o.attempts")
+            let rows: Vec<(Uuid,serde_json::Value,i32)>=sqlx::query_as("WITH picked AS (SELECT id FROM context_index_outbox WHERE (status IN ('pending','failed') AND available_at <= now()) OR (status='processing' AND lease_until < now()) AND NOT EXISTS (SELECT 1 FROM context_index_outbox older WHERE older.uri=context_index_outbox.uri AND older.status NOT IN ('done','dead') AND (older.mvcc_version < context_index_outbox.mvcc_version OR (older.mvcc_version = context_index_outbox.mvcc_version AND older.created_at < context_index_outbox.created_at))) ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE context_index_outbox o SET status='processing', lease_until=now()+($2 * interval '1 second'), attempts=attempts+1, updated_at=now() FROM picked WHERE o.id=picked.id RETURNING o.id,o.mutation_json,o.attempts")
                 .bind(limit).bind(lease_secs).fetch_all(&mut *tx).await.map_err(err)?;
             tx.commit().await.map_err(err)?;
             rows.into_iter()
@@ -248,7 +274,7 @@ async fn claim(pool: &DbPool, cfg: &OutboxConfig) -> Result<Vec<(String, IndexMu
             let mut tx = db.begin().await.map_err(err)?;
             let now = chrono::Utc::now();
             let lease = (now + chrono::Duration::seconds(lease_secs)).to_rfc3339();
-            let rows: Vec<(String,String,i64)>=sqlx::query_as("UPDATE context_index_outbox SET status='processing', lease_until=?, attempts=attempts+1, updated_at=? WHERE id IN (SELECT id FROM context_index_outbox WHERE ((status IN ('pending','failed') AND available_at <= ?) OR (status='processing' AND lease_until < ?)) ORDER BY created_at LIMIT ?) RETURNING id,mutation_json,attempts")
+            let rows: Vec<(String,String,i64)>=sqlx::query_as("UPDATE context_index_outbox SET status='processing', lease_until=?, attempts=attempts+1, updated_at=? WHERE id IN (SELECT id FROM context_index_outbox WHERE ((status IN ('pending','failed') AND available_at <= ?) OR (status='processing' AND lease_until < ?)) AND NOT EXISTS (SELECT 1 FROM context_index_outbox older WHERE older.uri=context_index_outbox.uri AND older.status NOT IN ('done','dead') AND (older.mvcc_version < context_index_outbox.mvcc_version OR (older.mvcc_version = context_index_outbox.mvcc_version AND older.created_at < context_index_outbox.created_at))) ORDER BY created_at LIMIT ?) RETURNING id,mutation_json,attempts")
                 .bind(lease).bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(limit).fetch_all(&mut *tx).await.map_err(err)?;
             tx.commit().await.map_err(err)?;
             rows.into_iter()
@@ -577,7 +603,7 @@ mod tests {
         process_batch(&pool, &index, &config(3)).await.unwrap();
         assert!(index.contains("dedup", &value.uri));
         assert_eq!(index.points.lock().len(), 1);
-        assert_eq!(index.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(index.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

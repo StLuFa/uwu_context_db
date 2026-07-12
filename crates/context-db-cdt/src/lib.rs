@@ -654,6 +654,76 @@ pub struct FailureCase {
     pub root_cause_contradiction: Option<String>,
 }
 
+impl EvalResult {
+    /// Emits evaluation feedback on the runtime learning path and applies online
+    /// updates only when the caller's calibration boundary permits it.
+    pub fn emit_reactions(
+        &self,
+        subject_id: &str,
+        execution_id: &str,
+        sink: &std::sync::Arc<dyn agent_context_db_core::ReactionSink>,
+        updater: Option<&std::sync::Arc<dyn agent_context_db_core::OnlinePolicyUpdater>>,
+        calibration: agent_context_db_core::CalibrationMetrics,
+        config: agent_context_db_core::OnlineUpdateConfig,
+    ) {
+        for reaction in self.to_reactions(subject_id, execution_id) {
+            agent_context_db_core::emit_and_update(
+                sink,
+                updater,
+                reaction,
+                calibration.clone(),
+                config,
+            );
+        }
+    }
+
+    /// Adapts CDT feedback to the shared reaction/credit-assignment model.
+    pub fn to_reactions(
+        &self,
+        subject_id: &str,
+        execution_id: &str,
+    ) -> Vec<agent_context_db_core::Reaction> {
+        let now = chrono::Utc::now();
+        let mut reactions = Vec::with_capacity(self.successes.len() + self.failures.len());
+        for (index, success) in self.successes.iter().enumerate() {
+            reactions.push(agent_context_db_core::Reaction {
+                id: format!("cdt:{}:success:{}", self.epoch, index),
+                subject_id: subject_id.into(),
+                execution_id: execution_id.into(),
+                outcome: 1.0,
+                predicted_outcome: Some(self.accuracy.clamp(0.0, 1.0)),
+                observed_at: now,
+                attributions: vec![agent_context_db_core::CausalAttribution {
+                    cause_id: success.skill_extracted.clone(),
+                    credit: 1.0,
+                    confidence: self.accuracy.clamp(0.0, 1.0),
+                }],
+                traits: std::collections::HashMap::from([("skill_success".into(), 1.0)]),
+            });
+        }
+        for (index, failure) in self.failures.iter().enumerate() {
+            reactions.push(agent_context_db_core::Reaction {
+                id: format!("cdt:{}:failure:{}", self.epoch, index),
+                subject_id: subject_id.into(),
+                execution_id: execution_id.into(),
+                outcome: 0.0,
+                predicted_outcome: Some(self.accuracy.clamp(0.0, 1.0)),
+                observed_at: now,
+                attributions: vec![agent_context_db_core::CausalAttribution {
+                    cause_id: failure
+                        .root_cause_contradiction
+                        .clone()
+                        .unwrap_or_else(|| failure.description.clone()),
+                    credit: 1.0,
+                    confidence: 1.0,
+                }],
+                traits: std::collections::HashMap::from([("skill_success".into(), 0.0)]),
+            });
+        }
+        reactions
+    }
+}
+
 /// 将评估结果反馈为认知记忆。
 ///
 /// - 成功 case → Skill 记忆（可指导下轮训练）

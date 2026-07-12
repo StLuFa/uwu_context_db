@@ -103,15 +103,15 @@ pub enum ContentPayload {
     },
     /// 图像内容：缩略图 → 特征向量 → 原始像素
     Image {
-        thumbnail: Vec<u8>, // L0 ~256x256 JPEG
-        features: Vec<f32>, // L1 CLIP/DINO embedding
-        raw: BlobRef,       // L2 原始像素（存 BlobStore）
+        thumbnail: Vec<u8>,                            // L0 ~256x256 JPEG
+        features: crate::multimodal::EncodedEmbedding, // L1 image embedding with explicit space identity
+        raw: BlobRef,                                  // L2 原始像素（存 BlobStore）
     },
     /// 音频内容：转写 → 语音 embedding → 原始波形
     Audio {
-        transcript: String,  // L0 ASR 转写
-        embedding: Vec<f32>, // L1 语音特征
-        raw: BlobRef,        // L2 原始波形
+        transcript: String,                             // L0 ASR 转写
+        embedding: crate::multimodal::EncodedEmbedding, // L1 audio embedding with explicit space identity
+        raw: BlobRef,                                   // L2 原始波形
     },
     /// 结构化内容：JSON 原生存储 + 可选 schema 引用
     Structured {
@@ -194,7 +194,7 @@ impl ContentPayload {
                 );
                 append_optional(
                     &mut output.l1,
-                    &format!("[image feature_dimensions={}]", features.len()),
+                    &format!("[image feature_dimensions={}]", features.values.len()),
                 );
                 append(
                     &mut output.l2,
@@ -212,7 +212,7 @@ impl ContentPayload {
                 append(&mut output.l0, transcript);
                 append_optional(
                     &mut output.l1,
-                    &format!("[audio embedding_dimensions={}]", embedding.len()),
+                    &format!("[audio embedding_dimensions={}]", embedding.values.len()),
                 );
                 append(
                     &mut output.l2,

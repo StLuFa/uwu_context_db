@@ -357,8 +357,8 @@ impl GraphTraverseOp {
                     },
                 })
             }
-            Err(e) => {
-                tracing::warn!(error=%e, "graph traverse failed, returning seeds");
+            Err(_error) => {
+                tracing::warn!(error = ?agent_context_db_core::ErrorReport::new(agent_context_db_core::ErrorKind::Downstream, false, None), "graph traverse failed, returning seeds");
                 Ok(seed_batch)
             }
         }

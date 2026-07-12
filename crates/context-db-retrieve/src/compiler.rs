@@ -67,21 +67,12 @@ pub struct RetrieverCompiler {
 }
 
 impl RetrieverCompiler {
-<<<<<<< Updated upstream
-    pub fn new(planner: Arc<dyn QueryPlanner>) -> Self {
-        let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
-        Self {
-            planner,
-            optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
-        }
-=======
     pub fn new(
         planner: Arc<dyn QueryPlanner>,
     ) -> std::result::Result<Self, crate::RetrieveConfigError> {
         let config = crate::QueryPlanConfig::default();
         let stats = Arc::new(StatisticsCollector::new(config)?);
         Self::with_stats(planner, stats)
->>>>>>> Stashed changes
     }
 
     /// 使用外部统计信息构建（用于 CBO 代价估算更准确）。
@@ -91,13 +82,8 @@ impl RetrieverCompiler {
     ) -> std::result::Result<Self, crate::RetrieveConfigError> {
         Ok(Self {
             planner,
-<<<<<<< Updated upstream
-            optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
-        }
-=======
             optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default())?,
         })
->>>>>>> Stashed changes
     }
 
     /// 编译自然语言查询 → CompiledPlan（异步，需 LLM/规则解析）。
@@ -198,7 +184,7 @@ pub struct CompiledRetriever {
     executor: PlanExecutor,
     reranker: Arc<dyn crate::Reranker>,
     /// 已编译计划缓存（query hash → CompiledPlan）。
-    plan_cache: parking_lot::Mutex<std::collections::HashMap<u64, CompiledPlan>>,
+    plan_cache: parking_lot::Mutex<crate::cache::BoundedLruCache<u64, CompiledPlan>>,
 }
 
 impl CompiledRetriever {
@@ -207,11 +193,28 @@ impl CompiledRetriever {
         exec_ctx: ExecContext,
         reranker: Arc<dyn crate::Reranker>,
     ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        Self::with_plan_cache_config(
+            planner,
+            exec_ctx,
+            reranker,
+            crate::PlanCacheConfig::default(),
+        )
+    }
+
+    pub fn with_plan_cache_config(
+        planner: Arc<dyn QueryPlanner>,
+        exec_ctx: ExecContext,
+        reranker: Arc<dyn crate::Reranker>,
+        plan_cache_config: crate::PlanCacheConfig,
+    ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        let plan_cache_config = plan_cache_config.validate()?;
         Ok(Self {
             compiler: RetrieverCompiler::new(planner)?,
             executor: PlanExecutor::new(exec_ctx),
             reranker,
-            plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            plan_cache: parking_lot::Mutex::new(crate::cache::BoundedLruCache::new(
+                plan_cache_config.capacity,
+            )),
         })
     }
 
@@ -221,7 +224,7 @@ impl CompiledRetriever {
 
         // 尝试从缓存读取已编译计划
         let compiled = {
-            let cache = self.plan_cache.lock();
+            let mut cache = self.plan_cache.lock();
             cache.get(&cache_key).cloned()
         };
 

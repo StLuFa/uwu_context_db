@@ -30,7 +30,7 @@ pub use agent_context_db_core::{
     VectorIndex, WatchHub, WatchSource, WatchableStore,
 };
 
-pub use graph::GraphCentralityConfig;
+pub use graph::{BatchWriteConfig, GraphCentralityConfig};
 pub use migrations::context_db_migrations;
 pub use perf::{
     BatchWriteBuffer, DedupStore, WalEntry, WriteAheadLogger, compress, content_hash, decompress,

@@ -299,6 +299,38 @@ pub fn context_db_migrations() -> Vec<SqlMigration> {
             "#,
             None::<&str>,
         ),
+        SqlMigration::new(
+            14,
+            "create_graph_revision_and_centrality",
+            r#"
+            CREATE TABLE IF NOT EXISTS context_graph_revisions (
+                scope TEXT PRIMARY KEY,
+                revision BIGINT NOT NULL CHECK (revision >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS context_graph_mutations (
+                scope TEXT NOT NULL,
+                revision BIGINT NOT NULL,
+                operation TEXT NOT NULL,
+                from_uri TEXT,
+                to_uri TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (scope, revision)
+            );
+            CREATE TABLE IF NOT EXISTS context_graph_centrality (
+                scope TEXT NOT NULL,
+                revision BIGINT NOT NULL,
+                algorithm_config TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                score REAL NOT NULL,
+                PRIMARY KEY (scope, revision, algorithm_config, uri)
+            );
+            ALTER TABLE context_index_outbox ADD COLUMN IF NOT EXISTS uri TEXT;
+            ALTER TABLE context_index_outbox ADD COLUMN IF NOT EXISTS mvcc_version BIGINT;
+            CREATE INDEX IF NOT EXISTS idx_context_index_outbox_uri_version
+                ON context_index_outbox (uri, mvcc_version, created_at);
+            "#,
+            None::<&str>,
+        ),
     ]
 }
 

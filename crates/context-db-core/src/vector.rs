@@ -1,30 +1,19 @@
-//! 向量索引端口（M0 轻量 trait，零外部依赖）。
-//!
-//! 从 `context-db-storage` 提升至 core，使检索层可依赖此端口而不反向依赖存储层。
-//! 后端适配器（Qdrant/Pgvector/Memory）由 storage 层实现。
-
-use crate::error::Result;
+//! Vector index ports, including a space-safe typed API.
 use crate::llm::EmbeddingVector;
-use crate::uri::ContextUri;
+use crate::{ContextError, ContextUri, EmbeddingSpaceId, EncodedEmbedding, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// 索引写入点：URI + 向量 + 可选 payload。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexPoint {
-    /// 指向内容层的 uwu:// URI。
     pub uri: ContextUri,
     pub vector: Vec<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_model_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_dim: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_version: Option<u64>,
     #[serde(default)]
     pub payload: serde_json::Value,
 }
-
 impl IndexPoint {
     pub fn from_embedding(
         uri: ContextUri,
@@ -40,9 +29,21 @@ impl IndexPoint {
             payload,
         }
     }
+    pub fn from_encoded(
+        uri: ContextUri,
+        embedding: EncodedEmbedding,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            uri,
+            embedding_model_id: Some(embedding.space.model.clone()),
+            embedding_dim: Some(embedding.space.dim),
+            embedding_version: None,
+            vector: embedding.values,
+            payload,
+        }
+    }
 }
-
-/// 从索引按 URI 读取的完整向量记录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexVector {
     pub uri: ContextUri,
@@ -52,8 +53,6 @@ pub struct IndexVector {
     pub embedding_version: Option<u64>,
     pub payload: serde_json::Value,
 }
-
-/// 索引命中结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexHit {
     pub uri: ContextUri,
@@ -61,13 +60,9 @@ pub struct IndexHit {
     pub payload: serde_json::Value,
 }
 
-/// 向量索引端口 —— 检索层通过它做向量召回，不感知具体后端。
 #[async_trait]
 pub trait VectorIndex: Send + Sync {
-    /// 写入/更新一个索引点。
     async fn upsert(&self, collection: &str, point: IndexPoint) -> Result<()>;
-
-    /// 相似度检索，返回 top_k 结果。
     async fn search(
         &self,
         collection: &str,
@@ -75,14 +70,85 @@ pub trait VectorIndex: Send + Sync {
         top_k: usize,
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<IndexHit>>;
-
-    /// 在一次后端调用中按 URI 批量读取完整向量。结果顺序不作保证；缺失 URI 不返回。
     async fn get_many(&self, _collection: &str, _uris: &[ContextUri]) -> Result<Vec<IndexVector>> {
-        Err(crate::error::ContextError::Storage(
+        Err(ContextError::Storage(
             "vector backend does not support batch retrieval".into(),
         ))
     }
-
-    /// 按 URI 删除索引点。
     async fn delete(&self, collection: &str, uri: &ContextUri) -> Result<()>;
+}
+
+#[async_trait]
+impl<T: VectorIndex + ?Sized> VectorIndex for &T {
+    async fn upsert(&self, collection: &str, point: IndexPoint) -> Result<()> {
+        (**self).upsert(collection, point).await
+    }
+
+    async fn search(
+        &self,
+        collection: &str,
+        query: Vec<f32>,
+        top_k: usize,
+        filter: Option<serde_json::Value>,
+    ) -> Result<Vec<IndexHit>> {
+        (**self).search(collection, query, top_k, filter).await
+    }
+
+    async fn get_many(&self, collection: &str, uris: &[ContextUri]) -> Result<Vec<IndexVector>> {
+        (**self).get_many(collection, uris).await
+    }
+
+    async fn delete(&self, collection: &str, uri: &ContextUri) -> Result<()> {
+        (**self).delete(collection, uri).await
+    }
+}
+
+/// Mandatory space-aware facade for all new query/upsert paths. A collection is bound to one exact space.
+pub struct SpaceCheckedVectorIndex<I> {
+    inner: I,
+    collection: String,
+    space: EmbeddingSpaceId,
+}
+impl<I> SpaceCheckedVectorIndex<I> {
+    pub fn new(inner: I, collection: impl Into<String>, space: EmbeddingSpaceId) -> Result<Self> {
+        space.validate()?;
+        Ok(Self {
+            inner,
+            collection: collection.into(),
+            space,
+        })
+    }
+    pub fn space(&self) -> &EmbeddingSpaceId {
+        &self.space
+    }
+}
+impl<I: VectorIndex> SpaceCheckedVectorIndex<I> {
+    pub async fn upsert(
+        &self,
+        uri: ContextUri,
+        embedding: EncodedEmbedding,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        embedding.ensure_space(&self.space)?;
+        self.inner
+            .upsert(
+                &self.collection,
+                IndexPoint::from_encoded(uri, embedding, payload),
+            )
+            .await
+    }
+    pub async fn search(
+        &self,
+        query: EncodedEmbedding,
+        top_k: usize,
+        filter: Option<serde_json::Value>,
+    ) -> Result<Vec<IndexHit>> {
+        query.ensure_space(&self.space)?;
+        self.inner
+            .search(&self.collection, query.values, top_k, filter)
+            .await
+    }
+    pub async fn delete(&self, uri: &ContextUri) -> Result<()> {
+        self.inner.delete(&self.collection, uri).await
+    }
 }

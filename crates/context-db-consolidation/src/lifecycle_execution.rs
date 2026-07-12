@@ -8,10 +8,11 @@
 use agent_context_db_core::{
     BlobRef, BlobStore, ContentLevel, ContentPart, ContentPayload, ContentStore, ContextEntry,
     ContextError, ContextUri, GraphRelation, GraphStore, IndexPoint, LifecycleAction, PageRequest,
-    Result, VectorIndex,
+    Result, StateScope, UriCategory, VectorIndex,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -35,6 +36,32 @@ pub enum LifecycleOperation {
     Delete,
     ColdStorage,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetacogTier {
+    Hot,
+    Cold,
+}
+
+/// Deterministic heat routing for metacognitive state. Mid-horizon observations
+/// are cold; immediate state and durable learned rules remain directly available.
+pub fn metacog_tier(entry: &ContextEntry) -> Result<MetacogTier> {
+    if entry.uri.category() != UriCategory::Metacog {
+        return Err(ContextError::InvalidUri(format!(
+            "heat routing is only defined for metacog entries: {}",
+            entry.uri
+        )));
+    }
+    match entry.metadata.state_scope {
+        Some(StateScope::Mid) => Ok(MetacogTier::Cold),
+        Some(StateScope::Short | StateScope::Long) => Ok(MetacogTier::Hot),
+        None => Err(ContextError::Storage(format!(
+            "metacog entry {} has no state scope",
+            entry.uri
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LifecycleCheckpoint {
     pub manifest: bool,
@@ -62,6 +89,14 @@ pub struct LifecycleJob {
     pub checkpoint: LifecycleCheckpoint,
     pub last_error: Option<String>,
     pub audit: Vec<LifecycleAudit>,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub lease_owner: Option<Uuid>,
+    #[serde(default)]
+    pub lease_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub restore_checkpoint: LifecycleCheckpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,31 +196,96 @@ impl FileLifecycleJournal {
             jobs: Mutex::new(jobs),
         })
     }
-    async fn save(&self, jobs: &BTreeMap<String, LifecycleJob>) -> Result<()> {
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+    fn transact<T>(
+        &self,
+        f: impl FnOnce(&mut BTreeMap<String, LifecycleJob>) -> Result<T>,
+    ) -> Result<T> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        atomic_write(&self.path, &serde_json::to_vec(jobs)?)
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.lock_path())?;
+        lock.lock_exclusive()?;
+        let mut jobs = if self.path.exists() {
+            serde_json::from_slice(&std::fs::read(&self.path)?)?
+        } else {
+            BTreeMap::new()
+        };
+        let result = f(&mut jobs)?;
+        atomic_write(&self.path, &serde_json::to_vec(&jobs)?)?;
+        lock.unlock()?;
+        Ok(result)
     }
     pub async fn upsert(&self, job: LifecycleJob) -> Result<LifecycleJob> {
-        let mut jobs = self.jobs.lock().await;
-        if let Some(existing) = jobs.get(&job.idempotency_key) {
-            return Ok(existing.clone());
-        }
-        jobs.insert(job.idempotency_key.clone(), job.clone());
-        self.save(&jobs).await?;
-        Ok(job)
+        let result = self.transact(|jobs| {
+            if let Some(existing) = jobs.get(&job.idempotency_key) {
+                return Ok(existing.clone());
+            }
+            jobs.insert(job.idempotency_key.clone(), job.clone());
+            Ok(job)
+        })?;
+        *self.jobs.lock().await = self.load()?;
+        Ok(result)
     }
-    async fn update(&self, job: LifecycleJob) -> Result<()> {
-        let mut jobs = self.jobs.lock().await;
-        jobs.insert(job.idempotency_key.clone(), job);
-        self.save(&jobs).await
+    fn load(&self) -> Result<BTreeMap<String, LifecycleJob>> {
+        if self.path.exists() {
+            Ok(serde_json::from_slice(&std::fs::read(&self.path)?)?)
+        } else {
+            Ok(BTreeMap::new())
+        }
+    }
+    async fn update(&self, job: &mut LifecycleJob) -> Result<()> {
+        self.transact(|jobs| {
+            let current = jobs
+                .get(&job.idempotency_key)
+                .ok_or_else(|| ContextError::NotFound(job.idempotency_key.clone()))?;
+            if current.revision != job.revision {
+                return Err(ContextError::VersionConflict(format!(
+                    "stale lifecycle revision for {}",
+                    job.idempotency_key
+                )));
+            }
+            job.revision += 1;
+            jobs.insert(job.idempotency_key.clone(), job.clone());
+            Ok(())
+        })
+    }
+    async fn claim(
+        &self,
+        key: &str,
+        owner: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<LifecycleJob>> {
+        self.transact(|jobs| {
+            let Some(job) = jobs.get_mut(key) else {
+                return Ok(None);
+            };
+            if job.next_attempt_at > now
+                || matches!(
+                    job.state,
+                    LifecycleJobState::Succeeded | LifecycleJobState::PermanentlyFailed
+                )
+                || job.lease_until.is_some_and(|until| until > now)
+            {
+                return Ok(None);
+            }
+            job.lease_owner = Some(owner);
+            job.lease_until = Some(now + chrono::Duration::seconds(30));
+            job.revision += 1;
+            Ok(Some(job.clone()))
+        })
     }
     pub async fn recoverable(&self, now: DateTime<Utc>) -> Vec<LifecycleJob> {
-        self.jobs
-            .lock()
-            .await
-            .values()
+        self.load()
+            .unwrap_or_default()
+            .into_values()
             .filter(|j| {
                 matches!(
                     j.state,
@@ -193,12 +293,12 @@ impl FileLifecycleJournal {
                         | LifecycleJobState::Running
                         | LifecycleJobState::Retryable
                 ) && j.next_attempt_at <= now
+                    && j.lease_until.is_none_or(|until| until <= now)
             })
-            .cloned()
             .collect()
     }
     pub async fn get(&self, key: &str) -> Option<LifecycleJob> {
-        self.jobs.lock().await.get(key).cloned()
+        self.load().ok()?.get(key).cloned()
     }
 }
 
@@ -210,6 +310,7 @@ pub struct LifecycleActionExecutor {
     blobs: Arc<dyn LifecycleBlobStore>,
     cold: Arc<dyn ColdStorage>,
     collection: String,
+    key_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 impl LifecycleActionExecutor {
     pub fn new(
@@ -229,6 +330,7 @@ impl LifecycleActionExecutor {
             blobs,
             cold,
             collection: collection.into(),
+            key_locks: Mutex::new(BTreeMap::new()),
         }
     }
     pub async fn submit(&self, uri: ContextUri, action: LifecycleAction) -> Result<LifecycleJob> {
@@ -262,22 +364,57 @@ impl LifecycleActionExecutor {
                 state: LifecycleJobState::Pending,
                 message: "accepted".into(),
             }],
+            revision: 0,
+            lease_owner: None,
+            lease_until: None,
+            restore_checkpoint: Default::default(),
         };
         self.journal.upsert(job).await
     }
+    pub async fn route_metacog(&self, entry: &ContextEntry) -> Result<Option<LifecycleJob>> {
+        match metacog_tier(entry)? {
+            MetacogTier::Hot => Ok(None),
+            MetacogTier::Cold => self
+                .submit(
+                    entry.uri.clone(),
+                    LifecycleAction::Downgrade {
+                        to_level: ContentLevel::L1,
+                    },
+                )
+                .await
+                .map(Some),
+        }
+    }
+
     pub async fn run_pending(&self) -> Result<Vec<LifecycleJob>> {
         let mut out = Vec::new();
+        let owner = Uuid::new_v4();
         for j in self.journal.recoverable(Utc::now()).await {
-            out.push(self.execute(j).await?);
+            let Some(current) = self
+                .journal
+                .claim(&j.idempotency_key, owner, Utc::now())
+                .await?
+            else {
+                continue;
+            };
+            out.push(self.execute(current).await?);
         }
         Ok(out)
+    }
+
+    async fn lock_for(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.key_locks.lock().await;
+        locks
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
     async fn execute(&self, mut job: LifecycleJob) -> Result<LifecycleJob> {
         job.state = LifecycleJobState::Running;
         job.attempts += 1;
         audit(&mut job, "attempt started");
         // The running checkpoint must be durable before any destructive backend operation.
-        self.journal.update(job.clone()).await?;
+        self.journal.update(&mut job).await?;
         let result = self.execute_phases(&mut job).await;
         match result {
             Ok(()) => {
@@ -297,12 +434,15 @@ impl LifecycleActionExecutor {
                 audit(&mut job, &format!("execution failed: {e}"));
             }
         }
+        // Release the durable lease as part of the final CAS transition.
+        job.lease_owner = None;
+        job.lease_until = None;
         // Never report a state transition that failed to reach durable storage.
-        self.journal.update(job.clone()).await?;
+        self.journal.update(&mut job).await?;
         Ok(job)
     }
     async fn execute_phases(&self, job: &mut LifecycleJob) -> Result<()> {
-        let key = &job.idempotency_key;
+        let key = job.idempotency_key.clone();
         if !job.checkpoint.manifest {
             let entry = self.read_entry(&job.uri).await?;
             let blobs = collect_blobs(&entry.payload);
@@ -314,7 +454,7 @@ impl LifecycleActionExecutor {
             let vector = self.vector.get_point(&self.collection, &job.uri).await?;
             self.cold
                 .put_manifest(
-                    key,
+                    &key,
                     &ArchiveManifest {
                         job_id: job.id,
                         entry,
@@ -326,33 +466,33 @@ impl LifecycleActionExecutor {
                 )
                 .await?;
             job.checkpoint.manifest = true;
-            self.journal.update(job.clone()).await?;
+            self.journal.update(job).await?;
         }
         if !job.checkpoint.vector {
             self.vector.delete(&self.collection, &job.uri).await?;
             job.checkpoint.vector = true;
-            self.journal.update(job.clone()).await?;
+            self.journal.update(job).await?;
         }
         if !job.checkpoint.graph {
-            let edges = self.cold.get_manifest(key).await?.edges;
+            let edges = self.cold.get_manifest(&key).await?.edges;
             for (from, to, _) in edges {
                 self.graph.remove_edge(&from, &to).await?;
             }
             job.checkpoint.graph = true;
-            self.journal.update(job.clone()).await?;
+            self.journal.update(job).await?;
         }
         if !job.checkpoint.content {
             self.content.delete(&job.uri).await?;
             job.checkpoint.content = true;
-            self.journal.update(job.clone()).await?;
+            self.journal.update(job).await?;
         }
         if !job.checkpoint.blobs {
-            let blobs = self.cold.get_manifest(key).await?.blobs;
+            let blobs = self.cold.get_manifest(&key).await?.blobs;
             for (blob, _) in blobs {
                 self.blobs.delete(&blob).await?;
             }
             job.checkpoint.blobs = true;
-            self.journal.update(job.clone()).await?;
+            self.journal.update(job).await?;
         }
         Ok(())
     }
@@ -371,19 +511,61 @@ impl LifecycleActionExecutor {
         self.graph.edges_for(uri).await
     }
     pub async fn restore(&self, key: &str) -> Result<()> {
+        let lock = self.lock_for(key).await;
+        let _guard = lock.lock().await;
         let m = self.cold.get_manifest(key).await?;
-        for (r, data) in &m.blobs {
-            let written = self.blobs.put(data, &r.mime_type).await?;
-            if written.hash != r.hash {
-                return Err(ContextError::Storage("restored blob hash mismatch".into()));
+        if let Some(job) = self.journal.get(key).await
+            && job.state != LifecycleJobState::Succeeded
+        {
+            return Err(ContextError::VersionConflict(format!(
+                "cannot restore incomplete lifecycle job {key}"
+            )));
+        }
+        let mut job = self
+            .journal
+            .get(key)
+            .await
+            .ok_or_else(|| ContextError::NotFound(key.into()))?;
+        if !job.restore_checkpoint.blobs {
+            for (r, data) in &m.blobs {
+                let written = self.blobs.put(data, &r.mime_type).await?;
+                if written.hash != r.hash {
+                    return Err(ContextError::Storage("restored blob hash mismatch".into()));
+                }
             }
+            job.restore_checkpoint.blobs = true;
+            self.journal.update(&mut job).await?;
         }
-        self.content.write(m.entry).await?;
-        for (from, to, k) in m.edges {
-            self.graph.add_edge(&from, &to, k).await?;
+        if !job.restore_checkpoint.content {
+            match self.read_entry(&m.entry.uri).await {
+                Ok(existing) if serde_json::to_vec(&existing)? != serde_json::to_vec(&m.entry)? => {
+                    return Err(ContextError::VersionConflict(format!(
+                        "hot entry changed since cold snapshot: {}",
+                        m.entry.uri
+                    )));
+                }
+                Ok(_) => {}
+                Err(ContextError::NotFound(_)) => {
+                    self.content.write(m.entry.clone()).await?;
+                }
+                Err(error) => return Err(error),
+            }
+            job.restore_checkpoint.content = true;
+            self.journal.update(&mut job).await?;
         }
-        if let Some(point) = m.vector {
-            self.vector.upsert(&self.collection, point).await?;
+        if !job.restore_checkpoint.graph {
+            for (from, to, kind) in &m.edges {
+                self.graph.add_edge(from, to, *kind).await?;
+            }
+            job.restore_checkpoint.graph = true;
+            self.journal.update(&mut job).await?;
+        }
+        if !job.restore_checkpoint.vector {
+            if let Some(point) = m.vector {
+                self.vector.upsert(&self.collection, point).await?;
+            }
+            job.restore_checkpoint.vector = true;
+            self.journal.update(&mut job).await?;
         }
         Ok(())
     }
@@ -781,6 +963,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metacog_heat_model_is_namespace_specific_and_deterministic() {
+        let tenant = TenantId(Uuid::new_v4());
+        let mut entry = ContextEntry::new_text(
+            ContextUri::parse(format!("uwu://{}/metacog/reflection/item", tenant.0)).unwrap(),
+            tenant,
+            "reflection",
+        );
+        entry.metadata.state_scope = Some(StateScope::Mid);
+        assert_eq!(metacog_tier(&entry).unwrap(), MetacogTier::Cold);
+        entry.metadata.state_scope = Some(StateScope::Long);
+        assert_eq!(metacog_tier(&entry).unwrap(), MetacogTier::Hot);
+        entry.uri = ContextUri::parse(format!("uwu://{}/state/runtime/item", tenant.0)).unwrap();
+        assert!(metacog_tier(&entry).is_err());
+    }
+
     #[tokio::test]
     async fn submit_persists_pending_job() {
         let f = fixture().await;
@@ -856,7 +1054,7 @@ mod tests {
         let failed = f.executor.run_pending().await.unwrap().pop().unwrap();
         let mut due = failed;
         due.next_attempt_at = Utc::now() - chrono::Duration::seconds(1);
-        f.journal.update(due).await.unwrap();
+        f.journal.update(&mut due).await.unwrap();
         let retried = f.executor.run_pending().await.unwrap().pop().unwrap();
         assert_eq!(retried.state, LifecycleJobState::Succeeded);
         assert_eq!(retried.attempts, 2);
@@ -940,5 +1138,31 @@ mod tests {
             f.outgoing.clone(),
             GraphRelation::DerivedFrom
         )));
+
+        // Repeated and concurrent on-demand reads converge without duplicate graph state.
+        let key = submitted.idempotency_key.clone();
+        let (a, b) = tokio::join!(f.executor.restore(&key), f.executor.restore(&key));
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(f.ports.edges_for(&f.uri).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn metacog_cold_to_hot_closed_loop() {
+        let mut f = fixture().await;
+        f.entry.uri = ContextUri::parse(format!(
+            "uwu://{}/metacog/reflection/item",
+            f.entry.tenant.0
+        ))
+        .unwrap();
+        f.entry.metadata.state_scope = Some(StateScope::Mid);
+        f.uri = f.entry.uri.clone();
+        f.ports.write(f.entry.clone()).await.unwrap();
+        let job = f.executor.route_metacog(&f.entry).await.unwrap().unwrap();
+        let completed = f.executor.run_pending().await.unwrap();
+        assert_eq!(completed[0].state, LifecycleJobState::Succeeded);
+        assert!(!f.ports.contains_entry(&f.uri).await);
+        f.executor.restore(&job.idempotency_key).await.unwrap();
+        assert!(f.ports.contains_entry(&f.uri).await);
     }
 }

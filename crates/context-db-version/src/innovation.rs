@@ -7,7 +7,6 @@ use agent_context_db_core::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::{CommitId, TemporalReasoner, VersionStore};
 
@@ -47,9 +46,9 @@ pub struct CrystalWritebackConfig {
 }
 
 impl CrystalWritebackConfig {
-    pub fn for_agent(agent_scope: impl Into<String>) -> Self {
+    pub fn for_agent(agent_scope: impl Into<String>, tenant: TenantId) -> Self {
         Self {
-            tenant: TenantId(Uuid::new_v4()),
+            tenant,
             agent_scope: agent_scope.into(),
             min_confidence: 0.35,
             write_dream_insights: true,
@@ -339,7 +338,11 @@ Return a JSON array of crystals:
             confidence: f32,
         }
 
-        let raw: Vec<RawCrystal> = serde_json::from_str(&response).unwrap_or_default();
+        let raw: Vec<RawCrystal> = serde_json::from_str(&response).map_err(|error| {
+            agent_context_db_core::ContextError::Storage(format!(
+                "distill returned invalid JSON: {error}"
+            ))
+        })?;
 
         Ok(raw
             .into_iter()
@@ -482,8 +485,7 @@ Return JSON array of repair actions:
             .map_err(|e| crate::VersionError::Storage(format!("self-heal llm: {e}")))?;
 
         // 解析 LLM 建议的修复方案
-        let actions = parse_repair_actions(&response, scope);
-        Ok(actions)
+        parse_repair_actions(&response, scope)
     }
 }
 
@@ -1561,7 +1563,7 @@ fn apply_intervention(graph: &CausalGraph, intervention: CausalIntervention) -> 
 }
 
 /// 解析 LLM 返回的 JSON 修复方案。
-fn parse_repair_actions(response: &str, scope: &ContextUri) -> Vec<RepairAction> {
+fn parse_repair_actions(response: &str, scope: &ContextUri) -> crate::Result<Vec<RepairAction>> {
     #[derive(serde::Deserialize)]
     struct RawAction {
         action: String,
@@ -1571,9 +1573,12 @@ fn parse_repair_actions(response: &str, scope: &ContextUri) -> Vec<RepairAction>
     }
 
     let json_str = extract_json_array(response);
-    let raw: Vec<RawAction> = serde_json::from_str(&json_str).unwrap_or_default();
+    let raw: Vec<RawAction> = serde_json::from_str(&json_str).map_err(|error| {
+        crate::VersionError::Storage(format!("self-heal returned invalid JSON: {error}"))
+    })?;
 
-    raw.into_iter()
+    Ok(raw
+        .into_iter()
         .map(|r| {
             let target_id = parse_commit_id(&r.target);
             match r.action.as_str() {
@@ -1593,7 +1598,7 @@ fn parse_repair_actions(response: &str, scope: &ContextUri) -> Vec<RepairAction>
                 },
             }
         })
-        .collect()
+        .collect())
 }
 
 /// 尝试从 LLM 返回的 target 字符串解析 CommitId。
@@ -1652,7 +1657,7 @@ mod tests {
             expected_outcome: "fewer rollout failures".into(),
         };
         let writer = CrystalMemoryWriter::new(CrystalWritebackConfig {
-            tenant: TenantId(Uuid::new_v4()),
+            tenant: TenantId(uuid::Uuid::new_v4()),
             agent_scope: "t/a".into(),
             min_confidence: 0.35,
             write_dream_insights: true,
@@ -1676,7 +1681,10 @@ mod tests {
 
     #[test]
     fn crystal_writer_turns_dream_insights_into_heuristics() {
-        let writer = CrystalMemoryWriter::new(CrystalWritebackConfig::for_agent("t/a"));
+        let writer = CrystalMemoryWriter::new(CrystalWritebackConfig::for_agent(
+            "t/a",
+            TenantId(uuid::Uuid::nil()),
+        ));
         let report = writer
             .entries_from_dream_insights(&["cluster auth failures into retry heuristic".into()])
             .unwrap();

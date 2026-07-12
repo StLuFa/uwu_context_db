@@ -66,6 +66,49 @@ pub struct MeshDiscoveryOpts {
     pub fetch_peers: usize,
     pub final_top_k: usize,
     pub deadline_ms: u64,
+    pub peer_timeout_ms: u64,
+    pub max_concurrency: usize,
+}
+
+impl MeshDiscoveryOpts {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_peers == 0 {
+            return Err(KnowledgeNetworkError::Planner(
+                "max_peers must be greater than zero".into(),
+            ));
+        }
+        if self.probe_peers == 0 || self.fetch_peers == 0 {
+            return Err(KnowledgeNetworkError::Planner(
+                "probe_peers and fetch_peers must be greater than zero".into(),
+            ));
+        }
+        if self.probe_peers > self.max_peers || self.fetch_peers > self.max_peers {
+            return Err(KnowledgeNetworkError::Planner(
+                "probe_peers and fetch_peers must not exceed max_peers".into(),
+            ));
+        }
+        if self.final_top_k == 0 {
+            return Err(KnowledgeNetworkError::Planner(
+                "final_top_k must be greater than zero".into(),
+            ));
+        }
+        if self.deadline_ms == 0 || self.peer_timeout_ms == 0 {
+            return Err(KnowledgeNetworkError::Planner(
+                "deadline_ms and peer_timeout_ms must be greater than zero".into(),
+            ));
+        }
+        if self.peer_timeout_ms > self.deadline_ms {
+            return Err(KnowledgeNetworkError::Planner(
+                "peer_timeout_ms must not exceed deadline_ms".into(),
+            ));
+        }
+        if self.max_concurrency == 0 || self.max_concurrency > self.max_peers {
+            return Err(KnowledgeNetworkError::Planner(
+                "max_concurrency must be between 1 and max_peers".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for MeshDiscoveryOpts {
@@ -78,6 +121,8 @@ impl Default for MeshDiscoveryOpts {
             fetch_peers: 6,
             final_top_k: 20,
             deadline_ms: 800,
+            peer_timeout_ms: 250,
+            max_concurrency: 8,
         }
     }
 }
@@ -103,6 +148,9 @@ pub struct ProgressiveMeshResult {
     pub hits: Vec<FederatedDiscoveryHit>,
     pub confidence: f32,
     pub missing_peer_count: usize,
+    pub failed_peer_count: usize,
+    pub timed_out_peer_count: usize,
+    pub cancelled_peer_count: usize,
     pub privacy_receipts: Vec<crate::privacy::PrivacyReceipt>,
 }
 

@@ -290,13 +290,8 @@ impl ReplayCache {
         if seen.contains_key(&id) {
             return Err(NatsBridgeError::Replay(id));
         }
-        if seen.len() >= self.capacity
-            && let Some(oldest) = seen
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(id, _)| id.clone())
-        {
-            seen.remove(&oldest);
+        if seen.len() >= self.capacity {
+            return Err(NatsBridgeError::ReplayCapacityExhausted);
         }
         seen.insert(id, now);
         Ok(())
@@ -351,14 +346,16 @@ fn verify_envelope(
     key.verify(&signing_bytes(env)?, &signature)
         .map_err(|_| NatsBridgeError::InvalidSignature)?;
     // 只在所有认证检查通过后占用 replay id，伪造消息不能污染缓存。
-    replay.insert(env.id.to_string(), now)
+    replay.insert(format!("{signer}\u{1f}{source}\u{1f}{}", env.id), now)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatsHealthState {
     Connecting { attempt: u32 },
     Healthy,
+    Reconnected { generation: u64 },
     Degraded { error: String, next_retry: Duration },
+    RestartDetected { generation: u64 },
     Stopped,
 }
 
@@ -455,12 +452,21 @@ async fn run_ingestor(cfg: NatsBridgeConfig, mesh: EventMesh, health: Arc<Health
         }
     };
     let mut attempt = 0u32;
+    let mut generation = 0u64;
+    let mut was_healthy = false;
     loop {
         health.set(NatsHealthState::Connecting { attempt });
         match NatsSubscriber::connect(cfg.to_nats(), cfg.correlation_id.clone()).await {
             Ok(mut subscriber) => {
                 attempt = 0;
-                health.set(NatsHealthState::Healthy);
+                generation = generation.saturating_add(1);
+                if was_healthy {
+                    health.set(NatsHealthState::RestartDetected { generation });
+                    health.set(NatsHealthState::Reconnected { generation });
+                } else {
+                    health.set(NatsHealthState::Healthy);
+                }
+                was_healthy = true;
                 while let Some((_channel, serialized)) = subscriber.recv_any().await {
                     match verify_envelope(&serialized, &cfg.security, &replay, Utc::now()).and_then(
                         |verified| {
@@ -472,17 +478,17 @@ async fn run_ingestor(cfg: NatsBridgeConfig, mesh: EventMesh, health: Arc<Health
                     ) {
                         Ok(((), env)) => {
                             if let Err(error) = mesh.ingest_remote(Arc::new(env)).await {
-                                tracing::error!(error = %error, "verified NATS envelope failed EventMesh ingestion");
+                                tracing::error!(error = ?agent_context_db_core::ErrorReport::from_error(&error), "verified NATS envelope failed EventMesh ingestion");
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(error = %error, "rejected inbound NATS envelope")
+                            tracing::warn!(error = ?agent_context_db_core::ErrorReport::from_error(&error), "rejected inbound NATS envelope")
                         }
                     }
                 }
             }
             Err(error) => {
-                tracing::warn!(error = %error, attempt, "NATS subscription connection failed")
+                tracing::warn!(error = ?agent_context_db_core::ErrorReport::from_error(&error), attempt, "NATS subscription connection failed")
             }
         }
         attempt = attempt.saturating_add(1);
@@ -493,6 +499,227 @@ async fn run_ingestor(cfg: NatsBridgeConfig, mesh: EventMesh, health: Arc<Health
         });
         tokio::time::sleep(delay).await;
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceSource {
+    /// In-process/synthetic contract evidence. It makes no claim about an external service.
+    Contract,
+    /// Evidence minted only after an environment-backed runner validates and probes its endpoint.
+    VerifiedExternal(VerifiedExternalEvidence),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VerifiedExternalEvidence {
+    endpoint_fingerprint: String,
+    runner: ExternalProbeKind,
+}
+
+impl VerifiedExternalEvidence {
+    pub fn endpoint_fingerprint(&self) -> &str {
+        &self.endpoint_fingerprint
+    }
+
+    pub fn runner(&self) -> ExternalProbeKind {
+        self.runner
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalProbeKind {
+    PostgreSql,
+    Nats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvidenceRecord {
+    pub run_id: String,
+    pub sequence: u64,
+    pub service: String,
+    pub service_generation: u64,
+    pub operation: String,
+    pub outcome: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub elapsed_ms: u64,
+    pub detail: Option<String>,
+    pub source: EvidenceSource,
+}
+
+/// Environment-backed PostgreSQL probe. Connection metadata is validated before any I/O;
+/// credentials and the raw endpoint are never copied into evidence records.
+pub async fn run_postgres_env_probe(
+    run_id: &str,
+    service_generation: u64,
+) -> Result<EvidenceRecord, NatsBridgeError> {
+    let raw = std::env::var("DATABASE_URL")
+        .map_err(|_| NatsBridgeError::ProbeConfiguration("DATABASE_URL is not set".into()))?;
+    let (fingerprint, _) = validated_endpoint(&raw, &["postgres", "postgresql"])?;
+    let started_at = Utc::now();
+    let timer = std::time::Instant::now();
+    let pool = sqlx::PgPool::connect(&raw).await.map_err(|error| {
+        NatsBridgeError::Probe(format!("PostgreSQL connection failed: {error}"))
+    })?;
+    sqlx::query("SELECT 1")
+        .execute(&pool)
+        .await
+        .map_err(|error| NatsBridgeError::Probe(format!("PostgreSQL probe failed: {error}")))?;
+    pool.close().await;
+    Ok(verified_probe_record(
+        run_id,
+        "postgresql",
+        service_generation,
+        started_at,
+        timer,
+        fingerprint,
+        ExternalProbeKind::PostgreSql,
+    ))
+}
+
+/// Environment-backed NATS probe using `NATS_URL` and the bridge's concrete publisher.
+pub async fn run_nats_env_probe(
+    run_id: &str,
+    service_generation: u64,
+) -> Result<EvidenceRecord, NatsBridgeError> {
+    let raw = std::env::var("NATS_URL")
+        .map_err(|_| NatsBridgeError::ProbeConfiguration("NATS_URL is not set".into()))?;
+    let (fingerprint, _) = validated_endpoint(&raw, &["nats", "tls"])?;
+    let started_at = Utc::now();
+    let timer = std::time::Instant::now();
+    let config = NatsConfig {
+        url: raw,
+        connection_name: "context-db-evidence-probe".into(),
+        ..Default::default()
+    };
+    let _publisher =
+        NatsPublisher::connect(config, NatsSubjects::new(format!("evidence-{run_id}")))
+            .await
+            .map_err(|error| NatsBridgeError::Probe(format!("NATS connection failed: {error}")))?;
+    Ok(verified_probe_record(
+        run_id,
+        "nats",
+        service_generation,
+        started_at,
+        timer,
+        fingerprint,
+        ExternalProbeKind::Nats,
+    ))
+}
+
+fn validated_endpoint(raw: &str, schemes: &[&str]) -> Result<(String, String), NatsBridgeError> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| NatsBridgeError::ProbeConfiguration("endpoint is not a valid URL".into()))?;
+    if !schemes.contains(&parsed.scheme()) || parsed.host_str().is_none() {
+        return Err(NatsBridgeError::ProbeConfiguration(
+            "endpoint scheme or host is invalid".into(),
+        ));
+    }
+    let canonical = format!(
+        "{}://{}:{}",
+        parsed.scheme(),
+        parsed.host_str().unwrap(),
+        parsed.port_or_known_default().unwrap_or(0)
+    );
+    let fingerprint = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+    Ok((fingerprint, canonical))
+}
+
+fn verified_probe_record(
+    run_id: &str,
+    service: &str,
+    service_generation: u64,
+    started_at: DateTime<Utc>,
+    timer: std::time::Instant,
+    endpoint_fingerprint: String,
+    runner: ExternalProbeKind,
+) -> EvidenceRecord {
+    EvidenceRecord {
+        run_id: run_id.into(),
+        sequence: 0,
+        service: service.into(),
+        service_generation,
+        operation: "connectivity-probe".into(),
+        outcome: "success".into(),
+        started_at,
+        finished_at: Utc::now(),
+        elapsed_ms: timer.elapsed().as_millis() as u64,
+        detail: None,
+        source: EvidenceSource::VerifiedExternal(VerifiedExternalEvidence {
+            endpoint_fingerprint,
+            runner,
+        }),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundedLoadConfig {
+    pub operations: usize,
+    pub max_concurrency: usize,
+    pub operation_timeout: Duration,
+}
+
+impl BoundedLoadConfig {
+    pub fn validate(&self) -> Result<(), NatsBridgeError> {
+        if self.operations == 0 || self.max_concurrency == 0 || self.operation_timeout.is_zero() {
+            return Err(NatsBridgeError::InvalidPolicy(
+                "load operations, concurrency, and timeout must be positive".into(),
+            ));
+        }
+        if self.operations > 100_000 || self.max_concurrency > 1_024 {
+            return Err(NatsBridgeError::InvalidPolicy(
+                "load harness exceeds hard safety bounds".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub async fn run_bounded_load<F, Fut>(
+    run_id: &str,
+    service: &str,
+    config: BoundedLoadConfig,
+    operation: F,
+) -> Result<Vec<EvidenceRecord>, NatsBridgeError>
+where
+    F: Fn(usize) -> Fut + Sync,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    use futures::{StreamExt, stream};
+    config.validate()?;
+    let timeout = config.operation_timeout;
+    let records = stream::iter(0..config.operations)
+        .map(|sequence| {
+            let operation = &operation;
+            async move {
+                let started_at = Utc::now();
+                let started = std::time::Instant::now();
+                let result = tokio::time::timeout(timeout, operation(sequence)).await;
+                let (outcome, detail) = match result {
+                    Ok(Ok(())) => ("success", None),
+                    Ok(Err(error)) => ("failure", Some(error)),
+                    Err(_) => ("timeout", None),
+                };
+                EvidenceRecord {
+                    run_id: run_id.into(),
+                    sequence: sequence as u64,
+                    service: service.into(),
+                    service_generation: 0,
+                    operation: "bounded-load".into(),
+                    outcome: outcome.into(),
+                    started_at,
+                    finished_at: Utc::now(),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    detail,
+                    source: EvidenceSource::Contract,
+                }
+            }
+        })
+        .buffer_unordered(config.max_concurrency)
+        .collect()
+        .await;
+    Ok(records)
 }
 
 fn reconnect_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
@@ -530,8 +757,14 @@ pub enum NatsBridgeError {
     InvalidSignature,
     #[error("replayed envelope: {0}")]
     Replay(String),
+    #[error("replay cache capacity exhausted while all entries remain valid")]
+    ReplayCapacityExhausted,
     #[error("replay cache lock poisoned")]
     ReplayCachePoisoned,
+    #[error("invalid external probe configuration: {0}")]
+    ProbeConfiguration(String),
+    #[error("external probe failed: {0}")]
+    Probe(String),
 }
 
 #[cfg(test)]
@@ -626,6 +859,63 @@ mod tests {
         assert_eq!(reconnect_delay(initial, max, 1), Duration::from_millis(100));
         assert_eq!(reconnect_delay(initial, max, 4), Duration::from_millis(800));
         assert_eq!(reconnect_delay(initial, max, 8), max);
+    }
+
+    #[tokio::test]
+    async fn bounded_load_records_contract_outcomes_without_external_evidence() {
+        let records = run_bounded_load(
+            "contract-run",
+            "fake-nats",
+            BoundedLoadConfig {
+                operations: 3,
+                max_concurrency: 2,
+                operation_timeout: Duration::from_millis(5),
+            },
+            |index| async move {
+                match index {
+                    0 => Ok(()),
+                    1 => Err("injected failure".into()),
+                    _ => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("bounded contract load");
+        assert_eq!(records.len(), 3);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source == EvidenceSource::Contract)
+        );
+        for outcome in ["success", "failure", "timeout"] {
+            assert!(records.iter().any(|record| record.outcome == outcome));
+        }
+    }
+
+    #[test]
+    fn endpoint_fingerprint_is_deterministic_and_excludes_credentials() {
+        let (first, canonical) = validated_endpoint(
+            "postgres://alice:secret@db.example:5432/context",
+            &["postgres", "postgresql"],
+        )
+        .unwrap();
+        let (second, _) = validated_endpoint(
+            "postgres://bob:other@db.example:5432/another",
+            &["postgres", "postgresql"],
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(canonical, "postgres://db.example:5432");
+        assert!(!first.contains("secret"));
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_wrong_service_and_missing_host() {
+        assert!(validated_endpoint("nats://broker:4222", &["postgres"]).is_err());
+        assert!(validated_endpoint("postgres:///context", &["postgres"]).is_err());
     }
 
     #[test]

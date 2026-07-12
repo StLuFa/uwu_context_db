@@ -45,7 +45,7 @@ pub struct ContextRetriever {
     intent_analyzer: Option<Arc<RuleBasedIntentAnalyzer>>,
     optimizer: CboOptimizer,
     /// 计划缓存（相同 query 不重复优化）。
-    plan_cache: parking_lot::Mutex<std::collections::HashMap<Vec<u8>, PhysicalPlan>>,
+    plan_cache: parking_lot::Mutex<crate::cache::BoundedLruCache<Vec<u8>, PhysicalPlan>>,
 }
 
 impl ContextRetriever {
@@ -54,16 +54,27 @@ impl ContextRetriever {
         index: Option<Arc<dyn VectorIndex>>,
         planner: Arc<dyn QueryPlanner>,
         reranker: Arc<dyn Reranker>,
-<<<<<<< Updated upstream
-    ) -> Self {
-        let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
-        Self {
-=======
     ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        Self::with_plan_cache_config(
+            fs,
+            index,
+            planner,
+            reranker,
+            crate::PlanCacheConfig::default(),
+        )
+    }
+
+    pub fn with_plan_cache_config(
+        fs: Arc<dyn FsOps>,
+        index: Option<Arc<dyn VectorIndex>>,
+        planner: Arc<dyn QueryPlanner>,
+        reranker: Arc<dyn Reranker>,
+        plan_cache_config: crate::PlanCacheConfig,
+    ) -> std::result::Result<Self, crate::RetrieveConfigError> {
+        let plan_cache_config = plan_cache_config.validate()?;
         let config = crate::QueryPlanConfig::default();
         let stats = Arc::new(StatisticsCollector::new(config)?);
         Ok(Self {
->>>>>>> Stashed changes
             fs,
             content: None,
             index,
@@ -75,12 +86,10 @@ impl ContextRetriever {
             reranker,
             retrieval_learner: None,
             intent_analyzer: None,
-<<<<<<< Updated upstream
-            optimizer: CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap(),
-=======
             optimizer: CboOptimizer::new(stats, config)?,
->>>>>>> Stashed changes
-            plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            plan_cache: parking_lot::Mutex::new(crate::cache::BoundedLruCache::new(
+                plan_cache_config.capacity,
+            )),
         })
     }
 
@@ -175,8 +184,17 @@ impl ContextRetriever {
             .as_ref()
             .map(|analyzer| analyzer.decide(query, ctx));
         if let Some(decision) = &intent_decision {
+            let key = agent_context_db_core::FingerprintKey::new(
+                blake3::derive_key("uwu-context-db/retrieval-trace/v1", b"default-local-key"),
+                "retrieval-default",
+                1,
+            );
             trace.steps.push(TraceStep::IntentAnalysis {
-                raw: query.to_string(),
+                query: key.observe(
+                    agent_context_db_core::SensitiveClass::Content,
+                    "retrieval.query",
+                    query,
+                ),
                 num_queries: decision.candidates.len(),
                 decision: Some(Box::new(decision.clone())),
             });
@@ -434,10 +452,6 @@ impl QueryPlanner for RuleBasedPlanner {
     }
 
     async fn plan(&self, logical: &LogicalPlan) -> Result<PhysicalPlan> {
-<<<<<<< Updated upstream
-        let stats = Arc::new(StatisticsCollector::new(crate::QueryPlanConfig::default()).unwrap());
-        let optimizer = CboOptimizer::new(stats, crate::QueryPlanConfig::default()).unwrap();
-=======
         let config = crate::QueryPlanConfig::default();
         let stats = Arc::new(
             StatisticsCollector::new(config)
@@ -445,7 +459,6 @@ impl QueryPlanner for RuleBasedPlanner {
         );
         let optimizer = CboOptimizer::new(stats, config)
             .map_err(|error| ContextError::Unsupported(error.to_string()))?;
->>>>>>> Stashed changes
         Ok(optimizer.optimize(logical))
     }
 }
@@ -466,6 +479,7 @@ pub struct ContextRetrieverBuilder {
     retrieval_learner: Option<Arc<IncrementalRetrievalLearner>>,
     planner: Option<Arc<dyn QueryPlanner>>,
     reranker: Option<Arc<dyn Reranker>>,
+    plan_cache_config: crate::PlanCacheConfig,
 }
 
 impl ContextRetrieverBuilder {
@@ -481,6 +495,7 @@ impl ContextRetrieverBuilder {
             retrieval_learner: None,
             planner: None,
             reranker: None,
+            plan_cache_config: crate::PlanCacheConfig::default(),
         }
     }
 
@@ -533,6 +548,11 @@ impl ContextRetrieverBuilder {
         self
     }
 
+    pub fn with_plan_cache_config(mut self, config: crate::PlanCacheConfig) -> Self {
+        self.plan_cache_config = config;
+        self
+    }
+
     pub fn build(self) -> std::result::Result<ContextRetriever, crate::RetrieveConfigError> {
         let planner = self
             .planner
@@ -540,7 +560,13 @@ impl ContextRetrieverBuilder {
         let reranker = self
             .reranker
             .unwrap_or_else(|| Arc::new(crate::ScoreReranker { keep: 20 }));
-        let mut r = ContextRetriever::new(self.fs, self.index, planner, reranker)?;
+        let mut r = ContextRetriever::with_plan_cache_config(
+            self.fs,
+            self.index,
+            planner,
+            reranker,
+            self.plan_cache_config,
+        )?;
         r.content = self.content;
         r.graph = self.graph;
         r.associative_enabled = self.associative_enabled;

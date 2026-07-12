@@ -3,10 +3,304 @@
 //! F9 ContextPubSub 已删除，使用 `crate::event_store`（基于 `uwu_event_mesh`）替代。
 
 use crate::{ContentPayload, ContextEntry, ContextUri};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+
+/// Data classes accepted by the observability policy. `Secret` can never be raw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitiveClass {
+    Public,
+    Operational,
+    Identifier,
+    Content,
+    Endpoint,
+    Secret,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "representation", rename_all = "snake_case")]
+pub enum ObservedField {
+    Raw {
+        class: SensitiveClass,
+        value: String,
+    },
+    Fingerprint {
+        class: SensitiveClass,
+        value: String,
+        key_id: String,
+        key_version: u32,
+    },
+    Omitted {
+        class: SensitiveClass,
+    },
+}
+
+#[derive(Clone)]
+pub struct FingerprintKey {
+    key: [u8; 32],
+    pub id: String,
+    pub version: u32,
+}
+
+impl FingerprintKey {
+    pub fn new(key: [u8; 32], id: impl Into<String>, version: u32) -> Self {
+        Self {
+            key,
+            id: id.into(),
+            version,
+        }
+    }
+
+    /// Keyed, domain-separated BLAKE3 fingerprint with 128 bits of output.
+    pub fn observe(&self, class: SensitiveClass, domain: &str, value: &str) -> ObservedField {
+        let mut hasher = blake3::Hasher::new_keyed(&self.key);
+        hasher.update(b"uwu-context-db/observability/v1\0");
+        hasher.update(domain.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(format!("{class:?}").as_bytes());
+        hasher.update(&[0]);
+        hasher.update(value.as_bytes());
+        let digest = hasher.finalize();
+        ObservedField::Fingerprint {
+            class,
+            value: digest.to_hex()[..32].to_owned(),
+            key_id: self.id.clone(),
+            key_version: self.version,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagnosticGrant {
+    pub expires_at: DateTime<Utc>,
+    pub operation: String,
+    pub classes: Vec<SensitiveClass>,
+    pub max_events: u64,
+}
+
+impl DiagnosticGrant {
+    pub fn permits(
+        &self,
+        now: DateTime<Utc>,
+        operation: &str,
+        class: SensitiveClass,
+        event: u64,
+    ) -> bool {
+        class != SensitiveClass::Secret
+            && now < self.expires_at
+            && self.operation == operation
+            && self.classes.contains(&class)
+            && event < self.max_events
+    }
+
+    pub fn with_ttl(
+        operation: impl Into<String>,
+        classes: Vec<SensitiveClass>,
+        max_events: u64,
+        ttl: Duration,
+    ) -> Self {
+        Self {
+            expires_at: Utc::now() + ttl,
+            operation: operation.into(),
+            classes,
+            max_events,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    Io,
+    Serialization,
+    Timeout,
+    Authentication,
+    Authorization,
+    RateLimited,
+    Unavailable,
+    InvalidInput,
+    Conflict,
+    Downstream,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorReport {
+    pub kind: ErrorKind,
+    pub retryable: bool,
+    pub status: Option<u16>,
+}
+
+impl ErrorReport {
+    pub const fn new(kind: ErrorKind, retryable: bool, status: Option<u16>) -> Self {
+        Self {
+            kind,
+            retryable,
+            status,
+        }
+    }
+
+    pub fn downstream() -> Self {
+        Self::new(ErrorKind::Downstream, false, None)
+    }
+
+    pub fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        let kind = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::TimedOut {
+                ErrorKind::Timeout
+            } else {
+                ErrorKind::Io
+            }
+        } else if error.is::<serde_json::Error>() {
+            ErrorKind::Serialization
+        } else {
+            ErrorKind::Downstream
+        };
+        let retryable = matches!(
+            kind,
+            ErrorKind::Io | ErrorKind::Timeout | ErrorKind::RateLimited | ErrorKind::Unavailable
+        );
+        Self {
+            kind,
+            retryable,
+            status: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SamplingConfig {
+    pub numerator: u64,
+    pub denominator: u64,
+    pub error_burst: u64,
+    pub error_window: Duration,
+}
+
+pub struct DeterministicSampler {
+    config: SamplingConfig,
+    key: FingerprintKey,
+    errors: Mutex<HashMap<ErrorKind, (DateTime<Utc>, u64)>>,
+}
+
+impl DeterministicSampler {
+    pub fn new(config: SamplingConfig, key: FingerprintKey) -> Self {
+        Self {
+            config,
+            key,
+            errors: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn sampled(&self, domain: &str, identity: &str) -> bool {
+        if self.config.denominator == 0 {
+            return false;
+        }
+        let ObservedField::Fingerprint { value, .. } =
+            self.key
+                .observe(SensitiveClass::Identifier, domain, identity)
+        else {
+            return false;
+        };
+        u64::from_str_radix(&value[..16], 16).unwrap_or(u64::MAX) % self.config.denominator
+            < self.config.numerator.min(self.config.denominator)
+    }
+    pub fn allow_error(&self, kind: ErrorKind, now: DateTime<Utc>) -> bool {
+        let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+        let state = errors.entry(kind).or_insert((now, 0));
+        if now - state.0 >= self.config.error_window {
+            *state = (now, 0);
+        }
+        if state.1 >= self.config.error_burst {
+            false
+        } else {
+            state.1 += 1;
+            true
+        }
+    }
+}
+
+/// Runtime-injected tracing privacy policy. Missing key/grant always omits data.
+pub struct ObservabilityPolicy {
+    key: Option<FingerprintKey>,
+    sampler: Option<Arc<DeterministicSampler>>,
+    grant: Option<DiagnosticGrant>,
+    events: AtomicU64,
+}
+
+impl ObservabilityPolicy {
+    pub fn omit_all() -> Self {
+        Self {
+            key: None,
+            sampler: None,
+            grant: None,
+            events: AtomicU64::new(0),
+        }
+    }
+
+    pub fn new(key: FingerprintKey, sampler: Arc<DeterministicSampler>) -> Self {
+        Self {
+            key: Some(key),
+            sampler: Some(sampler),
+            grant: None,
+            events: AtomicU64::new(0),
+        }
+    }
+
+    pub fn with_grant(mut self, grant: DiagnosticGrant) -> Self {
+        self.grant = Some(grant);
+        self
+    }
+
+    pub fn observe(
+        &self,
+        operation: &str,
+        class: SensitiveClass,
+        domain: &str,
+        value: &str,
+    ) -> ObservedField {
+        if class == SensitiveClass::Secret || class == SensitiveClass::Content {
+            return ObservedField::Omitted { class };
+        }
+        let event = self.events.fetch_add(1, Ordering::Relaxed);
+        if self
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.permits(Utc::now(), operation, class, event))
+        {
+            return ObservedField::Raw {
+                class,
+                value: value.to_owned(),
+            };
+        }
+        match (&self.key, &self.sampler) {
+            (Some(key), Some(sampler)) if sampler.sampled(domain, value) => {
+                key.observe(class, domain, value)
+            }
+            _ => ObservedField::Omitted { class },
+        }
+    }
+
+    pub fn report_error(&self, error: &(dyn std::error::Error + 'static)) -> Option<ErrorReport> {
+        let report = ErrorReport::from_error(error);
+        self.sampler
+            .as_ref()
+            .filter(|sampler| sampler.allow_error(report.kind, Utc::now()))
+            .map(|_| report)
+    }
+}
+
+impl Default for ObservabilityPolicy {
+    fn default() -> Self {
+        Self::omit_all()
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // F13 质量评分
@@ -262,5 +556,90 @@ pub fn record_cache(hit: bool) {
         metrics::counter!("uwu.cache.hit").increment(1);
     } else {
         metrics::counter!("uwu.cache.miss").increment(1);
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    fn key(byte: u8) -> FingerprintKey {
+        FingerprintKey::new([byte; 32], "test", 7)
+    }
+
+    #[test]
+    fn fingerprints_are_keyed_domain_separated_and_128_bit() {
+        let a = key(1).observe(SensitiveClass::Identifier, "uri", "same");
+        let b = key(2).observe(SensitiveClass::Identifier, "uri", "same");
+        let c = key(1).observe(SensitiveClass::Identifier, "query", "same");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        let ObservedField::Fingerprint {
+            value,
+            key_id,
+            key_version,
+            ..
+        } = a
+        else {
+            panic!()
+        };
+        assert_eq!(value.len(), 32);
+        assert_eq!((key_id.as_str(), key_version), ("test", 7));
+    }
+
+    #[test]
+    fn grants_expire_limit_events_and_never_reveal_secrets() {
+        let now = Utc::now();
+        let grant = DiagnosticGrant {
+            expires_at: now + Duration::seconds(1),
+            operation: "read".into(),
+            classes: vec![SensitiveClass::Content, SensitiveClass::Secret],
+            max_events: 1,
+        };
+        assert!(grant.permits(now, "read", SensitiveClass::Content, 0));
+        assert!(!grant.permits(now, "read", SensitiveClass::Secret, 0));
+        assert!(!grant.permits(now, "read", SensitiveClass::Content, 1));
+        assert!(!grant.permits(
+            now + Duration::seconds(2),
+            "read",
+            SensitiveClass::Content,
+            0
+        ));
+    }
+
+    #[test]
+    fn sampling_and_error_limits_are_deterministic() {
+        let sampler = DeterministicSampler::new(
+            SamplingConfig {
+                numerator: 1,
+                denominator: 2,
+                error_burst: 1,
+                error_window: Duration::seconds(10),
+            },
+            key(3),
+        );
+        assert_eq!(
+            sampler.sampled("request", "abc"),
+            sampler.sampled("request", "abc")
+        );
+        let now = Utc::now();
+        assert!(sampler.allow_error(ErrorKind::Timeout, now));
+        assert!(!sampler.allow_error(ErrorKind::Timeout, now));
+        assert!(sampler.allow_error(ErrorKind::Timeout, now + Duration::seconds(11)));
+    }
+
+    #[test]
+    fn errors_are_structured_without_messages() {
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "secret body");
+        assert_eq!(
+            ErrorReport::from_error(&timeout),
+            ErrorReport {
+                kind: ErrorKind::Timeout,
+                retryable: true,
+                status: None
+            }
+        );
+        let json = serde_json::to_string(&ErrorReport::from_error(&timeout)).unwrap();
+        assert!(!json.contains("secret body"));
     }
 }

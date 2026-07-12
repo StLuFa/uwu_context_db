@@ -22,6 +22,7 @@ pub mod lineage;
 pub mod loader;
 pub mod opportunity;
 pub mod patcher;
+pub mod prompt_budget;
 pub mod quality;
 pub mod relational_axis;
 pub mod rif;
@@ -501,6 +502,7 @@ pub struct ConsolidationConfig {
     pub convergence_threshold: f32,
     pub quality_threshold_add: f32,
     pub quality_threshold_update: f32,
+    pub prompt_budget: prompt_budget::PromptBudgetConfig,
 }
 
 impl ConsolidationConfig {
@@ -511,6 +513,7 @@ impl ConsolidationConfig {
         validate_unit_f32("convergence_threshold", self.convergence_threshold)?;
         validate_unit_f32("quality_threshold_add", self.quality_threshold_add)?;
         validate_unit_f32("quality_threshold_update", self.quality_threshold_update)?;
+        self.prompt_budget.validate()?;
         if self.quality_threshold_update > self.quality_threshold_add {
             return Err(ConfigError(
                 "quality_threshold_update must not exceed quality_threshold_add".into(),
@@ -527,6 +530,7 @@ impl Default for ConsolidationConfig {
             convergence_threshold: 0.05,
             quality_threshold_add: 0.7,
             quality_threshold_update: 0.3,
+            prompt_budget: prompt_budget::PromptBudgetConfig::default(),
         }
     }
 }
@@ -553,8 +557,14 @@ impl ConsolidationEngine {
         })
     }
 
+    fn budget_prompt(&self, sections: &[prompt_budget::PromptSection<'_>]) -> Result<String> {
+        prompt_budget::budget_prompt(self.config.prompt_budget, sections)
+            .map(|result| result.text)
+            .map_err(|error| ContextError::Unsupported(error.to_string()))
+    }
+
     /// Generate→Critique→Revise 收敛循环。
-    #[tracing::instrument(skip(self, entry), fields(uri = %entry.uri.as_str()))]
+    #[tracing::instrument(skip(self, entry))]
     pub async fn consolidate(&self, entry: &ContextEntry) -> Result<ConsolidationProduct> {
         let content = entry.l0_text().to_string();
         let ct = entry.content_type().unwrap_or(ContentType::Fact);
@@ -622,9 +632,23 @@ impl ConsolidationEngine {
             evidence_required: bool,
         }
 
-        let prompt = format!(
-            "Consolidate this memory into a concise, self-contained principle. Preserve its language and do not invent evidence. Memory: {content:?}; content type: {ct:?}; epistemic type: {et:?}. Return the required JSON object."
+        let instructions = format!(
+            "Consolidate this memory into a concise, self-contained principle. Preserve its language and do not invent evidence. Content type: {ct:?}; epistemic type: {et:?}. Return the required JSON object."
         );
+        let prompt = self.budget_prompt(&[
+            prompt_budget::PromptSection {
+                label: "Instructions",
+                content: &instructions,
+                priority: 100,
+                required: true,
+            },
+            prompt_budget::PromptSection {
+                label: "Memory",
+                content,
+                priority: 80,
+                required: false,
+            },
+        ])?;
         let schema = JsonSchema::new(serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -1389,6 +1413,15 @@ pub trait LifecycleExecutorPort: Send + Sync {
         uri: ContextUri,
         action: agent_context_db_core::LifecycleAction,
     ) -> Result<crate::lifecycle_execution::LifecycleJob>;
+    async fn route_metacog(
+        &self,
+        _entry: &ContextEntry,
+    ) -> Result<Option<crate::lifecycle_execution::LifecycleJob>> {
+        Ok(None)
+    }
+    async fn restore_metacog(&self, _uri: &ContextUri) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1403,6 +1436,25 @@ impl LifecycleExecutorPort for crate::lifecycle_execution::LifecycleActionExecut
         action: agent_context_db_core::LifecycleAction,
     ) -> Result<crate::lifecycle_execution::LifecycleJob> {
         self.submit(uri, action).await
+    }
+
+    async fn route_metacog(
+        &self,
+        entry: &ContextEntry,
+    ) -> Result<Option<crate::lifecycle_execution::LifecycleJob>> {
+        self.route_metacog(entry).await
+    }
+
+    async fn restore_metacog(&self, uri: &ContextUri) -> Result<()> {
+        if uri.category() != agent_context_db_core::UriCategory::Metacog {
+            return Ok(());
+        }
+        let key = format!(
+            "{}:{:?}",
+            uri,
+            crate::lifecycle_execution::LifecycleOperation::ColdStorage
+        );
+        self.restore(&key).await
     }
 }
 
@@ -1714,7 +1766,14 @@ impl SleeptimeExecutor {
                     report.quality_promoted_long = promoted_long;
                     report.quality_archived = archived;
                     report.training_candidates = training_candidates;
-                    tracing::info!(scope=%scope, reassessed, promoted_mid, promoted_long, archived, training_candidates, "sleeptime: horizon-aware quality reassessment");
+                    tracing::info!(
+                        reassessed,
+                        promoted_mid,
+                        promoted_long,
+                        archived,
+                        training_candidates,
+                        "sleeptime: horizon-aware quality reassessment"
+                    );
                     report.tasks_executed += 1;
                 }
 

@@ -20,7 +20,9 @@ use uuid::Uuid;
 use std::sync::Arc;
 use uwu_database::DbPool;
 
-use crate::graph::{GraphCentralityConfig, pagerank_score};
+use crate::graph::{
+    BatchWriteConfig, GraphCentralityConfig, incremental_pagerank_scores, pagerank_scores,
+};
 use crate::outbox::{
     IndexMutation, collection_from_entry, enqueue_pg, point_from_entry, upsert_mutation,
 };
@@ -36,6 +38,7 @@ pub struct PgContextStore {
     /// 可选的 L0/L1 读取缓存（通过 UwuCacheAdapter 桥接 uwu_database::Cache）。
     read_cache: Option<Arc<dyn agent_context_db_core::ReadCache>>,
     centrality_config: GraphCentralityConfig,
+    batch_config: BatchWriteConfig,
 }
 
 impl PgContextStore {
@@ -51,6 +54,7 @@ impl PgContextStore {
             pool,
             read_cache: None,
             centrality_config,
+            batch_config: BatchWriteConfig::default(),
         })
     }
 
@@ -65,8 +69,12 @@ impl PgContextStore {
     }
 
     /// I.3: 统一 map_err 辅助 —— 记录 tracing::error! 并返回 `ContextError::Storage`。
-    fn storage_err(op: &str, e: impl std::fmt::Display) -> ContextError {
-        tracing::error!(op, error = %e, "storage operation failed");
+    fn storage_err(op: &str, e: impl std::error::Error + 'static) -> ContextError {
+        tracing::error!(
+            op,
+            error = ?agent_context_db_core::ErrorReport::from_error(&e),
+            "storage operation failed"
+        );
         ContextError::Storage(format!("{op} failed: {e}"))
     }
 
@@ -87,6 +95,28 @@ impl PgContextStore {
         format!("{}%", Self::escape_like(prefix))
     }
 
+    fn glob_pattern(glob: &str) -> String {
+        let mut pattern = String::with_capacity(glob.len());
+        for ch in glob.chars() {
+            match ch {
+                '*' => pattern.push('%'),
+                '?' => pattern.push('_'),
+                '\\' | '%' | '_' => {
+                    pattern.push('\\');
+                    pattern.push(ch);
+                }
+                _ => pattern.push(ch),
+            }
+        }
+        pattern
+    }
+
+    fn version_from_sql(version: i64) -> Result<MvccVersion> {
+        u64::try_from(version).map(MvccVersion).map_err(|_| {
+            ContextError::Storage(format!("invalid negative PostgreSQL version {version}"))
+        })
+    }
+
     fn page_limit(page: &PageRequest) -> Result<i64> {
         i64::try_from(page.effective_limit() + 1)
             .map_err(|_| ContextError::Storage("page limit exceeds PostgreSQL BIGINT".into()))
@@ -99,6 +129,21 @@ impl PgContextStore {
         }
         let next_cursor = has_more.then(|| items.last().map(&cursor)).flatten();
         Page::new(items, next_cursor)
+    }
+
+    async fn bump_graph_revision(
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &str,
+        operation: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<u64> {
+        let revision: i64 = sqlx::query_scalar("INSERT INTO context_graph_revisions(scope, revision) VALUES ($1,1) ON CONFLICT(scope) DO UPDATE SET revision=context_graph_revisions.revision+1 RETURNING revision")
+            .bind(scope).fetch_one(&mut **tx).await.map_err(|e| Self::storage_err("bump graph revision", e))?;
+        sqlx::query("INSERT INTO context_graph_mutations(scope, revision, operation, from_uri, to_uri) VALUES ($1,$2,$3,$4,$5)")
+            .bind(scope).bind(revision).bind(operation).bind(from).bind(to).execute(&mut **tx).await
+            .map_err(|e| Self::storage_err("log graph mutation", e))?;
+        u64::try_from(revision).map_err(|_| ContextError::Storage("negative graph revision".into()))
     }
 
     async fn write_in_tx(
@@ -266,7 +311,7 @@ fn payload_from_levels(l0: &str, l1: Option<&str>, _l2_ref: Option<Uuid>) -> Con
 
 #[async_trait]
 impl ContentRepo for PgContextStore {
-    #[tracing::instrument(skip(self, entry), fields(uri = %entry.uri))]
+    #[tracing::instrument(skip(self, entry), fields(uri = tracing::field::Empty))]
     async fn write(&self, entry: ContextEntry) -> Result<MvccVersion> {
         let uri = entry.uri.clone();
         let mut tx = self
@@ -287,7 +332,7 @@ impl ContentRepo for PgContextStore {
         Ok(version)
     }
 
-    #[tracing::instrument(skip(self), fields(uri = %uri))]
+    #[tracing::instrument(skip(self), fields(uri = tracing::field::Empty))]
     async fn delete(&self, uri: &ContextUri) -> Result<()> {
         let mut tx = self
             .pg_pool()
@@ -328,11 +373,17 @@ impl ContentRepo for PgContextStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::storage_err("delete versions", e))?;
-        sqlx::query("DELETE FROM context_relations WHERE from_uri = $1 OR to_uri = $1")
-            .bind(&uri_str)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::storage_err("delete relations", e))?;
+        let graph_changed =
+            sqlx::query("DELETE FROM context_relations WHERE from_uri = $1 OR to_uri = $1")
+                .bind(&uri_str)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::storage_err("delete relations", e))?
+                .rows_affected();
+        if graph_changed > 0 {
+            Self::bump_graph_revision(&mut tx, uri.tenant(), "delete", Some(uri.as_str()), None)
+                .await?;
+        }
 
         tx.commit()
             .await
@@ -343,7 +394,7 @@ impl ContentRepo for PgContextStore {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(from = %from, to = %to))]
+    #[tracing::instrument(skip(self, from, to), fields(from = tracing::field::Empty, to = tracing::field::Empty))]
     async fn rename(&self, from: &ContextUri, to: &ContextUri) -> Result<()> {
         if from.tenant() != to.tenant() {
             return Err(ContextError::PermissionDenied(format!(
@@ -418,6 +469,7 @@ impl ContentRepo for PgContextStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::storage_err("remove renamed relations", e))?;
+        let graph_changed = !relations.is_empty();
         for (edge_from, edge_to, kind, created_at) in relations {
             sqlx::query("INSERT INTO context_relations (from_uri, to_uri, relation_kind, created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                 .bind(if edge_from == from_str { &to_str } else { &edge_from })
@@ -427,6 +479,16 @@ impl ContentRepo for PgContextStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Self::storage_err("restore renamed relation", e))?;
+        }
+        if graph_changed {
+            Self::bump_graph_revision(
+                &mut tx,
+                from.tenant(),
+                "rename",
+                Some(from.as_str()),
+                Some(to.as_str()),
+            )
+            .await?;
         }
 
         enqueue_pg(
@@ -461,12 +523,35 @@ impl ContentRepo for PgContextStore {
             .map_err(|e| Self::storage_err("batch begin", e))?;
 
         let mut versions = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let version = Self::write_in_tx(&mut tx, entry).await?;
-            if let Some(mutation) = upsert_mutation(entry, version)? {
-                enqueue_pg(&mut tx, &mutation).await?;
-            }
-            versions.push(version);
+        for chunk in self.batch_config.chunks(entries)? {
+            let uris = chunk
+                .iter()
+                .map(|entry| entry.uri.to_string())
+                .collect::<Vec<_>>();
+            let base_versions = sqlx::query_as::<_, (String, i64)>(
+                "SELECT uri, mvcc_version FROM context_entries WHERE uri = ANY($1) FOR UPDATE",
+            )
+            .bind(&uris)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Self::storage_err("lock batch versions", e))?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+            let (rows, chunk_versions) = crate::graph::prepare_batch_chunk(chunk, &base_versions)?;
+            let json = serde_json::to_value(&rows)?;
+            sqlx::query(r#"
+                WITH input AS (SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(uri text,tenant_id text,l0 text,l1 text,l2 text,content_type text,state_scope text,tags jsonb,custom jsonb,entry jsonb,version bigint,created_at text,updated_at text,is_current boolean))
+                INSERT INTO context_entries(uri,tenant_id,l0_abstract,l1_overview,l2_detail_ref,content_type,state_scope,tags,custom,entry_json,mvcc_version,created_at,updated_at)
+                SELECT uri,tenant_id::uuid,l0,l1,NULL,content_type,state_scope,tags,custom,entry,version,created_at::timestamptz,updated_at::timestamptz FROM input WHERE is_current
+                ON CONFLICT(uri) DO UPDATE SET tenant_id=excluded.tenant_id,l0_abstract=excluded.l0_abstract,l1_overview=excluded.l1_overview,l2_detail_ref=excluded.l2_detail_ref,content_type=excluded.content_type,state_scope=excluded.state_scope,tags=excluded.tags,custom=excluded.custom,entry_json=excluded.entry_json,mvcc_version=excluded.mvcc_version,updated_at=excluded.updated_at
+            "#).bind(&json).execute(&mut *tx).await.map_err(|e| Self::storage_err("write batch current", e))?;
+            sqlx::query(r#"INSERT INTO context_versions(uri,mvcc_version,tenant_id,l0_abstract,l1_overview,l2_detail_ref,content_type,state_scope,tags,custom,entry_json,created_at)
+                SELECT uri,version,tenant_id::uuid,l0,l1,NULL,content_type,state_scope,tags,custom,entry,updated_at::timestamptz FROM jsonb_to_recordset($1::jsonb) AS x(uri text,tenant_id text,l0 text,l1 text,content_type text,state_scope text,tags jsonb,custom jsonb,entry jsonb,version bigint,updated_at text)"#)
+                .bind(&json).execute(&mut *tx).await.map_err(|e| Self::storage_err("write batch history", e))?;
+            sqlx::query(r#"INSERT INTO context_index_outbox(id,mutation_json,uri,mvcc_version,status,attempts,available_at,created_at,updated_at)
+                SELECT outbox_id::uuid,mutation,uri,version,'pending',0,updated_at::timestamptz,updated_at::timestamptz,updated_at::timestamptz FROM jsonb_to_recordset($1::jsonb) AS x(ordinal bigint,uri text,version bigint,outbox_id text,mutation jsonb,updated_at text) WHERE mutation IS NOT NULL ORDER BY ordinal"#)
+                .bind(&json).execute(&mut *tx).await.map_err(|e| Self::storage_err("write batch outbox", e))?;
+            versions.extend(chunk_versions);
         }
         tx.commit()
             .await
@@ -576,7 +661,7 @@ impl FsOps for PgContextStore {
         let after = page.after.as_deref().unwrap_or("");
         let limit = Self::page_limit(&page)?;
         let content_type = pattern.content_type.map(|kind| kind.as_path_segment());
-        let name_pattern = pattern.name_glob.as_deref().map(Self::prefix_pattern);
+        let name_pattern = pattern.name_glob.as_deref().map(Self::glob_pattern);
         let results: Vec<String> = sqlx::query_scalar(
             r#"SELECT uri FROM context_entries
                WHERE uri LIKE $1 ESCAPE '\\' AND uri > $2
@@ -678,7 +763,7 @@ impl FsOps for PgContextStore {
         ))
     }
 
-    #[tracing::instrument(skip(self), fields(uri = %uri, level = ?level))]
+    #[tracing::instrument(skip(self), fields(uri = tracing::field::Empty, level = ?level))]
     async fn read(&self, uri: &ContextUri, level: ContentLevel) -> Result<ContentPayload> {
         // 0. 缓存命中（L0/L1 可缓存，L2 不走缓存）
         if level != ContentLevel::L2
@@ -778,12 +863,14 @@ impl VersionOps for PgContextStore {
         .fetch_all(pg).await.map_err(|e| Self::storage_err("version_history", e))?;
         let items = rows
             .into_iter()
-            .map(|(v, message, ts)| VersionEntry {
-                version: MvccVersion(v as u64),
-                message,
-                ts,
+            .map(|(v, message, ts)| {
+                Ok(VersionEntry {
+                    version: Self::version_from_sql(v)?,
+                    message,
+                    ts,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self::finish_page(items, page.effective_limit(), |item| {
             item.version.0.to_string()
         }))
@@ -820,7 +907,10 @@ impl VersionOps for PgContextStore {
             ContextError::VersionConflict(format!("no version {} for {uri}", to.0))
         })?)?;
         entry.uri = uri.clone();
-        Self::write_in_tx(&mut tx, &entry).await?;
+        let version = Self::write_in_tx(&mut tx, &entry).await?;
+        if let Some(mutation) = upsert_mutation(&entry, version)? {
+            enqueue_pg(&mut tx, &mutation).await?;
+        }
         tx.commit()
             .await
             .map_err(|e| Self::storage_err("commit rollback", e))?;
@@ -833,12 +923,20 @@ impl VersionOps for PgContextStore {
     async fn diff(&self, uri: &ContextUri, a: MvccVersion, b: MvccVersion) -> Result<ContextDiff> {
         let pg = self.pg_pool();
         let uri_str = uri.to_string();
+        let a_version = a.0;
+        let b_version = b.0;
+        let a = i64::try_from(a_version).map_err(|_| {
+            ContextError::VersionConflict(format!("version {a_version} is too large"))
+        })?;
+        let b = i64::try_from(b_version).map_err(|_| {
+            ContextError::VersionConflict(format!("version {b_version} is too large"))
+        })?;
 
         let v_a: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT entry_json FROM context_versions WHERE uri = $1 AND mvcc_version = $2",
         )
         .bind(&uri_str)
-        .bind(a.0 as i64)
+        .bind(a)
         .fetch_optional(pg)
         .await
         .map_err(|e| Self::storage_err("diff read a", e))?;
@@ -847,7 +945,7 @@ impl VersionOps for PgContextStore {
             "SELECT entry_json FROM context_versions WHERE uri = $1 AND mvcc_version = $2",
         )
         .bind(&uri_str)
-        .bind(b.0 as i64)
+        .bind(b)
         .fetch_optional(pg)
         .await
         .map_err(|e| Self::storage_err("diff read b", e))?;
@@ -863,9 +961,12 @@ impl VersionOps for PgContextStore {
         let mut changes = Vec::new();
         collect_json_changes("$", &a_json, &b_json, &mut changes);
         let summary = if changes.is_empty() {
-            format!("{uri_str}: v{} and v{} are identical", a.0, b.0)
+            format!("{uri_str}: v{a_version} and v{b_version} are identical")
         } else {
-            format!("{uri_str}: v{} -> v{}\n{}", a.0, b.0, changes.join("\n"))
+            format!(
+                "{uri_str}: v{a_version} -> v{b_version}\n{}",
+                changes.join("\n")
+            )
         };
 
         Ok(ContextDiff { summary })
@@ -1041,18 +1142,28 @@ impl GraphStore for PgContextStore {
         to: &ContextUri,
         kind: GraphRelation,
     ) -> Result<()> {
-        let pg = self.pg_pool();
-        sqlx::query(
-            "INSERT INTO context_relations (from_uri, to_uri, relation_kind, created_at)
-             VALUES ($1, $2, $3, now())
-             ON CONFLICT (from_uri, to_uri, relation_kind) DO NOTHING",
-        )
-        .bind(from.to_string())
-        .bind(to.to_string())
-        .bind(format!("{:?}", kind))
-        .execute(pg)
-        .await
-        .map_err(|e| Self::storage_err("add_edge", e))?;
+        let mut tx = self
+            .pg_pool()
+            .begin()
+            .await
+            .map_err(|e| Self::storage_err("begin add edge", e))?;
+        let changed = sqlx::query(
+            "INSERT INTO context_relations (from_uri, to_uri, relation_kind, created_at) VALUES ($1,$2,$3,now()) ON CONFLICT DO NOTHING",
+        ).bind(from.to_string()).bind(to.to_string()).bind(format!("{:?}", kind))
+        .execute(&mut *tx).await.map_err(|e| Self::storage_err("add_edge", e))?.rows_affected();
+        if changed > 0 {
+            Self::bump_graph_revision(
+                &mut tx,
+                from.tenant(),
+                "add",
+                Some(from.as_str()),
+                Some(to.as_str()),
+            )
+            .await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::storage_err("commit add edge", e))?;
         Ok(())
     }
 
@@ -1200,7 +1311,82 @@ impl GraphStore for PgContextStore {
             .into_iter()
             .filter(|(from, to)| node_set.contains(from) && node_set.contains(to))
             .collect::<Vec<_>>();
-        Ok(pagerank_score(uri.as_str(), &node_list, &edges, config))
+        let scope = uri.tenant();
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT revision FROM context_graph_revisions WHERE scope=$1), 0)",
+        )
+        .bind(scope)
+        .fetch_one(pg)
+        .await
+        .map_err(|e| Self::storage_err("centrality revision", e))?;
+        let cache_key = config.cache_key();
+        if let Some(score) = sqlx::query_scalar::<_, f32>(
+            "SELECT score FROM context_graph_centrality WHERE scope=$1 AND revision=$2 AND algorithm_config=$3 AND uri=$4",
+        ).bind(scope).bind(revision).bind(&cache_key).bind(uri.as_str())
+            .fetch_optional(pg).await.map_err(|e| Self::storage_err("read centrality cache", e))?
+        { return Ok(score); }
+        let previous_revision: Option<i64> = sqlx::query_scalar(
+            "SELECT max(revision) FROM context_graph_centrality WHERE scope=$1 AND algorithm_config=$2 AND revision < $3",
+        )
+        .bind(scope)
+        .bind(&cache_key)
+        .bind(revision)
+        .fetch_one(pg)
+        .await
+        .map_err(|e| Self::storage_err("read previous centrality revision", e))?;
+        let scores = if let Some(previous_revision) = previous_revision {
+            let previous = sqlx::query_as::<_, (String, f32)>(
+                "SELECT uri, score FROM context_graph_centrality WHERE scope=$1 AND revision=$2 AND algorithm_config=$3",
+            )
+            .bind(scope)
+            .bind(previous_revision)
+            .bind(&cache_key)
+            .fetch_all(pg)
+            .await
+            .map_err(|e| Self::storage_err("read previous centrality snapshot", e))?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+            let dirty_seeds = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT from_uri, to_uri FROM context_graph_mutations WHERE scope=$1 AND revision > $2 AND revision <= $3",
+            )
+            .bind(scope)
+            .bind(previous_revision)
+            .bind(revision)
+            .fetch_all(pg)
+            .await
+            .map_err(|e| Self::storage_err("read dirty graph nodes", e))?
+            .into_iter()
+            .flat_map(|(from, to)| from.into_iter().chain(to))
+            .collect::<std::collections::HashSet<_>>();
+            incremental_pagerank_scores(&node_list, &edges, &previous, &dirty_seeds, config)
+                .unwrap_or_else(|| pagerank_scores(&node_list, &edges, config))
+        } else {
+            pagerank_scores(&node_list, &edges, config)
+        };
+        let mut tx = pg
+            .begin()
+            .await
+            .map_err(|e| Self::storage_err("begin centrality cache", e))?;
+        for (node, score) in &scores {
+            sqlx::query("INSERT INTO context_graph_centrality(scope,revision,algorithm_config,uri,score) VALUES($1,$2,$3,$4,$5) ON CONFLICT(scope,revision,algorithm_config,uri) DO UPDATE SET score=EXCLUDED.score")
+                .bind(scope).bind(revision).bind(&cache_key).bind(node).bind(score)
+                .execute(&mut *tx).await.map_err(|e| Self::storage_err("write centrality cache", e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Self::storage_err("commit centrality cache", e))?;
+        Ok(scores.get(uri.as_str()).copied().unwrap_or(0.0))
+    }
+
+    async fn graph_revision(&self, scope: &ContextUri) -> Result<u64> {
+        let revision: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM context_graph_revisions WHERE scope=$1")
+                .bind(scope.tenant())
+                .fetch_optional(self.pg_pool())
+                .await
+                .map_err(|e| Self::storage_err("read graph revision", e))?;
+        u64::try_from(revision.unwrap_or(0))
+            .map_err(|_| ContextError::Storage("negative graph revision".into()))
     }
 }
 

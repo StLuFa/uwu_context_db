@@ -55,7 +55,38 @@ pub enum ThreatCheck {
 pub struct ImmuneProtocol {
     antibodies: parking_lot::RwLock<Vec<Antibody>>,
     event_mesh: Option<EventMesh>,
-    similarity_threshold: f32,
+    config: ImmuneConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImmuneConfig {
+    pub similarity_threshold: f32,
+    pub antibody_confidence: f32,
+}
+
+impl Default for ImmuneConfig {
+    fn default() -> Self {
+        Self {
+            similarity_threshold: 0.85,
+            antibody_confidence: 0.9,
+        }
+    }
+}
+
+impl ImmuneConfig {
+    pub fn validate(&self) -> agent_context_db_core::Result<()> {
+        for (name, value) in [
+            ("similarity_threshold", self.similarity_threshold),
+            ("antibody_confidence", self.antibody_confidence),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(ContextError::TrustPolicy(format!(
+                    "immune {name} must be finite and in [0, 1]"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ImmuneProtocol {
@@ -69,8 +100,17 @@ impl ImmuneProtocol {
         Self {
             antibodies: parking_lot::RwLock::new(Vec::new()),
             event_mesh: None,
-            similarity_threshold: 0.85,
+            config: ImmuneConfig::default(),
         }
+    }
+
+    pub fn with_config(config: ImmuneConfig) -> agent_context_db_core::Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            antibodies: parking_lot::RwLock::new(Vec::new()),
+            event_mesh: None,
+            config,
+        })
     }
 
     pub fn with_event_mesh(mut self, mesh: EventMesh) -> Self {
@@ -93,7 +133,7 @@ impl ImmuneProtocol {
             severity,
             detected_by: detected_by.clone(),
             detected_at: chrono::Utc::now(),
-            confidence: 0.9,
+            confidence: self.config.antibody_confidence,
         };
 
         self.antibodies.write().push(antibody.clone());
@@ -143,7 +183,7 @@ impl ImmuneProtocol {
 
         for antibody in antibodies.iter() {
             let similarity = cosine_similarity(content_signature, &antibody.pattern_signature);
-            if similarity >= self.similarity_threshold {
+            if similarity >= self.config.similarity_threshold {
                 matched.push(antibody.id);
                 total_risk += similarity * antibody.confidence;
                 if antibody.severity > max_severity {
